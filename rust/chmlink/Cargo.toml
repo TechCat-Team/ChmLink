@@ -1,0 +1,6 @@
+[package]
+name = "chmlink"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "User-mode types for the ChmLink virtual network adapter"

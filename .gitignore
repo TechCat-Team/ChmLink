@@ -1,0 +1,12 @@
+/build/
+/target/
+*.sys
+*.cat
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.user
+*.suo
+/.vs/
