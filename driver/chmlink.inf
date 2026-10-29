@@ -1,0 +1,59 @@
+[Version]
+Signature = "$WINDOWS NT$"
+Class = Net
+ClassGuid = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider = %Provider%
+DriverVer = 10/29/2026,0.1.0.0
+CatalogFile = chmlink.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%Provider% = Models,NTamd64.10.0...14393
+
+[Models.NTamd64.10.0...14393]
+%DeviceDescription% = Install, Root\ChmLink
+
+[Install.NT]
+Characteristics = 0x81
+BusType = 15
+CopyFiles = DriverCopy
+AddReg = NetworkSettings
+
+[DriverCopy]
+chmlink.sys,,,2
+
+[DestinationDirs]
+DriverCopy = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+chmlink.sys = 1
+
+[NetworkSettings]
+HKR, Ndi, Service, 0, "chmlink"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "nolower"
+HKR,, *IfType, 0x00010001, 6
+HKR,, *MediaType, 0x00010001, 0
+HKR,, *PhysicalMediaType, 0x00010001, 0
+HKR,, *IfConnectorPresent, 0x00010001, 0
+HKR,, *PriorityVLANTag, 0x00010001, 0
+
+[Install.NT.Services]
+AddService = chmlink, 2, Service
+
+[Service]
+DisplayName = %ServiceDescription%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %12%\chmlink.sys
+LoadOrderGroup = NDIS
+
+[Strings]
+Provider = "TechCat Team"
+DeviceDescription = "ChmLAN Link"
+ServiceDescription = "ChmLink Virtual Ethernet Adapter"
+DiskName = "ChmLink Driver Package"
