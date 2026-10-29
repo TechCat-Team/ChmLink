@@ -1,8 +1,30 @@
 #include "chmlink.h"
 
+void ClUpdateReadEventLocked(CL_ADAPTER *a)
+{
+    if (a->ReadEvent != NULL) {
+        if (a->Count != 0 || a->State != ClAdapterRunning || a->SessionState != ClSessionOpen)
+            KeSetEvent(a->ReadEvent, IO_NO_INCREMENT, FALSE);
+        else KeClearEvent(a->ReadEvent);
+    }
+}
+
+void ClDetachReadEvent(CL_ADAPTER *a)
+{
+    PKEVENT event;
+    KIRQL irql;
+    KeAcquireSpinLock(&a->Lock, &irql);
+    event = a->ReadEvent;
+    a->ReadEvent = NULL;
+    if (event != NULL) KeSetEvent(event, IO_NO_INCREMENT, FALSE);
+    KeReleaseSpinLock(&a->Lock, irql);
+    if (event != NULL) ObDereferenceObject(event);
+}
+
 void ClRelease(CL_ADAPTER *a)
 {
     if (InterlockedDecrement(&a->References) == 0) {
+        NT_ASSERT(a->ReadEvent == NULL);
         if (a->Queue != NULL) ExFreePoolWithTag(a->Queue, CL_TAG);
         ExFreePoolWithTag(a, CL_TAG);
     }
@@ -18,7 +40,7 @@ void ClIndicateLink(CL_ADAPTER *a)
     link.Header.Revision = NDIS_LINK_STATE_REVISION_1;
     link.Header.Size = NDIS_SIZEOF_LINK_STATE_REVISION_1;
     KeAcquireSpinLock(&a->Lock, &irql);
-    link.MediaConnectState = a->Session ? MediaConnectStateConnected : MediaConnectStateDisconnected;
+    link.MediaConnectState = a->SessionState == ClSessionOpen ? MediaConnectStateConnected : MediaConnectStateDisconnected;
     KeReleaseSpinLock(&a->Lock, irql);
     link.MediaDuplexState = MediaDuplexStateFull;
     link.XmitLinkSpeed = link.RcvLinkSpeed = 1000000000ULL;
@@ -53,6 +75,8 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     NdisZeroMemory(a, sizeof(*a));
     a->References = 1;
     a->Handle = handle;
+    a->InterfaceIndex = index;
+    a->Luid = parameters->NetLuid;
     a->Lookahead = CHMLINK_ETHERNET_MTU;
     KeInitializeSpinLock(&a->Lock);
     KeInitializeMutex(&a->ControlMutex, 0);
@@ -124,6 +148,7 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     if (a->Pool == NULL) { status = NDIS_STATUS_RESOURCES; goto fail; }
     status = ClRegisterControl(a, index);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
+    a->State = ClAdapterPaused;
     KeAcquireSpinLock(&ClAdaptersLock, &irql);
     InsertTailList(&ClAdapters, &a->Link);
     KeReleaseSpinLock(&ClAdaptersLock, irql);
@@ -141,10 +166,17 @@ NDIS_STATUS ClPause(NDIS_HANDLE context, PNDIS_MINIPORT_PAUSE_PARAMETERS paramet
     KIRQL irql;
     UNREFERENCED_PARAMETER(parameters);
     KeAcquireSpinLock(&a->Lock, &irql);
-    a->Running = FALSE;
+    a->State = ClAdapterPausing;
+    a->TxQueueDrops += a->Count;
     a->Count = a->Head = 0;
+    ClUpdateReadEventLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     ExWaitForRundownProtectionRelease(&a->IoRundown);
+    a->IoDrained = TRUE;
+    KeAcquireSpinLock(&a->Lock, &irql);
+    a->State = ClAdapterPaused;
+    ClUpdateReadEventLocked(a);
+    KeReleaseSpinLock(&a->Lock, irql);
     return NDIS_STATUS_SUCCESS;
 }
 
@@ -154,14 +186,13 @@ NDIS_STATUS ClRestart(NDIS_HANDLE context, PNDIS_MINIPORT_RESTART_PARAMETERS par
     CL_ADAPTER *a = context;
     KIRQL irql;
     UNREFERENCED_PARAMETER(parameters);
-    /* Initial initialization is paused, but its rundown has not run yet. */
-    if (!ExAcquireRundownProtection(&a->IoRundown)) {
+    if (a->IoDrained) {
         ExReInitializeRundownProtection(&a->IoRundown);
-    } else {
-        ExReleaseRundownProtection(&a->IoRundown);
+        a->IoDrained = FALSE;
     }
     KeAcquireSpinLock(&a->Lock, &irql);
-    a->Running = TRUE;
+    a->State = ClAdapterRunning;
+    ClUpdateReadEventLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
     ClIndicateLink(a);
@@ -179,7 +210,14 @@ void ClHalt(NDIS_HANDLE context, NDIS_HALT_ACTION action)
     RemoveEntryList(&a->Link);
     a->Removed = TRUE;
     KeReleaseSpinLock(&ClAdaptersLock, irql);
+    KeAcquireSpinLock(&a->Lock, &irql);
+    a->State = ClAdapterRemoving;
+    a->TxQueueDrops += a->Count;
+    a->Count = a->Head = 0;
+    ClUpdateReadEventLocked(a);
+    KeReleaseSpinLock(&a->Lock, irql);
     ExWaitForRundownProtectionRelease(&a->IoRundown);
+    ClDetachReadEvent(a);
     NdisDeregisterDeviceEx(a->ControlHandle);
     NdisFreeNetBufferListPool(a->Pool);
     ClRelease(a);
@@ -197,10 +235,11 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
         PNET_BUFFER nb;
         ULONG added = 0;
         ULONG64 bytes = 0;
+        BOOLEAN queue_full = FALSE;
         NDIS_STATUS status = NDIS_STATUS_SUCCESS;
         KeAcquireSpinLock(&a->Lock, &irql);
-        if (!acquired || !a->Running) status = NDIS_STATUS_PAUSED;
-        else if (!a->Session) status = NDIS_STATUS_MEDIA_DISCONNECTED;
+        if (!acquired || a->State != ClAdapterRunning) status = NDIS_STATUS_PAUSED;
+        else if (a->SessionState != ClSessionOpen) status = NDIS_STATUS_MEDIA_DISCONNECTED;
         for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL && status == NDIS_STATUS_SUCCESS;
              nb = NET_BUFFER_NEXT_NB(nb)) {
             ULONG length = NET_BUFFER_DATA_LENGTH(nb);
@@ -210,6 +249,7 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
                 status = NDIS_STATUS_INVALID_LENGTH; break;
             }
             if (a->Count + added >= CHMLINK_QUEUE_PACKETS) {
+                queue_full = TRUE;
                 status = NDIS_STATUS_RESOURCES; break;
             }
             packet = &a->Queue[(a->Head + a->Count + added) % CHMLINK_QUEUE_PACKETS];
@@ -224,7 +264,16 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
             a->Count += added;
             a->TxPackets += added;
             a->TxBytes += bytes;
-        } else a->TxErrors++;
+        } else {
+            a->TxErrors++;
+            if (queue_full) {
+                /* Nothing from this NBL was published; account for the whole
+                 * rejected chain, not just its first overflowing packet. */
+                for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL; nb = NET_BUFFER_NEXT_NB(nb))
+                    a->TxQueueDrops++;
+            }
+        }
+        ClUpdateReadEventLocked(a);
         KeReleaseSpinLock(&a->Lock, irql);
         NET_BUFFER_LIST_STATUS(nbl) = status;
     }

@@ -18,6 +18,15 @@ typedef struct CL_PACKET {
     UCHAR Bytes[CHMLINK_ETHERNET_LIMIT];
 } CL_PACKET;
 
+typedef enum CL_ADAPTER_STATE {
+    ClAdapterInitializing, ClAdapterPaused, ClAdapterRunning,
+    ClAdapterPausing, ClAdapterRemoving
+} CL_ADAPTER_STATE;
+
+typedef enum CL_SESSION_STATE {
+    ClSessionClosed, ClSessionOpen, ClSessionClosing
+} CL_SESSION_STATE;
+
 typedef struct CL_ADAPTER {
     LIST_ENTRY Link;
     LONG References;
@@ -28,9 +37,13 @@ typedef struct CL_ADAPTER {
     EX_RUNDOWN_REF IoRundown;
     KSPIN_LOCK Lock;
     KMUTEX ControlMutex;
-    BOOLEAN Running;
+    CL_ADAPTER_STATE State; /* protected by Lock */
+    CL_SESSION_STATE SessionState; /* protected by Lock */
+    PKEVENT ReadEvent; /* referenced object; protected by Lock */
+    BOOLEAN IoDrained; /* NDIS lifecycle callbacks are serialized */
     BOOLEAN Removed;
-    BOOLEAN Session;
+    ULONG InterfaceIndex;
+    NET_LUID Luid;
     ULONG PacketFilter;
     ULONG Lookahead;
     ULONG MulticastCount;
@@ -41,6 +54,7 @@ typedef struct CL_ADAPTER {
     ULONG Count;
     ULONG64 TxPackets, TxBytes, TxErrors;
     ULONG64 RxPackets, RxBytes, RxDiscards;
+    ULONG64 TxQueueDrops;
 } CL_ADAPTER;
 
 extern NDIS_HANDLE ClDriverHandle;
@@ -65,6 +79,8 @@ MINIPORT_SHUTDOWN ClShutdown;
 DRIVER_DISPATCH ClDispatch;
 
 void ClRelease(CL_ADAPTER *adapter);
+void ClUpdateReadEventLocked(CL_ADAPTER *adapter);
+void ClDetachReadEvent(CL_ADAPTER *adapter);
 void ClIndicateLink(CL_ADAPTER *adapter);
 NDIS_STATUS ClRegisterControl(CL_ADAPTER *adapter, NET_IFINDEX index);
 

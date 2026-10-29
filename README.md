@@ -45,6 +45,24 @@ For fuzz testing, build `tests/fuzz_batch.c`, `src/protocol/batch.c`, and
 
 ## Windows prototype
 
+The current SDK requires device interface version 2. It rejects older drivers
+without the metadata query instead of silently assuming compatible limits.
+Version 1 packet batches and the existing receive/inject IOCTLs are unchanged.
+`chmlink-list` enumerates accessible adapters and prints their GUID, state,
+capabilities and cumulative counters without connecting a data session.
+`chmlink_open_by_id` opens by interface GUID and checks the resolved identity;
+the GUID remains stable for that installed adapter, but can change on removal
+and recreation. Queries remain available while the data path is paused.
+
+Drivers advertising `CHMLINK_CAP_WAIT` support `chmlink_wait_readable` and
+`chmlink_cancel_wait`. Readiness uses a referenced private event, not a pending
+kernel I/O request. Data arrival, pause, removal and session cleanup wake the
+waiter; state is rechecked after wakeup. One wait is allowed per session.
+Timeouts, cancellation and lifecycle errors are reported through GetLastError.
+Cancellation affects only the active wait. Readiness does not reserve packets.
+The caller must prevent new SDK calls before closing and close exactly once;
+close wakes a waiter and drains in-progress calls before freeing resources.
+
 `chmlink-arp-test <ifIndex> <local-ipv4> <unused-peer-ipv4>` tests both
 directions in one session. It requires a link-local IPv4 address already
 assigned to the adapter and a distinct unused link-local peer with no cached
@@ -67,8 +85,9 @@ Store (DIRID 13). The build validates the complete INF with `/u` and applies
 The current adapter has an MTU of 1500 and accepts inline Ethernet frames up
 to 1522 bytes, including VLAN headers but excluding FCS. Offloads are not
 advertised. Each adapter has an independent 256-packet transmit queue and one
-exclusive administrator/SYSTEM session. Receiving polls the queue; empty
-queues return `ERROR_NO_MORE_ITEMS`. Packet injection honors the Windows
+exclusive administrator/SYSTEM session. Nonblocking receives on empty
+queues return `ERROR_NO_MORE_ITEMS`; callers can wait for readiness instead
+of polling. Packet injection honors the Windows
 packet filter and multicast list. Pausing drops queued frames and drains
 active I/O; removing the device invalidates existing sessions.
 
@@ -87,10 +106,15 @@ Configure a test IP address on that adapter and generate traffic to observe
 outgoing frames. `chmlink_inject` accepts the batch format for the opposite
 direction; `chmlink-inject.exe <ifIndex> <frame.bin>` submits a raw Ethernet
 frame from a file. Close capture before running this separate example because
-the session is exclusive. The provisioning utility uses Windows driver selection and can
-update other matching ChmLink devices when creating an adapter; use a clean
-test VM. To remove a device, stop capture and pass the exact instance ID
+the session is exclusive. The provisioning utility restricts driver selection
+to the supplied INF and installs it only on the newly created device. It does
+not upgrade other matching adapters. It prints the device instance and, when
+available, its interface GUID. To remove a device, stop capture and pass the exact instance ID
 printed during creation to `chmlink-device.exe remove <instance-id>`.
+
+All instances still share the `chmlink` driver service. Selecting a different
+package is not an isolated per-adapter upgrade; additional adapters should use
+the same package. A managed upgrade/rollback workflow is still pending.
 
 Before any production use, the prototype still needs Windows runtime tests
 for bidirectional traffic, Driver Verifier, concurrent cleanup and removal,

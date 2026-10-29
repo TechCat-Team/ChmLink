@@ -34,7 +34,11 @@ int main(int argc, char **argv)
         uint32_t received, count;
         if (!chmlink_receive(adapter, buffer, CHMLINK_BATCH_MAX_SIZE, &received)) {
             DWORD error = GetLastError();
-            if (error == ERROR_NO_MORE_ITEMS || error == ERROR_NOT_READY) { Sleep(10); continue; }
+            if (error == ERROR_NO_MORE_ITEMS) {
+                if (chmlink_wait_readable(adapter, 250)) continue;
+                error = GetLastError();
+                if (error == ERROR_TIMEOUT) continue;
+            }
             fprintf(stderr, "Receive failed: %lu\n", error); result = 1; break;
         }
         if (chmlink_batch_validate(buffer, received, CHMLINK_MODE_ETHERNET, 1522, &count) == CHMLINK_OK)
