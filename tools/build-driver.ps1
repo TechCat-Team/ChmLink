@@ -85,6 +85,10 @@ Invoke-Checked 'link.exe' (@('/nologo', '/driver', '/subsystem:native,10.00',
     "/out:$Output/chmlink.sys", "/libpath:$wdk/Lib/$kitVersion/km/x64",
     'ntoskrnl.lib', 'hal.lib', 'ndis.lib', 'ntstrsafe.lib', 'BufferOverflowK.lib') + $objects)
 Copy-Item "$repo/driver/chmlink.inf" $Output -Force
-Invoke-Checked "$wdk/tools/$kitVersion/x64/infverif.exe" @('/w', "$Output/chmlink.inf")
+$infverif = "$wdk/tools/$kitVersion/x64/infverif.exe"
+Invoke-Checked $infverif @('/u', "$Output/chmlink.inf")
+# Net-class run-from-Driver-Store support starts at build 25319. Validate
+# isolation on that path while retaining DIRID 12 for Windows 10 1607/Server 2016.
+Invoke-Checked $infverif @('/w', '/wbuild', 'NTAMD64.10.0.0.25319', "$Output/chmlink.inf")
 Invoke-Checked "$wdk/bin/$kitVersion/x86/Inf2Cat.exe" @("/driver:$Output", '/os:10_X64,Server10_X64', '/uselocaltime')
 Write-Output "Unsigned test package: $Output"

@@ -8,22 +8,35 @@ CatalogFile = chmlink.cat
 PnpLockdown = 1
 
 [Manufacturer]
-%Provider% = Models,NTamd64.10.0...14393
+%Provider% = Models,NTamd64.10.0...14393,NTamd64.10.0...25319
 
 [Models.NTamd64.10.0...14393]
-%DeviceDescription% = Install, Root\ChmLink
+%DeviceDescription% = InstallLegacy, Root\ChmLink
 
-[Install.NT]
+[Models.NTamd64.10.0...25319]
+%DeviceDescription% = InstallStore, Root\ChmLink
+
+[InstallLegacy.NT]
 Characteristics = 0x81
 BusType = 15
 CopyFiles = DriverCopy
 AddReg = NetworkSettings
 
+[InstallStore.NT]
+Characteristics = 0x81
+BusType = 15
+CopyFiles = DriverCopyStore
+AddReg = NetworkSettings
+
 [DriverCopy]
 chmlink.sys,,,2
 
+[DriverCopyStore]
+chmlink.sys
+
 [DestinationDirs]
 DriverCopy = 12
+DriverCopyStore = 13
 
 [SourceDisksNames]
 1 = %DiskName%,,,
@@ -41,8 +54,11 @@ HKR,, *PhysicalMediaType, 0x00010001, 0
 HKR,, *IfConnectorPresent, 0x00010001, 0
 HKR,, *PriorityVLANTag, 0x00010001, 0
 
-[Install.NT.Services]
+[InstallLegacy.NT.Services]
 AddService = chmlink, 2, Service
+
+[InstallStore.NT.Services]
+AddService = chmlink, 2, ServiceStore
 
 [Service]
 DisplayName = %ServiceDescription%
@@ -50,6 +66,14 @@ ServiceType = 1
 StartType = 3
 ErrorControl = 1
 ServiceBinary = %12%\chmlink.sys
+LoadOrderGroup = NDIS
+
+[ServiceStore]
+DisplayName = %ServiceDescription%
+ServiceType = 1
+StartType = 3
+ErrorControl = 1
+ServiceBinary = %13%\chmlink.sys
 LoadOrderGroup = NDIS
 
 [Strings]

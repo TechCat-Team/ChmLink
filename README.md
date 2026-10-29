@@ -52,6 +52,11 @@ unsigned `.sys`, INF and catalog in `build/driver/`. The driver workflow
 checks compilation, INF validation and catalog creation; it does not load
 the driver or certify compatibility with the minimum operating system.
 
+The INF uses OS-specific installation sections: builds before 25319 use
+the system drivers directory (DIRID 12), and newer builds run from the Driver
+Store (DIRID 13). The build validates the complete INF with `/u` and applies
+`/w` isolation checks from build 25319 onward.
+
 The current adapter has an MTU of 1500 and accepts inline Ethernet frames up
 to 1522 bytes, including VLAN headers but excluding FCS. Offloads are not
 advertised. Each adapter has an independent 256-packet transmit queue and one
