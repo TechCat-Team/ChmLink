@@ -98,8 +98,8 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     general.SupportedPacketFilters = CL_FILTERS;
     general.MaxMulticastListSize = CL_MULTICAST_MAX;
     general.MacAddressLength = 6;
-    general.PermanentMacAddress = a->Mac;
-    general.CurrentMacAddress = a->Mac;
+    NdisMoveMemory(general.PermanentMacAddress, a->Mac, sizeof(a->Mac));
+    NdisMoveMemory(general.CurrentMacAddress, a->Mac, sizeof(a->Mac));
     general.AccessType = NET_IF_ACCESS_BROADCAST;
     general.DirectionType = NET_IF_DIRECTION_SENDRECEIVE;
     general.ConnectionType = NET_IF_CONNECTION_DEDICATED;

@@ -62,17 +62,24 @@ $sdk = "$KitRoot/microsoft.windows.sdk.cpp/c"
 $sources = @('driver/entry.c', 'driver/adapter.c', 'driver/oid.c', 'driver/control.c',
              'src/packet/packet.c', 'src/protocol/batch.c')
 $objects = @()
+$compileFailed = $false
 foreach ($source in $sources) {
     Write-Host "Compiling $source"
     $object = Join-Path $Output (([IO.Path]::GetFileNameWithoutExtension($source)) + '.obj')
     $objects += $object
-    Invoke-Checked 'cl.exe' @('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/W4', '/WX',
+    try {
+        Invoke-Checked 'cl.exe' @('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/W4', '/WX',
         '/wd4201', '/wd4324', '/wd4996', '/D_AMD64_', '/DNDIS660_MINIPORT=1',
         '/D_WIN32_WINNT=0x0A00', '/DNTDDI_VERSION=0x0A000002',
         "/I$repo/include", "/I$repo/driver", "/I$wdk/Include/$kitVersion/km",
         "/I$sdk/Include/$kitVersion/shared", "/I$sdk/Include/$kitVersion/ucrt",
-        "/Fo$object", "$repo/$source")
+            "/Fo$object", "$repo/$source")
+    } catch {
+        Write-Warning "Compilation failed for $source : $_"
+        $compileFailed = $true
+    }
 }
+if ($compileFailed) { throw 'Driver compilation failed; see compiler diagnostics above.' }
 Invoke-Checked 'link.exe' (@('/nologo', '/driver', '/subsystem:native,10.00',
     '/entry:GsDriverEntry', '/machine:x64', '/nodefaultlib', '/integritycheck',
     "/out:$Output/chmlink.sys", "/libpath:$wdk/Lib/$kitVersion/km/x64",
