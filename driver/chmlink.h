@@ -3,6 +3,7 @@
 
 #include <ntddk.h>
 #include <ndis.h>
+#define NTSTRSAFE_LIB
 #include <ntstrsafe.h>
 #include "chmlink/device.h"
 #include "chmlink/protocol.h"
