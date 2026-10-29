@@ -18,8 +18,13 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if (-not $vs) { throw 'Visual Studio C++ build tools were not found.' }
-    $environment = & cmd.exe /s /c "`"`"$vs\Common7\Tools\VsDevCmd.bat`" -arch=amd64 -host_arch=amd64 >nul && set`""
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize the Visual Studio environment.' }
+    $bootstrap = Join-Path ([IO.Path]::GetTempPath()) (([guid]::NewGuid().ToString()) + '.cmd')
+    try {
+        @("@call `"$vs\Common7\Tools\VsDevCmd.bat`" -arch=amd64 -host_arch=amd64 >nul",
+          '@if errorlevel 1 exit /b %errorlevel%', '@set') | Set-Content $bootstrap -Encoding ASCII
+        $environment = & cmd.exe /c $bootstrap
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize the Visual Studio environment.' }
+    } finally { Remove-Item $bootstrap -Force }
     foreach ($line in $environment) {
         if ($line -match '^([^=]+)=(.*)$') {
             [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
