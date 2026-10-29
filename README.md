@@ -22,7 +22,7 @@ support. The planned NDIS baseline is 6.60.
 - `driver/` — NDIS 6.60 Ethernet miniport and INF package.
 - `src/windows/` — user-mode C interface.
 - `examples/` — small programs using the C interface.
-- `tools/` — driver build and device provisioning tools.
+- `tools/` — driver build, provisioning and package maintenance tools.
 - `tests/` — portable C tests.
 - `rust/chmlink/` — Rust types for the user-mode integration.
 
@@ -114,7 +114,81 @@ printed during creation to `chmlink-device.exe remove <instance-id>`.
 
 All instances still share the `chmlink` driver service. Selecting a different
 package is not an isolated per-adapter upgrade; additional adapters should use
-the same package. A managed upgrade/rollback workflow is still pending.
+the same package.
+
+## Package maintenance
+
+`tools/manage-driver.ps1` adds an explicit upgrade and recovery workflow. This
+implementation has not been built or exercised on Windows. Use it only in a
+disposable test VM with a snapshot until installation, recovery and reboot
+behavior have been qualified. It targets Windows PowerShell 5.1 and the same
+Windows baseline as the driver.
+
+Plan is read-only and reports every installed ChmLink instance, including
+disconnected devices, together with its package, identity and network settings:
+
+```powershell
+.\tools\manage-driver.ps1 -Action Plan -InfPath C:\packages\next\chmlink.inf
+```
+
+Stop all ChmLink clients and provisioning tools before changing packages. Run
+the remaining commands in an elevated PowerShell, using a freshly built version
+2 `chmlink-device.exe`. `-MaintenanceWindow` acknowledges that clients have been
+stopped. The idle probe briefly opens a data session and can change link state;
+it cannot prevent a client from opening later. The maintenance mutex serializes
+this script only. Keep other installers and low-level device tools stopped.
+
+```powershell
+.\tools\manage-driver.ps1 -Action Upgrade `
+    -InfPath C:\packages\next\chmlink.inf `
+    -RecoveryDirectory C:\ChmLinkRecovery\upgrade-001 -MaintenanceWindow
+
+.\tools\manage-driver.ps1 -Action Rollback `
+    -JournalPath C:\ChmLinkRecovery\upgrade-001\journal.json -MaintenanceWindow
+
+.\tools\manage-driver.ps1 -Action RemovePackage `
+    -PublishedInf oem42.inf -MaintenanceWindow
+```
+
+Upgrade requires all instances to use the same package. It exports the old
+package, copies the new INF/SYS/CAT payload, hashes the files and persists a
+recovery journal before installing on each exact device instance. Use a new
+recovery directory on a trusted local NTFS volume; protect it from modification
+by other users and keep it until recovery is no longer needed. The journal
+records machine identity, interface GUIDs, bindings, attempted changes and
+restart requirements. Address, route and DNS entries are diagnostic snapshots;
+the script does not reapply network settings. It preserves existing devices
+rather than deleting and recreating them.
+
+The target version must increase unless `-AllowDowngrade` explicitly requests
+a repair or downgrade. Windows checks package signatures and compatibility
+during installation. When no restart is requested, the script checks the bound
+package files and the configured service image on disk. This does not verify
+the kernel's loaded image or packet traffic.
+
+On installation failure, recovery attempts the old bindings in reverse order,
+including the instance whose installation failed. Recovery retains the journal
+and reports incomplete steps. If Windows requests a restart during upgrade,
+failure recovery is deferred until after that restart. Restart manually, then
+rerun Rollback with the same journal. If rollback itself requires a restart,
+rerun Rollback after restarting to finish checking the recorded package files.
+Changed device inventories or bindings outside the transaction require manual
+review. Windows package installation across multiple devices is not atomic;
+recovery is best effort and cannot promise uninterrupted networking.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Requested operation completed without a reported restart requirement. |
+| 1 | Operation refused or failed before this invocation changed devices. |
+| 2 | Upgrade failed and recovery was applied; inspect the journal for restart requirements. |
+| 3 | Recovery is incomplete or deferred; retain the entire recovery directory. |
+| 3010 | Requested upgrade or rollback was applied and requires a manual restart. |
+
+The script never restarts Windows, removes devices, deletes recovery files or
+forces package deletion. RemovePackage accepts only a recognized ChmLink OEM
+INF and refuses packages still associated with devices. Windows also guards
+the final deletion through `SetupUninstallOEMInf` with no force flag. Package
+cleanup is explicit and separate from upgrade and rollback.
 
 Before any production use, the prototype still needs Windows runtime tests
 for bidirectional traffic, Driver Verifier, concurrent cleanup and removal,

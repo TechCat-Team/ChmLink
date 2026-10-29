@@ -10,8 +10,37 @@
 #include <cfgmgr32.h>
 #include <devguid.h>
 #include <stdio.h>
+#include <wchar.h>
+#include <errno.h>
 
 static const wchar_t hardware_id[] = L"Root\\ChmLink";
+
+/* Select from one signed INF and install on one existing devnode. Windows
+ * remains responsible for signature, architecture and compatibility checks. */
+static BOOL install_on_device(HDEVINFO set, SP_DEVINFO_DATA *device,
+                              const wchar_t *path, BOOL *reboot)
+{
+    SP_DEVINSTALL_PARAMS_W parameters;
+    SP_DRVINFO_DATA_W selected;
+    DWORD error;
+    BOOL result;
+    ZeroMemory(&parameters, sizeof(parameters));
+    parameters.cbSize = sizeof(parameters);
+    if (!SetupDiGetDeviceInstallParamsW(set, device, &parameters)) return FALSE;
+    parameters.Flags |= DI_ENUMSINGLEINF;
+    if (wcslen(path) >= MAX_PATH) { SetLastError(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+    CopyMemory(parameters.DriverPath, path, (wcslen(path) + 1) * sizeof(wchar_t));
+    if (!SetupDiSetDeviceInstallParamsW(set, device, &parameters) ||
+        !SetupDiBuildDriverInfoList(set, device, SPDIT_COMPATDRIVER)) return FALSE;
+    ZeroMemory(&selected, sizeof(selected)); selected.cbSize = sizeof(selected);
+    result = SetupDiCallClassInstaller(DIF_SELECTBESTCOMPATDRV, set, device) &&
+             SetupDiGetSelectedDriverW(set, device, &selected) &&
+             DiInstallDevice(NULL, set, device, &selected, 0, reboot);
+    error = GetLastError();
+    SetupDiDestroyDriverInfoList(set, device, SPDIT_COMPATDRIVER);
+    if (!result) SetLastError(error);
+    return result;
+}
 
 static BOOL is_chmlink_device(HDEVINFO set, SP_DEVINFO_DATA *device)
 {
@@ -140,11 +169,106 @@ fail:
     return 1;
 }
 
+static int install_existing(const wchar_t *instance, const wchar_t *inf)
+{
+    HDEVINFO set;
+    SP_DEVINFO_DATA device;
+    wchar_t path[MAX_PATH];
+    DWORD length = GetFullPathNameW(inf, MAX_PATH, path, NULL), error;
+    BOOL reboot = FALSE;
+    if (!length || length >= MAX_PATH) return 1;
+    set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
+    if (set == INVALID_HANDLE_VALUE) return 1;
+    ZeroMemory(&device, sizeof(device)); device.cbSize = sizeof(device);
+    if (!SetupDiOpenDeviceInfoW(set, instance, NULL, 0, &device)) goto fail;
+    if (!is_chmlink_device(set, &device)) { SetLastError(ERROR_ACCESS_DENIED); goto fail; }
+    if (!install_on_device(set, &device, path, &reboot)) goto fail;
+    SetupDiDestroyDeviceInfoList(set);
+    wprintf(L"Installed package on %ls\n", instance);
+    if (reboot) wprintf(L"A restart is required.\n");
+    return reboot ? ERROR_SUCCESS_REBOOT_REQUIRED : 0;
+fail:
+    error = GetLastError(); SetupDiDestroyDeviceInfoList(set);
+    fprintf(stderr, "Install failed: %lu\n", error);
+    return 1;
+}
+
+static BOOL is_oem_name(const wchar_t *name)
+{
+    size_t i = 3;
+    if (_wcsnicmp(name, L"oem", 3) != 0) return FALSE;
+    if (name[i] < L'0' || name[i] > L'9') return FALSE;
+    while (name[i] >= L'0' && name[i] <= L'9') ++i;
+    return _wcsicmp(name + i, L".inf") == 0;
+}
+
+static int remove_package(const wchar_t *name)
+{
+    wchar_t path[MAX_PATH], service[64], id[64];
+    HINF inf;
+    INFCONTEXT line;
+    DWORD length;
+    BOOL owned = FALSE;
+    const wchar_t *models[] = {L"Models.NTamd64.10.0...14393", L"Models.NTamd64.10.0...25319"};
+    const wchar_t *services[] = {L"InstallLegacy.NT.Services", L"InstallStore.NT.Services"};
+    unsigned int i;
+    if (!is_oem_name(name)) { fprintf(stderr, "Expected an OEM INF filename, without a path.\n"); return 2; }
+    length = GetWindowsDirectoryW(path, MAX_PATH);
+    if (!length || length + 5 + wcslen(name) >= MAX_PATH) return 1;
+    wcscat_s(path, MAX_PATH, L"\\INF\\"); wcscat_s(path, MAX_PATH, name);
+    inf = SetupOpenInfFileW(path, L"Net", INF_STYLE_WIN4, NULL);
+    if (inf == INVALID_HANDLE_VALUE) return 1;
+    /* Accept only this project's known INF schema, never arbitrary OEM files. */
+    for (i = 0; i < 2; ++i) {
+        if (SetupFindFirstLineW(inf, models[i], NULL, &line) &&
+            SetupGetStringFieldW(&line, 2, id, 64, NULL) && _wcsicmp(id, hardware_id) == 0 &&
+            SetupFindFirstLineW(inf, services[i], L"AddService", &line) &&
+            SetupGetStringFieldW(&line, 1, service, 64, NULL) && _wcsicmp(service, L"chmlink") == 0)
+            owned = TRUE;
+    }
+    SetupCloseInfFile(inf);
+    if (!owned) { fprintf(stderr, "Package is not a recognized ChmLink package.\n"); return 1; }
+    /* Flags zero: Windows refuses packages used by present OR phantom devices.
+     * Never force deletion or manually remove files from the Driver Store. */
+    if (!SetupUninstallOEMInfW(name, 0, NULL)) {
+        fprintf(stderr, "Package removal refused: %lu\n", GetLastError()); return 1;
+    }
+    wprintf(L"Removed unused package %ls\n", name);
+    return 0;
+}
+
+static int check_idle(const wchar_t *text)
+{
+    wchar_t path[64], *end;
+    unsigned long index;
+    HANDLE device;
+    errno = 0;
+    index = wcstoul(text, &end, 10);
+    if (errno || *end || !index || text[0] == L'-') return 2;
+    swprintf(path, 64, L"\\\\.\\ChmLink%lu", index);
+    device = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (device == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Idle check failed: %lu\n", GetLastError()); return 1;
+    }
+    CloseHandle(device);
+    puts("No data session was active at the time of this check.");
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv)
 {
+    if (argc == 2 && wcscmp(argv[1], L"version") == 0) { puts("2"); return 0; }
     if (argc == 3 && wcscmp(argv[1], L"create") == 0) return create(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"remove") == 0) return remove_device(argv[2]);
+    if (argc == 4 && wcscmp(argv[1], L"install") == 0) return install_existing(argv[2], argv[3]);
+    if (argc == 3 && wcscmp(argv[1], L"package-remove") == 0) return remove_package(argv[2]);
+    if (argc == 3 && wcscmp(argv[1], L"check-idle") == 0) return check_idle(argv[2]);
     fwprintf(stderr, L"Usage: chmlink-device create <signed-inf-path>\n"
-                     L"       chmlink-device remove <exact-device-instance-id>\n");
+                     L"       chmlink-device remove <exact-device-instance-id>\n"
+                     L"       chmlink-device install <exact-device-instance-id> <signed-inf-path>\n"
+                     L"       chmlink-device package-remove <oemNN.inf>\n"
+                     L"       chmlink-device check-idle <interface-index>\n"
+                     L"       chmlink-device version\n");
     return 2;
 }
