@@ -17,6 +17,18 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
 }
 
+function Invoke-InfVerification([string[]]$Arguments) {
+    Write-Host ("[{0:HH:mm:ss}] Validating INF: {1}" -f (Get-Date), ($Arguments -join ' '))
+    $diagnostics = & $infverif @Arguments 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    if ($diagnostics) { Write-Host $diagnostics }
+    # This kit returns zero for some invalid command lines. Never treat its
+    # usage/error diagnostics as successful verification solely on exit code.
+    if ($exitCode -ne 0 -or $diagnostics -match '(?im)Invalid build string|^\s*Usage:|\bERROR\([0-9]+\)') {
+        throw "INF verification failed (exit code $exitCode)."
+    }
+}
+
 if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     Write-Host 'Initializing Visual Studio x64 tools'
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -86,9 +98,9 @@ Invoke-Checked 'link.exe' (@('/nologo', '/driver', '/subsystem:native,10.00',
     'ntoskrnl.lib', 'hal.lib', 'ndis.lib', 'ntstrsafe.lib', 'BufferOverflowK.lib') + $objects)
 Copy-Item "$repo/driver/chmlink.inf" $Output -Force
 $infverif = "$wdk/tools/$kitVersion/x64/infverif.exe"
-Invoke-Checked $infverif @('/u', "$Output/chmlink.inf")
+Invoke-InfVerification @('/u', "$Output/chmlink.inf")
 # Net-class run-from-Driver-Store support starts at build 25319. Validate
 # isolation on that path while retaining DIRID 12 for Windows 10 1607/Server 2016.
-Invoke-Checked $infverif @('/w', '/wbuild', 'NTAMD64.10.0.0.25319', "$Output/chmlink.inf")
+Invoke-InfVerification @('/w', '/wbuild', '10.0.25319', "$Output/chmlink.inf")
 Invoke-Checked "$wdk/bin/$kitVersion/x86/Inf2Cat.exe" @("/driver:$Output", '/os:10_X64,Server10_X64', '/uselocaltime')
 Write-Output "Unsigned test package: $Output"
