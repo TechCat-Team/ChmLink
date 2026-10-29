@@ -77,7 +77,7 @@ ServiceBinary = %13%\chmlink.sys
 LoadOrderGroup = NDIS
 
 [Strings]
-Provider = "TechCat Team"
+Provider = "QZhua Team"
 DeviceDescription = "ChmLAN Link"
 ServiceDescription = "ChmLink Virtual Ethernet Adapter"
 DiskName = "ChmLink Driver Package"
