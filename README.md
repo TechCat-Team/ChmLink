@@ -45,6 +45,13 @@ For fuzz testing, build `tests/fuzz_batch.c`, `src/protocol/batch.c`, and
 
 ## Windows prototype
 
+`chmlink-arp-test <ifIndex> <local-ipv4> <unused-peer-ipv4>` tests both
+directions in one session. It requires a link-local IPv4 address already
+assigned to the adapter and a distinct unused link-local peer with no cached
+neighbor entry. It responds to the system's ARP request and passes only when
+Windows resolves the simulated MAC. Run it in an isolated test environment;
+the tool does not configure addresses or remove existing neighbor entries.
+
 Build user-mode tools with the CMake commands above in a Visual Studio C++
 environment. Run `powershell -File tools/build-driver.ps1 -Restore` to build
 the x64 driver using pinned Microsoft WDK/SDK packages. This creates an
