@@ -73,7 +73,9 @@ Get-NetAdapter -IncludeHidden | Where-Object InterfaceDescription -Like 'ChmLAN 
 
 Configure a test IP address on that adapter and generate traffic to observe
 outgoing frames. `chmlink_inject` accepts the batch format for the opposite
-direction. The provisioning utility uses Windows driver selection and can
+direction; `chmlink-inject.exe <ifIndex> <frame.bin>` submits a raw Ethernet
+frame from a file. Close capture before running this separate example because
+the session is exclusive. The provisioning utility uses Windows driver selection and can
 update other matching ChmLink devices when creating an adapter; use a clean
 test VM. To remove a device, stop capture and pass the exact instance ID
 printed during creation to `chmlink-device.exe remove <instance-id>`.

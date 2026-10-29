@@ -6,7 +6,6 @@ NDIS_STATUS ClRegisterControl(CL_ADAPTER *a, NET_IFINDEX index)
     PDRIVER_DISPATCH dispatch[IRP_MJ_MAXIMUM_FUNCTION + 1];
     WCHAR nameBuffer[64], linkBuffer[64];
     UNICODE_STRING name, link, security;
-    ULONG i;
     NTSTATUS status;
     status = RtlStringCchPrintfW(nameBuffer, RTL_NUMBER_OF(nameBuffer), L"\\Device\\ChmLink%lu", index);
     if (!NT_SUCCESS(status)) return status;
@@ -15,7 +14,11 @@ NDIS_STATUS ClRegisterControl(CL_ADAPTER *a, NET_IFINDEX index)
     RtlInitUnicodeString(&name, nameBuffer);
     RtlInitUnicodeString(&link, linkBuffer);
     RtlInitUnicodeString(&security, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-    for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; ++i) dispatch[i] = ClDispatch;
+    NdisZeroMemory(dispatch, sizeof(dispatch));
+    dispatch[IRP_MJ_CREATE] = ClDispatch;
+    dispatch[IRP_MJ_CLEANUP] = ClDispatch;
+    dispatch[IRP_MJ_CLOSE] = ClDispatch;
+    dispatch[IRP_MJ_DEVICE_CONTROL] = ClDispatch;
     NdisZeroMemory(&attributes, sizeof(attributes));
     attributes.Header.Type = NDIS_OBJECT_TYPE_DEVICE_OBJECT_ATTRIBUTES;
     attributes.Header.Revision = NDIS_DEVICE_OBJECT_ATTRIBUTES_REVISION_1;
@@ -24,7 +27,9 @@ NDIS_STATUS ClRegisterControl(CL_ADAPTER *a, NET_IFINDEX index)
     attributes.SymbolicName = &link;
     attributes.MajorFunctions = dispatch;
     attributes.DefaultSDDLString = &security;
-    return NdisRegisterDeviceEx(ClDriverHandle, &attributes, &a->ControlObject, &a->ControlHandle);
+    status = NdisRegisterDeviceEx(ClDriverHandle, &attributes, &a->ControlObject, &a->ControlHandle);
+    if (NT_SUCCESS(status)) a->ControlObject->Characteristics |= FILE_DEVICE_SECURE_OPEN;
+    return status;
 }
 
 static NTSTATUS receive(CL_ADAPTER *a, PIRP irp, ULONG size)
@@ -130,6 +135,7 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
     return status;
 }
 
+_Use_decl_annotations_
 NTSTATUS ClDispatch(PDEVICE_OBJECT device, PIRP irp)
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);

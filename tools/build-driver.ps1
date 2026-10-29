@@ -9,6 +9,7 @@ $ProgressPreference = 'SilentlyContinue'
 $repo = (Resolve-Path "$PSScriptRoot/..").Path
 $version = '10.0.26100.6584'
 $kitVersion = '10.0.26100.0'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
@@ -39,11 +40,14 @@ $KitRoot = (Resolve-Path $KitRoot).Path
 $Output = (Resolve-Path $Output).Path
 foreach ($package in @('microsoft.windows.wdk.x64', 'microsoft.windows.sdk.cpp')) {
     $destination = Join-Path $KitRoot $package
-    if (-not (Test-Path "$destination/c/Include/$kitVersion")) {
+    if (-not (Test-Path "$destination/.restored-$version")) {
         if (-not $Restore) { throw "Missing $package; pass -Restore to download pinned Microsoft kits." }
         $archive = Join-Path $KitRoot "$package.zip"
-        Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$package/$version/$package.$version.nupkg" -OutFile $archive
-        Expand-Archive $archive -DestinationPath $destination -Force
+        Write-Output "Restoring $package $version"
+        Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$package/$version/$package.$version.nupkg" -OutFile $archive -UseBasicParsing
+        if (Test-Path $destination) { Remove-Item $destination -Recurse -Force }
+        [IO.Compression.ZipFile]::ExtractToDirectory($archive, $destination)
+        New-Item -ItemType File "$destination/.restored-$version" | Out-Null
     }
 }
 $wdk = "$KitRoot/microsoft.windows.wdk.x64/c"

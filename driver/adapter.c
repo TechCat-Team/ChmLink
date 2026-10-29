@@ -34,6 +34,7 @@ void ClIndicateLink(CL_ADAPTER *a)
     NdisMIndicateStatusEx(a->Handle, &indication);
 }
 
+_Use_decl_annotations_
 NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
                         PNDIS_MINIPORT_INIT_PARAMETERS parameters)
 {
@@ -133,6 +134,7 @@ fail:
     return status;
 }
 
+_Use_decl_annotations_
 NDIS_STATUS ClPause(NDIS_HANDLE context, PNDIS_MINIPORT_PAUSE_PARAMETERS parameters)
 {
     CL_ADAPTER *a = context;
@@ -146,6 +148,7 @@ NDIS_STATUS ClPause(NDIS_HANDLE context, PNDIS_MINIPORT_PAUSE_PARAMETERS paramet
     return NDIS_STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 NDIS_STATUS ClRestart(NDIS_HANDLE context, PNDIS_MINIPORT_RESTART_PARAMETERS parameters)
 {
     CL_ADAPTER *a = context;
@@ -160,10 +163,13 @@ NDIS_STATUS ClRestart(NDIS_HANDLE context, PNDIS_MINIPORT_RESTART_PARAMETERS par
     KeAcquireSpinLock(&a->Lock, &irql);
     a->Running = TRUE;
     KeReleaseSpinLock(&a->Lock, irql);
+    KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
     ClIndicateLink(a);
+    KeReleaseMutex(&a->ControlMutex, FALSE);
     return NDIS_STATUS_SUCCESS;
 }
 
+_Use_decl_annotations_
 void ClHalt(NDIS_HANDLE context, NDIS_HALT_ACTION action)
 {
     CL_ADAPTER *a = context;
@@ -179,6 +185,7 @@ void ClHalt(NDIS_HANDLE context, NDIS_HALT_ACTION action)
     ClRelease(a);
 }
 
+_Use_decl_annotations_
 void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, ULONG flags)
 {
     CL_ADAPTER *a = context;

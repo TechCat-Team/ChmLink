@@ -137,6 +137,7 @@ static NDIS_STATUS set(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
     return status;
 }
 
+_Use_decl_annotations_
 NDIS_STATUS ClOidRequest(NDIS_HANDLE context, PNDIS_OID_REQUEST request)
 {
     if (request->RequestType == NdisRequestQueryInformation ||

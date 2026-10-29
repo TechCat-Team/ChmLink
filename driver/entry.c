@@ -4,6 +4,7 @@ NDIS_HANDLE ClDriverHandle;
 LIST_ENTRY ClAdapters;
 KSPIN_LOCK ClAdaptersLock;
 
+_Use_decl_annotations_
 NTSTATUS DriverEntry(PDRIVER_OBJECT object, PUNICODE_STRING path)
 {
     NDIS_MINIPORT_DRIVER_CHARACTERISTICS c;
@@ -32,18 +33,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT object, PUNICODE_STRING path)
     return NdisMRegisterMiniportDriver(object, path, NULL, &c, &ClDriverHandle);
 }
 
+_Use_decl_annotations_
 void ClUnload(PDRIVER_OBJECT object)
 {
     UNREFERENCED_PARAMETER(object);
     NdisMDeregisterMiniportDriver(ClDriverHandle);
 }
 
+_Use_decl_annotations_
 void ClPnp(NDIS_HANDLE context, PNET_DEVICE_PNP_EVENT event)
 {
     UNREFERENCED_PARAMETER(context);
     UNREFERENCED_PARAMETER(event);
 }
 
+_Use_decl_annotations_
 void ClShutdown(NDIS_HANDLE context, NDIS_SHUTDOWN_ACTION action)
 {
     CL_ADAPTER *a = context;
@@ -52,6 +56,7 @@ void ClShutdown(NDIS_HANDLE context, NDIS_SHUTDOWN_ACTION action)
     UNREFERENCED_PARAMETER(a);
 }
 
+_Use_decl_annotations_
 void ClCancelOid(NDIS_HANDLE context, PVOID id)
 {
     UNREFERENCED_PARAMETER(context);
@@ -59,6 +64,7 @@ void ClCancelOid(NDIS_HANDLE context, PVOID id)
     /* OID requests are completed synchronously. */
 }
 
+_Use_decl_annotations_
 void ClCancelSend(NDIS_HANDLE context, PVOID id)
 {
     UNREFERENCED_PARAMETER(context);
@@ -66,6 +72,7 @@ void ClCancelSend(NDIS_HANDLE context, PVOID id)
     /* No NBL is retained after the send callback. */
 }
 
+_Use_decl_annotations_
 void ClReturn(NDIS_HANDLE context, PNET_BUFFER_LIST lists, ULONG flags)
 {
     UNREFERENCED_PARAMETER(context);
