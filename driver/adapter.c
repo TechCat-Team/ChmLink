@@ -184,6 +184,7 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
     CL_ADAPTER *a = context;
     PNET_BUFFER_LIST nbl;
     KIRQL irql;
+    BOOLEAN acquired = ExAcquireRundownProtection(&a->IoRundown);
     UNREFERENCED_PARAMETER(port);
     for (nbl = lists; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
         PNET_BUFFER nb;
@@ -191,7 +192,7 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
         ULONG64 bytes = 0;
         NDIS_STATUS status = NDIS_STATUS_SUCCESS;
         KeAcquireSpinLock(&a->Lock, &irql);
-        if (!a->Running) status = NDIS_STATUS_PAUSED;
+        if (!acquired || !a->Running) status = NDIS_STATUS_PAUSED;
         else if (!a->Session) status = NDIS_STATUS_MEDIA_DISCONNECTED;
         for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL && status == NDIS_STATUS_SUCCESS;
              nb = NET_BUFFER_NEXT_NB(nb)) {
@@ -222,4 +223,5 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
     }
     NdisMSendNetBufferListsComplete(a->Handle, lists,
         (flags & NDIS_SEND_FLAGS_DISPATCH_LEVEL) ? NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL : 0);
+    if (acquired) ExReleaseRundownProtection(&a->IoRundown);
 }

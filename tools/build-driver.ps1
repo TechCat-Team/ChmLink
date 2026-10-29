@@ -5,6 +5,7 @@ param(
     [switch]$Restore
 )
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $repo = (Resolve-Path "$PSScriptRoot/..").Path
 $version = '10.0.26100.6584'
 $kitVersion = '10.0.26100.0'

@@ -23,6 +23,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT object, PUNICODE_STRING path)
     c.PauseHandler = ClPause;
     c.RestartHandler = ClRestart;
     c.SendNetBufferListsHandler = ClSend;
+    c.ReturnNetBufferListsHandler = ClReturn;
     c.OidRequestHandler = ClOidRequest;
     c.CancelOidRequestHandler = ClCancelOid;
     c.CancelSendHandler = ClCancelSend;
@@ -63,4 +64,13 @@ void ClCancelSend(NDIS_HANDLE context, PVOID id)
     UNREFERENCED_PARAMETER(context);
     UNREFERENCED_PARAMETER(id);
     /* No NBL is retained after the send callback. */
+}
+
+void ClReturn(NDIS_HANDLE context, PNET_BUFFER_LIST lists, ULONG flags)
+{
+    UNREFERENCED_PARAMETER(context);
+    UNREFERENCED_PARAMETER(lists);
+    UNREFERENCED_PARAMETER(flags);
+    /* All indications carry RESOURCES; NDIS must not return these NBLs. */
+    NT_ASSERT(FALSE);
 }
