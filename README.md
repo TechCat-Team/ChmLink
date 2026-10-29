@@ -8,8 +8,9 @@ The project is at an early development stage. The packet and batch validation
 libraries are portable; the Windows driver, device interface, and installation
 tools have not yet been implemented. It cannot replace TAP or Wintun yet.
 
-The compatibility target is Windows 7 SP1 / Server 2008 R2 SP1 and later,
-including Server 2012 R2. These are development targets, not verified support.
+The compatibility target is Windows 10 version 1607 (build 14393) /
+Windows Server 2016 and later. These are development targets, not verified
+support. The planned NDIS baseline is 6.60.
 
 ## Layout
 
