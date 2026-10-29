@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <netioapi.h>
 #include <objbase.h>
 #include <bcrypt.h>
 #include <devguid.h>
