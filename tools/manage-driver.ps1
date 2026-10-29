@@ -107,7 +107,10 @@ function Save-Journal {
             [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
         try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
         finally { $stream.Dispose() }
-        if (Test-Path -LiteralPath $script:journal) { [IO.File]::Replace($temporary, $script:journal, $null) }
+        if (Test-Path -LiteralPath $script:journal) {
+            # PowerShell 5.1 binds $null to an empty string for this overload.
+            [IO.File]::Replace($temporary, $script:journal, [NullString]::Value)
+        }
         else { [IO.File]::Move($temporary, $script:journal) }
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }

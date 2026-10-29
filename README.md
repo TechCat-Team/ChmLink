@@ -174,10 +174,14 @@ It never removes a successfully created device to undo a naming failure.
 
 ## Package maintenance
 
-`tools/manage-driver.ps1` adds an explicit upgrade and recovery workflow. This
-implementation has not been built or exercised on Windows. Use it only in a
-disposable test VM with a snapshot until installation, recovery and reboot
-behavior have been qualified. It targets Windows PowerShell 5.1 and the same
+`tools/manage-driver.ps1` provides explicit upgrade and recovery. Initial x64
+builds and VM checks have passed on Windows 11 build 26200 with PowerShell 5.1:
+legacy migration, invalid configuration rejection, ownership checks, naming
+retry, upgrades, rollback, ARP traffic and identity persistence across a reboot.
+The driver also passed the build's INF and catalog checks. This is initial
+coverage; minimum-version compatibility, Driver Verifier, stress, power and
+fault-injection qualification remain incomplete. Continue using a disposable
+test VM with a snapshot. The script targets Windows PowerShell 5.1 and the same
 Windows baseline as the driver.
 
 Plan is read-only and reports every installed ChmLink instance, including
