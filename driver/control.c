@@ -77,7 +77,8 @@ static BOOLEAN accepts(CL_ADAPTER *a, const UCHAR *frame)
 static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
 {
     const UCHAR *bytes = irp->AssociatedIrp.SystemBuffer;
-    ULONG count, i, offset = CHMLINK_BATCH_HEADER_SIZE, accepted = 0;
+    uint32_t count;
+    ULONG i, offset = CHMLINK_BATCH_HEADER_SIZE, accepted = 0;
     ULONG64 acceptedBytes = 0;
     PMDL mdl;
     PNET_BUFFER_LIST first = NULL, last = NULL, nbl;
@@ -102,7 +103,7 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
         if (accept) {
             nbl = NdisAllocateNetBufferAndNetBufferList(a->Pool, 0, 0, mdl, offset, length);
             if (nbl == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
-            NET_BUFFER_LIST_SOURCE_HANDLE(nbl) = a->Handle;
+            nbl->SourceHandle = a->Handle;
             NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
             if (last != NULL) NET_BUFFER_LIST_NEXT_NBL(last) = nbl;
             else first = nbl;
