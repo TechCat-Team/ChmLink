@@ -7,6 +7,7 @@
 #include <ntstrsafe.h>
 #include "chmlink/device.h"
 #include "chmlink/protocol.h"
+#include "chmlink/config.h"
 
 #define CL_TAG 'kLmC'
 #define CL_FILTERS (NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST | \
@@ -49,6 +50,7 @@ typedef struct CL_ADAPTER {
     ULONG MulticastCount;
     UCHAR Multicast[CL_MULTICAST_MAX][6];
     UCHAR Mac[6];
+    UCHAR Configuration[CHMLINK_CONFIG_SIZE];
     CL_PACKET *Queue;
     ULONG Head;
     ULONG Count;
@@ -83,5 +85,6 @@ void ClUpdateReadEventLocked(CL_ADAPTER *adapter);
 void ClDetachReadEvent(CL_ADAPTER *adapter);
 void ClIndicateLink(CL_ADAPTER *adapter);
 NDIS_STATUS ClRegisterControl(CL_ADAPTER *adapter, NET_IFINDEX index);
+NDIS_STATUS ClReadConfiguration(NDIS_HANDLE adapter, UCHAR *configuration);
 
 #endif

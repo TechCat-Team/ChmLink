@@ -10,10 +10,84 @@
 #include <cfgmgr32.h>
 #include <devguid.h>
 #include <stdio.h>
+#include <string.h>
 #include <wchar.h>
 #include <errno.h>
+#include "device_config.h"
 
 static const wchar_t hardware_id[] = L"Root\\ChmLink";
+static BOOL is_oem_name(const wchar_t *name);
+
+static BOOL same_file(const wchar_t *left, const wchar_t *right)
+{
+    HANDLE a, b;
+    BYTE first[4096], second[4096];
+    DWORD x, y, error = ERROR_SUCCESS;
+    a = CreateFileW(left, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (a == INVALID_HANDLE_VALUE) return FALSE;
+    b = CreateFileW(right, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (b == INVALID_HANDLE_VALUE) { error = GetLastError(); CloseHandle(a); SetLastError(error); return FALSE; }
+    for (;;) {
+        if (!ReadFile(a, first, sizeof(first), &x, NULL) || !ReadFile(b, second, sizeof(second), &y, NULL)) {
+            error = GetLastError(); break;
+        }
+        if (x != y || memcmp(first, second, x) != 0) { error = ERROR_REVISION_MISMATCH; break; }
+        if (x == 0) break;
+    }
+    CloseHandle(a); CloseHandle(b); SetLastError(error); return error == ERROR_SUCCESS;
+}
+
+/* Every instance shares one service. Creation must never change the package
+ * of existing devices as an incidental effect of installing a new instance. */
+static BOOL check_creation_package(const wchar_t *source)
+{
+    HDEVINFO all = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, NULL, NULL, 0);
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    const wchar_t *files[] = {L"chmlink.inf", L"chmlink.sys", L"chmlink.cat"};
+    DWORD i, j, type, bytes, error;
+    wchar_t name[64], installed[MAX_PATH], store[MAX_PATH], input[MAX_PATH], *tail;
+    HKEY key;
+    LSTATUS query;
+    if (all == INVALID_HANDLE_VALUE) return FALSE;
+    for (i = 0; SetupDiEnumDeviceInfo(all, i, &device); ++i) {
+        if (!ClIsDevice(all, &device)) continue;
+        key = SetupDiOpenDevRegKey(all, &device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_QUERY_VALUE);
+        if (key == INVALID_HANDLE_VALUE) goto fail;
+        bytes = sizeof(name);
+        query = RegQueryValueExW(key, L"InfPath", NULL, &type, (BYTE *)name, &bytes);
+        RegCloseKey(key);
+        if (query != ERROR_SUCCESS) { SetLastError(query); goto fail; }
+        if (type != REG_SZ || bytes < sizeof(wchar_t) || bytes > sizeof(name) ||
+            bytes % sizeof(wchar_t) || name[bytes / sizeof(wchar_t) - 1] ||
+            (wcslen(name) + 1) * sizeof(wchar_t) != bytes || !is_oem_name(name)) {
+            SetLastError(ERROR_INVALID_DATA); goto fail;
+        }
+        bytes = GetWindowsDirectoryW(installed, MAX_PATH);
+        if (!bytes || bytes + wcslen(name) + 5 >= MAX_PATH) { SetLastError(ERROR_FILENAME_EXCED_RANGE); goto fail; }
+        wcscat_s(installed, MAX_PATH, L"\\INF\\"); wcscat_s(installed, MAX_PATH, name);
+        if (!SetupGetInfDriverStoreLocationW(installed, NULL, NULL, store, MAX_PATH, NULL)) goto fail;
+        tail = wcsrchr(store, L'\\');
+        if (!tail || (size_t)(tail - store) + 13 >= MAX_PATH) { SetLastError(ERROR_FILENAME_EXCED_RANGE); goto fail; }
+        tail[1] = 0;
+        wcscpy_s(input, MAX_PATH, source);
+        tail = wcsrchr(input, L'\\');
+        if (!tail || (size_t)(tail - input) + 13 >= MAX_PATH) { SetLastError(ERROR_FILENAME_EXCED_RANGE); goto fail; }
+        tail[1] = 0;
+        for (j = 0; j < 3; ++j) {
+            wchar_t existing[MAX_PATH], candidate[MAX_PATH];
+            wcscpy_s(existing, MAX_PATH, store); wcscat_s(existing, MAX_PATH, files[j]);
+            wcscpy_s(candidate, MAX_PATH, input); wcscat_s(candidate, MAX_PATH, files[j]);
+            if (!same_file(existing, candidate)) goto fail;
+        }
+    }
+    error = GetLastError(); SetupDiDestroyDeviceInfoList(all);
+    if (error == ERROR_NO_MORE_ITEMS) return TRUE;
+    SetLastError(error); return FALSE;
+fail:
+    error = GetLastError(); SetupDiDestroyDeviceInfoList(all);
+    fprintf(stderr, "Existing adapters must use the identical INF/SYS/CAT package; use managed upgrade first.\n");
+    SetLastError(error); return FALSE;
+}
 
 /* Select from one signed INF and install on one existing devnode. Windows
  * remains responsible for signature, architecture and compatibility checks. */
@@ -42,7 +116,7 @@ static BOOL install_on_device(HDEVINFO set, SP_DEVINFO_DATA *device,
     return result;
 }
 
-static BOOL is_chmlink_device(HDEVINFO set, SP_DEVINFO_DATA *device)
+BOOL ClIsDevice(HDEVINFO set, SP_DEVINFO_DATA *device)
 {
     wchar_t ids[512] = {0};
     DWORD type, bytes;
@@ -60,35 +134,26 @@ static BOOL is_chmlink_device(HDEVINFO set, SP_DEVINFO_DATA *device)
     return FALSE;
 }
 
-static void print_identity(HDEVINFO set, SP_DEVINFO_DATA *device)
-{
-    HKEY key = SetupDiOpenDevRegKey(set, device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_QUERY_VALUE);
-    wchar_t id[64] = {0};
-    DWORD type, bytes = sizeof(id);
-    if (key != INVALID_HANDLE_VALUE) {
-        LSTATUS error = RegQueryValueExW(key, L"NetCfgInstanceId", NULL, &type, (BYTE *)id, &bytes);
-        RegCloseKey(key);
-        if (error == ERROR_SUCCESS && type == REG_SZ && bytes >= sizeof(wchar_t) &&
-            bytes <= sizeof(id) && bytes % sizeof(wchar_t) == 0 && id[bytes / sizeof(wchar_t) - 1] == 0) {
-            wprintf(L"Interface GUID: %ls\n", id);
-            return;
-        }
-    }
-    wprintf(L"Interface GUID is not available yet; enumerate again after initialization.\n");
-}
-
-static int create(const wchar_t *inf)
+static int create(const wchar_t *inf, const wchar_t *owner, const wchar_t *name, const wchar_t *mac)
 {
     HDEVINFO set;
     SP_DEVINFO_DATA device;
     BOOL reboot = FALSE, registered = FALSE, driver_list = FALSE;
+    BOOL rollback_failed = FALSE;
     SP_DEVINSTALL_PARAMS_W parameters;
     SP_DRVINFO_DATA_W selected;
     DWORD error = ERROR_SUCCESS;
+    CL_DEVICE_CONFIG config;
     wchar_t path[MAX_PATH], instance[MAX_DEVICE_ID_LEN];
     DWORD path_length = GetFullPathNameW(inf, MAX_PATH, path, NULL);
     if (!path_length || path_length >= MAX_PATH) {
         fprintf(stderr, "INF path is invalid or too long.\n"); return 1;
+    }
+    if (!check_creation_package(path)) {
+        fprintf(stderr, "Package preflight failed: %lu\n", GetLastError()); return 1;
+    }
+    if (!ClNewConfig(&config, owner, name, mac) || !ClCheckUnique(NULL, NULL, &config)) {
+        fprintf(stderr, "Invalid or conflicting configuration: %lu\n", GetLastError()); return 1;
     }
     set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
     if (set == INVALID_HANDLE_VALUE) {
@@ -119,39 +184,47 @@ static int create(const wchar_t *inf)
     if (!SetupDiGetSelectedDriverW(set, &device, &selected)) goto fail;
     if (!SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, &device)) goto fail;
     registered = TRUE;
+    if (!ClWriteConfig(set, &device, &config) ||
+        !SetupDiSetDeviceRegistryPropertyW(set, &device, SPDRP_FRIENDLYNAME,
+            (const BYTE *)config.Name, (DWORD)((wcslen(config.Name) + 1) * sizeof(wchar_t)))) goto fail;
     if (!SetupDiGetDeviceInstanceIdW(set, &device, instance, MAX_DEVICE_ID_LEN, NULL)) goto fail;
     /* Install only the selected package on this newly registered device.
      * Do not update every instance matching the hardware ID. */
     if (!DiInstallDevice(NULL, set, &device, &selected, 0, &reboot)) goto fail;
-    wprintf(L"Created %ls\n", instance);
-    print_identity(set, &device);
-    if (reboot) wprintf(L"A restart is required.\n");
     SetupDiDestroyDriverInfoList(set, &device, SPDIT_COMPATDRIVER);
     SetupDiDestroyDeviceInfoList(set);
-    return 0;
+    if (ClShowConfig(instance) != 0) {
+        fwprintf(stderr, L"Device was created, but its configuration could not be queried: %ls\n", instance);
+        return 3;
+    }
+    return reboot ? ERROR_SUCCESS_REBOOT_REQUIRED : 0;
 fail:
     error = GetLastError();
-    if (registered && !SetupDiCallClassInstaller(DIF_REMOVE, set, &device))
+    if (registered && !SetupDiCallClassInstaller(DIF_REMOVE, set, &device)) {
+        rollback_failed = TRUE;
         fprintf(stderr, "Rollback failed: %lu\n", GetLastError());
+    }
     if (driver_list) SetupDiDestroyDriverInfoList(set, &device, SPDIT_COMPATDRIVER);
     SetupDiDestroyDeviceInfoList(set);
     fprintf(stderr, "Create failed: %lu\n", error);
-    return 1;
+    return rollback_failed ? 3 : 1;
 }
 
-static int remove_device(const wchar_t *instance)
+static int remove_device(const wchar_t *instance, const wchar_t *owner)
 {
     HDEVINFO set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
     SP_DEVINFO_DATA device;
     SP_REMOVEDEVICE_PARAMS parameters;
+    CL_DEVICE_CONFIG config;
     DWORD error;
     if (set == INVALID_HANDLE_VALUE) return 1;
     ZeroMemory(&device, sizeof(device));
     device.cbSize = sizeof(device);
     if (!SetupDiOpenDeviceInfoW(set, instance, NULL, 0, &device)) goto fail;
-    if (!is_chmlink_device(set, &device)) {
+    if (!ClIsDevice(set, &device)) {
         SetLastError(ERROR_ACCESS_DENIED); goto fail;
     }
+    if (!ClReadConfig(set, &device, &config) || !ClCheckOwner(&config, owner)) goto fail;
     ZeroMemory(&parameters, sizeof(parameters));
     parameters.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
     parameters.ClassInstallHeader.InstallFunction = DIF_REMOVE;
@@ -176,12 +249,14 @@ static int install_existing(const wchar_t *instance, const wchar_t *inf)
     wchar_t path[MAX_PATH];
     DWORD length = GetFullPathNameW(inf, MAX_PATH, path, NULL), error;
     BOOL reboot = FALSE;
+    CL_DEVICE_CONFIG config;
     if (!length || length >= MAX_PATH) return 1;
     set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
     if (set == INVALID_HANDLE_VALUE) return 1;
     ZeroMemory(&device, sizeof(device)); device.cbSize = sizeof(device);
     if (!SetupDiOpenDeviceInfoW(set, instance, NULL, 0, &device)) goto fail;
-    if (!is_chmlink_device(set, &device)) { SetLastError(ERROR_ACCESS_DENIED); goto fail; }
+    if (!ClIsDevice(set, &device)) { SetLastError(ERROR_ACCESS_DENIED); goto fail; }
+    if (!ClReadConfig(set, &device, &config)) goto fail;
     if (!install_on_device(set, &device, path, &reboot)) goto fail;
     SetupDiDestroyDeviceInfoList(set);
     wprintf(L"Installed package on %ls\n", instance);
@@ -258,14 +333,44 @@ static int check_idle(const wchar_t *text)
 
 int wmain(int argc, wchar_t **argv)
 {
-    if (argc == 2 && wcscmp(argv[1], L"version") == 0) { puts("2"); return 0; }
-    if (argc == 3 && wcscmp(argv[1], L"create") == 0) return create(argv[2]);
-    if (argc == 3 && wcscmp(argv[1], L"remove") == 0) return remove_device(argv[2]);
+    const wchar_t *owner = CHMLINK_DEFAULT_OWNER, *name = NULL, *mac = NULL;
+    BOOL creating, adopting, removing, owner_set = FALSE;
+    HANDLE mutex;
+    DWORD locked;
+    int i, result;
+    if (argc == 2 && wcscmp(argv[1], L"version") == 0) { puts("3"); return 0; }
+    if (argc == 3 && wcscmp(argv[1], L"show") == 0) return ClShowConfig(argv[2]);
     if (argc == 4 && wcscmp(argv[1], L"install") == 0) return install_existing(argv[2], argv[3]);
     if (argc == 3 && wcscmp(argv[1], L"package-remove") == 0) return remove_package(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"check-idle") == 0) return check_idle(argv[2]);
-    fwprintf(stderr, L"Usage: chmlink-device create <signed-inf-path>\n"
-                     L"       chmlink-device remove <exact-device-instance-id>\n"
+    creating = argc >= 3 && wcscmp(argv[1], L"create") == 0;
+    adopting = argc >= 3 && wcscmp(argv[1], L"adopt") == 0;
+    removing = argc >= 3 && wcscmp(argv[1], L"remove") == 0;
+    if (!creating && !adopting && !removing) goto usage;
+    for (i = 3; i < argc; i += 2) {
+        if (i + 1 == argc) goto usage;
+        if (wcscmp(argv[i], L"--owner") == 0 && !owner_set) { owner = argv[i + 1]; owner_set = TRUE; }
+        else if (wcscmp(argv[i], L"--name") == 0 && !removing && name == NULL) name = argv[i + 1];
+        else if (wcscmp(argv[i], L"--mac") == 0 && creating && mac == NULL) mac = argv[i + 1];
+        else goto usage;
+    }
+    mutex = CreateMutexW(NULL, FALSE, L"Global\\ChmLink.AdapterConfiguration");
+    if (mutex == NULL) { fprintf(stderr, "Configuration lock failed: %lu\n", GetLastError()); return 1; }
+    locked = WaitForSingleObject(mutex, 0);
+    if (locked != WAIT_OBJECT_0) {
+        if (locked == WAIT_ABANDONED) ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        fprintf(stderr, "Configuration is busy or was interrupted; inspect the device inventory.\n"); return 1;
+    }
+    if (creating) result = create(argv[2], owner, name, mac);
+    else if (adopting) result = ClAdoptDevice(argv[2], owner, name);
+    else result = remove_device(argv[2], owner);
+    ReleaseMutex(mutex); CloseHandle(mutex); return result;
+usage:
+    fwprintf(stderr, L"Usage: chmlink-device create <signed-inf-path> [--owner <GUID>] [--name <name>] [--mac <MAC>]\n"
+                     L"       chmlink-device adopt <exact-device-instance-id> [--owner <GUID>] [--name <name>]\n"
+                     L"       chmlink-device show <exact-device-instance-id>\n"
+                     L"       chmlink-device remove <exact-device-instance-id> [--owner <GUID>]\n"
                      L"       chmlink-device install <exact-device-instance-id> <signed-inf-path>\n"
                      L"       chmlink-device package-remove <oemNN.inf>\n"
                      L"       chmlink-device check-idle <interface-index>\n"

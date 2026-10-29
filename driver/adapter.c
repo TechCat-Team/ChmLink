@@ -67,6 +67,7 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     NET_BUFFER_LIST_POOL_PARAMETERS pool;
     NDIS_PM_CAPABILITIES power;
     KIRQL irql;
+    PLIST_ENTRY entry;
     ULONG index = parameters->IfIndex;
     UNREFERENCED_PARAMETER(driverContext);
 
@@ -84,12 +85,9 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     a->Queue = ExAllocatePoolWithTag(NonPagedPoolNx,
         sizeof(CL_PACKET) * CHMLINK_QUEUE_PACKETS, CL_TAG);
     if (a->Queue == NULL) { ClRelease(a); return NDIS_STATUS_RESOURCES; }
-    a->Mac[0] = 0x02;
-    a->Mac[1] = 0x43;
-    a->Mac[2] = (UCHAR)(index >> 24);
-    a->Mac[3] = (UCHAR)(index >> 16);
-    a->Mac[4] = (UCHAR)(index >> 8);
-    a->Mac[5] = (UCHAR)index;
+    status = ClReadConfiguration(handle, a->Configuration);
+    if (status != NDIS_STATUS_SUCCESS) goto fail;
+    NdisMoveMemory(a->Mac, a->Configuration + 48, sizeof(a->Mac));
 
     NdisZeroMemory(&registration, sizeof(registration));
     registration.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
@@ -150,6 +148,16 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     if (status != NDIS_STATUS_SUCCESS) goto fail;
     a->State = ClAdapterPaused;
     KeAcquireSpinLock(&ClAdaptersLock, &irql);
+    for (entry = ClAdapters.Flink; entry != &ClAdapters; entry = entry->Flink) {
+        CL_ADAPTER *other = CONTAINING_RECORD(entry, CL_ADAPTER, Link);
+        if (RtlCompareMemory(other->Mac, a->Mac, sizeof(a->Mac)) == sizeof(a->Mac) ||
+            RtlCompareMemory(other->Configuration + 16, a->Configuration + 16, 16) == 16) {
+            KeReleaseSpinLock(&ClAdaptersLock, irql);
+            NdisDeregisterDeviceEx(a->ControlHandle);
+            status = NDIS_STATUS_INVALID_DATA;
+            goto fail;
+        }
+    }
     InsertTailList(&ClAdapters, &a->Link);
     KeReleaseSpinLock(&ClAdaptersLock, irql);
     return NDIS_STATUS_SUCCESS;

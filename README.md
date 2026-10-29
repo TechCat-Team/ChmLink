@@ -97,8 +97,8 @@ signing; regenerate the catalog after signing the binary. Once Windows trusts
 the test certificate, use an elevated terminal:
 
 ```powershell
-.\build\Release\chmlink-device.exe create C:\path\to\signed\chmlink.inf
-Get-NetAdapter -IncludeHidden | Where-Object InterfaceDescription -Like 'ChmLAN Link*'
+.\tools\manage-adapter.ps1 -Action Create -InfPath C:\path\to\signed\chmlink.inf -Name 'ChmLink Test'
+Get-NetAdapter -IncludeHidden -Name 'ChmLink Test'
 .\build\Release\chmlink-capture.exe <ifIndex>
 ```
 
@@ -108,13 +108,69 @@ direction; `chmlink-inject.exe <ifIndex> <frame.bin>` submits a raw Ethernet
 frame from a file. Close capture before running this separate example because
 the session is exclusive. The provisioning utility restricts driver selection
 to the supplied INF and installs it only on the newly created device. It does
-not upgrade other matching adapters. It prints the device instance and, when
-available, its interface GUID. To remove a device, stop capture and pass the exact instance ID
-printed during creation to `chmlink-device.exe remove <instance-id>`.
+not upgrade other matching adapters. It prints JSON containing the device instance
+ID and persistent configuration. To remove a device, stop capture and pass the
+exact instance ID to `chmlink-device.exe remove <instance-id>`. Supply the same
+`--owner <GUID>` used at creation when using a custom owner.
 
 All instances still share the `chmlink` driver service. Selecting a different
 package is not an isolated per-adapter upgrade; additional adapters should use
-the same package.
+the same package. Native creation compares the supplied INF, SYS and CAT against
+the packages bound to existing ChmLink instances and refuses different content;
+upgrade the existing instances explicitly before creating additional adapters.
+
+## Persistent adapter configuration
+
+Driver package 0.2.0.0 requires configuration version 1. Each device stores an
+immutable adapter GUID, owner GUID and locally administered unicast MAC in a
+64-byte versioned registry value, together with its desired name. The driver
+reads this state from the device hardware key rather than deriving a MAC from
+the interface index. Removing and recreating a device creates a new identity;
+this is not persistence across device deletion or cloning to another machine.
+The adapter GUID is distinct from the Windows interface GUID used by the SDK.
+
+Creation generates a random MAC unless `-Mac '02:11:22:33:44:55'` is supplied.
+Names default to `ChmLink-<adapter-guid>`. Configuration rejects multicast and
+globally administered MACs, empty GUIDs, malformed values, duplicate configured
+identities/names/MACs and conflicts with MACs visible in the local interface
+table. This cannot detect conflicts on remote machines. The driver independently
+refuses duplicate MACs or adapter IDs among its active instances.
+
+Applications should supply their own fixed `-OwnerId <GUID>`. The default owner
+is reserved for standalone provisioning. Removal requires a matching owner ID;
+ownership is an administrative mistake-prevention check, not a security boundary
+against administrators. Package maintenance still coordinates every instance
+because they share a driver service.
+
+Migrate old devices explicitly while their original driver is still running:
+
+```powershell
+.\tools\manage-adapter.ps1 -Action Adopt -InstanceId 'ROOT\NET\0000'
+.\build\Release\chmlink-device.exe show 'ROOT\NET\0000'
+```
+
+Adopt preserves the current MAC, records the current connection name unless
+`-Name` is supplied, and never overwrites an existing identity. It does not
+install or restart a driver. Unmanaged devices remain visible in the package
+Plan output; they must be adopted before installation of 0.2.0.0. Missing or
+invalid configuration causes the new driver to refuse initialization instead
+of generating a replacement identity. Recovery to older drivers retains the
+configuration, but older binaries do not implement the new persistence contract.
+
+`manage-adapter.ps1` applies the stored name to the exact Windows interface GUID
+after native creation/adoption. Native `create` alone sets the device friendly
+name; the script also sets the network connection alias. If the interface is not
+ready or naming fails, it keeps the device and reports partial completion. Retry
+without creating another adapter:
+
+```powershell
+.\tools\manage-adapter.ps1 -Action ApplyName -InstanceId 'ROOT\NET\0000'
+```
+
+Use the same owner ID on retries. Creation/adoption return native code 3 when
+device cleanup or configuration persistence is uncertain. The wrapper also
+returns 3 when naming is incomplete; 3010 means a manual restart is required.
+It never removes a successfully created device to undo a naming failure.
 
 ## Package maintenance
 
@@ -133,7 +189,7 @@ disconnected devices, together with its package, identity and network settings:
 
 Stop all ChmLink clients and provisioning tools before changing packages. Run
 the remaining commands in an elevated PowerShell, using a freshly built version
-2 `chmlink-device.exe`. `-MaintenanceWindow` acknowledges that clients have been
+3 `chmlink-device.exe`. `-MaintenanceWindow` acknowledges that clients have been
 stopped. The idle probe briefly opens a data session and can change link state;
 it cannot prevent a client from opening later. The maintenance mutex serializes
 this script only. Keep other installers and low-level device tools stopped.
@@ -155,7 +211,7 @@ package, copies the new INF/SYS/CAT payload, hashes the files and persists a
 recovery journal before installing on each exact device instance. Use a new
 recovery directory on a trusted local NTFS volume; protect it from modification
 by other users and keep it until recovery is no longer needed. The journal
-records machine identity, interface GUIDs, bindings, attempted changes and
+records machine identity, interface GUIDs, persistent configuration, bindings, attempted changes and
 restart requirements. Address, route and DNS entries are diagnostic snapshots;
 the script does not reapply network settings. It preserves existing devices
 rather than deleting and recreating them.
@@ -185,7 +241,9 @@ recovery is best effort and cannot promise uninterrupted networking.
 | 3010 | Requested upgrade or rollback was applied and requires a manual restart. |
 
 The script never restarts Windows, removes devices, deletes recovery files or
-forces package deletion. RemovePackage accepts only a recognized ChmLink OEM
+forces package deletion. Version 3 tooling writes journal schema 2 and refuses
+older journals; retain the corresponding older tools for any older recovery
+directories. RemovePackage accepts only a recognized ChmLink OEM
 INF and refuses packages still associated with devices. Windows also guards
 the final deletion through `SetupUninstallOEMInf` with no force flag. Package
 cleanup is explicit and separate from upgrade and rollback.

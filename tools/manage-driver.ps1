@@ -41,10 +41,18 @@ function Get-Inventory {
         $adapter = @(Get-CimInstance Win32_NetworkAdapter -Filter "PNPDeviceID='$($device.InstanceId.Replace('\', '\\'))'" -ErrorAction Stop)
         $index = 0; $guid = $null
         if ($adapter.Count -eq 1) { $index = [uint32]$adapter[0].InterfaceIndex; $guid = $adapter[0].GUID }
+        $configuration = & $DeviceTool show $device.InstanceId
+        if ($LASTEXITCODE -ne 0) { throw "Missing or invalid persistent identity on $($device.InstanceId); explicitly adopt legacy devices first." }
+        $configuration = $configuration | ConvertFrom-Json
+        if ((!$configuration.Managed -or $configuration.Version -ne 1) -and $Action -ne 'Plan') {
+            throw 'Persistent identity is required; explicitly adopt legacy devices first.'
+        }
         $result += [pscustomobject]@{
             InstanceId = $device.InstanceId; PublishedInf = $inf
             Version = [string](Get-Property $device 'DEVPKEY_Device_DriverVersion')
             InterfaceIndex = $index; InterfaceGuid = $guid; Status = [string]$device.Status
+            InterfaceName = if ($adapter.Count -eq 1) { $adapter[0].NetConnectionID } else { $null }
+            Configuration = $configuration
             Addresses = @(); Routes = @(); Dns = @()
         }
         if ($index) {
@@ -239,6 +247,14 @@ function Assert-Inventory($Current) {
         if ($original.InterfaceGuid -and $device.InterfaceGuid -ine $original.InterfaceGuid) {
             throw "Interface identity changed for $($device.InstanceId)."
         }
+        if ($original.InterfaceName -and $device.InterfaceName -cne $original.InterfaceName) {
+            throw "Connection name changed for $($device.InstanceId)."
+        }
+        foreach ($field in @('Version', 'AdapterId', 'OwnerId', 'Mac', 'Name')) {
+            if ($device.Configuration.$field -cne $original.Configuration.$field) {
+                throw "Persistent configuration changed for $($device.InstanceId)."
+            }
+        }
         if ($device.PublishedInf -ieq $original.PublishedInf) { continue }
         $step = @($script:record.Steps | Where-Object InstanceId -eq $device.InstanceId)
         if ($step.Count -ne 1) { throw 'An untouched device changed package.' }
@@ -261,7 +277,11 @@ function Assert-Inventory($Current) {
 $restartRequired = $false
 $deviceChangesStarted = $false; $rollbackStarted = $false
 $mutex = $null; $locked = $false; $record = $null
+$configMutex = $null; $configLocked = $false
 try {
+    $DeviceTool = (Resolve-Path -LiteralPath $DeviceTool).Path
+    $toolVersion = & $DeviceTool version
+    if ($LASTEXITCODE -ne 0 -or ($toolVersion -join '').Trim() -ne '3') { throw 'Device tool version 3 is required.' }
     if ($Action -eq 'Plan') {
         $inventory = @(Get-Inventory)
         $target = if ($InfPath) { [string](Get-PackageVersion (Resolve-Path -LiteralPath $InfPath).Path) } else { $null }
@@ -273,14 +293,16 @@ try {
     if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'An elevated PowerShell is required.' }
     if (!$MaintenanceWindow) { throw 'Specify -MaintenanceWindow after stopping all ChmLink clients.' }
-    $DeviceTool = (Resolve-Path -LiteralPath $DeviceTool).Path
-    $toolVersion = & $DeviceTool version
-    if ($LASTEXITCODE -ne 0 -or ($toolVersion -join '').Trim() -ne '2') { throw 'Device tool version 2 is required.' }
     $mutex = [Threading.Mutex]::new($false, 'Global\ChmLink.PackageMaintenance')
     try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] {
         $locked = $true; throw 'Previous maintenance was interrupted; inspect its recovery journal first.'
     }
     if (!$locked) { throw 'Another package maintenance operation is running.' }
+    $configMutex = [Threading.Mutex]::new($false, 'Global\ChmLink.AdapterConfiguration')
+    try { $configLocked = $configMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] {
+        $configLocked = $true; throw 'Adapter configuration was interrupted; inspect the device inventory.'
+    }
+    if (!$configLocked) { throw 'Adapter configuration is busy.' }
     if ($Action -eq 'RemovePackage') {
         Assert-NoPendingReboot
         if ($PublishedInf -notmatch '^oem[0-9]+\.inf$') { throw 'Specify -PublishedInf oemNN.inf.' }
@@ -292,7 +314,7 @@ try {
     if ($Action -eq 'Rollback') {
         $journal = (Resolve-Path -LiteralPath $JournalPath).Path
         $record = Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($record.Schema -ne 1 -or $record.ComputerName -ine $env:COMPUTERNAME -or
+        if ($record.Schema -ne 2 -or $record.ComputerName -ine $env:COMPUTERNAME -or
             $record.MachineId -ne (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid -or
             $record.Status -notin @('Installing', 'UpgradeFailed', 'Upgraded', 'UpgradePendingReboot', 'RecoveryPendingReboot', 'RollingBack', 'RollbackIncomplete', 'RollbackPendingReboot')) {
             throw 'Journal schema, computer or recovery state is invalid.'
@@ -330,7 +352,7 @@ try {
     if (Test-Path -LiteralPath $RecoveryDirectory) { throw 'RecoveryDirectory must not already exist.' }
     $directory = New-Item -ItemType Directory -Path $RecoveryDirectory
     $journal = Join-Path $directory.FullName 'journal.json'
-    $record = [pscustomobject]@{ Schema = 1; ComputerName = $env:COMPUTERNAME; Status = 'BackingUp'
+    $record = [pscustomobject]@{ Schema = 2; ComputerName = $env:COMPUTERNAME; Status = 'BackingUp'
         MachineId = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
         OperationBootUtc = (Get-BootTime)
         TargetVersion = [string]$version; Devices = $devices; Backups = @(); Steps = @()
@@ -397,6 +419,8 @@ try {
     if ($deviceChangesStarted -or $rollbackStarted) { exit 3 }
     exit 1
 } finally {
+    if ($configLocked) { $configMutex.ReleaseMutex() }
+    if ($null -ne $configMutex) { $configMutex.Dispose() }
     if ($locked) { $mutex.ReleaseMutex() }
     if ($null -ne $mutex) { $mutex.Dispose() }
 }
