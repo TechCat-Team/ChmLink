@@ -1,0 +1,49 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fuzzer
+        run: >-
+          clang -std=c99 -g -O1 -Wall -Wextra -Werror
+          -fsanitize=fuzzer,address,undefined -Iinclude
+          src/packet/packet.c src/protocol/batch.c tests/fuzz_batch.c
+          -o fuzz_batch
+      - name: Seed corpus
+        run: |
+          mkdir corpus
+          python3 - <<'PY'
+          import pathlib
+          import struct
+          for mode, packet in [(1, bytes(14)), (2, bytes([0x45]) + bytes(19)),
+                               (2, bytes([0x60]) + bytes(39))]:
+              padding = bytes((-len(packet)) % 4)
+              record = struct.pack('<I', len(packet)) + packet + padding
+              header = struct.pack('<6I', 1, mode, 1, 24 + len(record), 0, 0)
+              pathlib.Path(f'corpus/{mode}-{len(packet)}').write_bytes(header + record)
+          PY
+      - name: Fuzz
+        run: ./fuzz_batch corpus -runs=100000 -max_len=4096
