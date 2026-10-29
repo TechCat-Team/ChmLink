@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* The values are part of the user-mode/driver contract. */
 typedef enum chmlink_mode {
     CHMLINK_MODE_ETHERNET = 1,
@@ -17,5 +21,9 @@ typedef enum chmlink_mode {
  */
 int chmlink_packet_valid(chmlink_mode mode, const uint8_t *data,
                          size_t length, size_t max_length);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

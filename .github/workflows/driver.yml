@@ -1,0 +1,36 @@
+name: Driver
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        id: kits
+        with:
+          path: build/wdk
+          key: wdk-x64-10.0.26100.6584
+      - name: Build x64 driver and catalog
+        shell: powershell
+        run: ./tools/build-driver.ps1 -Restore
+      - uses: actions/cache/save@v4
+        if: always() && steps.kits.outputs.cache-hit != 'true'
+        with:
+          path: build/wdk
+          key: wdk-x64-10.0.26100.6584
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chmlink-x64-unsigned
+          path: |
+            build/driver/chmlink.sys
+            build/driver/chmlink.inf
+            build/driver/chmlink.cat
