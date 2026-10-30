@@ -19,9 +19,19 @@ jobs:
         with:
           path: build/wdk
           key: wdk-x64-10.0.26100.6584
-      - name: Build x64 driver and catalog
+      - name: Parse PowerShell scripts
         shell: powershell
-        run: ./tools/build-driver.ps1 -Restore
+        run: |
+          $failed = $false
+          Get-ChildItem tools -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null; $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            foreach ($e in $errors) { Write-Host "::error file=$($_.FullName),line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+      - name: Build x64 driver and catalog (with static analysis)
+        shell: powershell
+        run: ./tools/build-driver.ps1 -Restore -Analyze
       - uses: actions/cache/save@v4
         if: always() && steps.kits.outputs.cache-hit != 'true'
         with:

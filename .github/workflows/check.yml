@@ -47,3 +47,27 @@ jobs:
           PY
       - name: Fuzz
         run: ./fuzz_batch corpus -runs=100000 -max_len=4096
+
+  # Scripts under tools/ci: their own tests, a shell lint, and the DriverVer rule.
+  ci-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test the CI helper scripts
+        run: python3 -m unittest discover -s tools/ci -v
+      - name: Lint shell scripts
+        run: shellcheck -s bash tools/ci/vm-run.sh
+
+  # A new driver binary needs a higher INF DriverVer, otherwise Windows reuses the
+  # published package and silently keeps the old one.
+  driver-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check DriverVer
+        run: >-
+          python3 tools/ci/check_driver_version.py
+          --base "${{ github.event.pull_request.base.sha || github.event.before }}"
+
