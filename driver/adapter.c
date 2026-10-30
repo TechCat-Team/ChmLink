@@ -237,7 +237,15 @@ void ClHalt(NDIS_HANDLE context, NDIS_HALT_ACTION action)
     a->TxQueueDrops += chmlink_ring_clear(&a->Queue);
     ClUpdateReadEventLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
-    ExWaitForRundownProtectionRelease(&a->IoRundown);
+    /* Pause has normally run the rundown down already. A second wait on a
+     * run-down reference is not a no-op: if the first wait had to block, the
+     * reference still holds that (stale, on-stack) wait block, and a second
+     * wait reads it as live protection and never returns. Wait only if no
+     * pause did, as for a halt straight after initialization. */
+    if (!a->IoDrained) {
+        ExWaitForRundownProtectionRelease(&a->IoRundown);
+        a->IoDrained = TRUE;
+    }
     ClDetachReadEvent(a);
     NdisDeregisterDeviceEx(a->ControlHandle);
     NdisFreeNetBufferListPool(a->Pool);
