@@ -56,6 +56,11 @@ void ClIndicateLink(CL_ADAPTER *a)
     NdisMIndicateStatusEx(a->Handle, &indication);
 }
 
+/* PREfast cannot see through the reference count that frees the adapter in ClRelease, so every
+ * early return below is reported as a leak of the adapter and its queue (C28197). Each failure path
+ * does release both: References starts at 1 and ClRelease frees them at zero. */
+#pragma warning(disable: 28197)
+
 _Use_decl_annotations_
 NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
                         PNDIS_MINIPORT_INIT_PARAMETERS parameters)
@@ -174,6 +179,8 @@ fail:
     ClRelease(a);
     return status;
 }
+
+#pragma warning(default: 28197)
 
 _Use_decl_annotations_
 NDIS_STATUS ClPause(NDIS_HANDLE context, PNDIS_MINIPORT_PAUSE_PARAMETERS parameters)
