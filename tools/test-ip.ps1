@@ -2,9 +2,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InfPath,
-    [string]$BuildDirectory = "$PSScriptRoot/../build/verify/Release",
+    [string]$BuildDirectory,
     [Parameter(Mandatory)][string]$OutputDirectory
 )
+# Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
+if (-not $BuildDirectory) { $BuildDirectory = Join-Path $PSScriptRoot '../build/verify/Release' }
 $ErrorActionPreference = 'Stop'
 $owner = [guid]'A9206A62-5C94-4CBC-B23E-FB3A891DE058'
 $devices = @(); $process = $null; $exitCode = 1
