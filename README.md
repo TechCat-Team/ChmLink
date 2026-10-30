@@ -79,7 +79,10 @@ test addresses `169.254.250.1/24` and `169.254.251.1/24`, then removes the adapt
 in cleanup. It refuses addresses already assigned locally. It exercises wait
 timeout/cancel/close races, concurrent waiter rejection, abrupt child-process
 termination, repeated GUID opens, queue saturation and recovery, 1000 uniquely
-numbered UDP packets, adapter isolation, and waits during disable/removal.
+numbered UDP packets, adapter isolation, waits during disable/removal, SDK handle
+release after concurrent calls from 16 threads, and IOCTL fuzzing (`chmlink-ioctl-fuzz`,
+`-FuzzSeconds`, default 20): strictly on one adapter, and tolerantly on another
+that is disabled and enabled while the requests run.
 Normal configuration traffic is drained before timing checks; readiness may
 legally win a cancellation race. Process deadlines and per-stage stdout/stderr
 logs distinguish hangs from assertion failures. The mutating suite is not
@@ -371,10 +374,12 @@ calls and copies further; it would change the device contract and is not done.
 
 Not production ready. Open work: signing and installation outside a test-signed
 VM, minimum-version and ARM64 testing, power transitions (the PnP and shutdown
-callbacks are empty), longer stress and fault injection, the Driver Verifier low
-resources options, and the Rust device I/O and agent integration. Lifecycle and
-IP suites last passed with standard Driver Verifier on package 0.3.1.0. The C
-interface and device contract are experimental.
+callbacks are empty), systematic low resources simulation and NDIS verification,
+and the Rust device I/O and agent integration. Package 0.3.1.2 passed the nightly
+lane: lifecycle (with IOCTL fuzzing), IP and stress suites under standard Driver
+Verifier, then adapter churn and fuzzing under randomized low resources
+simulation, with no leaked allocations. The C interface and device contract are
+experimental.
 
 ## License
 
