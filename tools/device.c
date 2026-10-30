@@ -16,7 +16,38 @@
 #include "device_config.h"
 
 static const wchar_t hardware_id[] = L"Root\\ChmLink";
+static const wchar_t ip_hardware_id[] = L"Root\\ChmLinkIP";
 static BOOL is_oem_name(const wchar_t *name);
+
+/* Both current adapter modes require configuration version 2. Do not bind an
+ * older binary that cannot initialize that configuration, even when the
+ * lower-level install command is invoked without the PowerShell manager. */
+static BOOL supported_package_version(const wchar_t *path)
+{
+    HINF inf;
+    INFCONTEXT line;
+    wchar_t version[80], *cursor, *end;
+    unsigned long parts[4];
+    unsigned int i;
+    inf = SetupOpenInfFileW(path, L"Net", INF_STYLE_WIN4, NULL);
+    if (inf == INVALID_HANDLE_VALUE) return FALSE;
+    if (!SetupFindFirstLineW(inf, L"Version", L"DriverVer", &line) ||
+        !SetupGetStringFieldW(&line, 2, version, 80, NULL)) {
+        SetupCloseInfFile(inf); SetLastError(ERROR_INVALID_DATA); return FALSE;
+    }
+    SetupCloseInfFile(inf);
+    cursor = version;
+    for (i = 0; i < 4; ++i) {
+        if (*cursor < L'0' || *cursor > L'9') { SetLastError(ERROR_INVALID_DATA); return FALSE; }
+        errno = 0; parts[i] = wcstoul(cursor, &end, 10);
+        if (errno || parts[i] > 65535 || (i < 3 ? *end != L'.' : *end != 0)) {
+            SetLastError(ERROR_INVALID_DATA); return FALSE;
+        }
+        cursor = end + (i < 3 ? 1 : 0);
+    }
+    if (parts[0] == 0 && parts[1] < 3) { SetLastError(ERROR_REVISION_MISMATCH); return FALSE; }
+    return TRUE;
+}
 
 static BOOL same_file(const wchar_t *left, const wchar_t *right)
 {
@@ -116,11 +147,12 @@ static BOOL install_on_device(HDEVINFO set, SP_DEVINFO_DATA *device,
     return result;
 }
 
-BOOL ClIsDevice(HDEVINFO set, SP_DEVINFO_DATA *device)
+unsigned int ClDeviceMode(HDEVINFO set, SP_DEVINFO_DATA *device)
 {
     wchar_t ids[512] = {0};
     DWORD type, bytes;
     size_t offset, count;
+    unsigned int mode = 0;
     if (!SetupDiGetDeviceRegistryPropertyW(set, device, SPDRP_HARDWAREID, &type,
                                           (BYTE *)ids, sizeof(ids), &bytes)) return FALSE;
     if (type != REG_MULTI_SZ || bytes < 2 * sizeof(wchar_t) ||
@@ -129,12 +161,17 @@ BOOL ClIsDevice(HDEVINFO set, SP_DEVINFO_DATA *device)
     if (ids[count - 1] != 0 || ids[count - 2] != 0) return FALSE;
     for (offset = 0; offset < count - 1 && ids[offset] != 0;
          offset += wcslen(ids + offset) + 1) {
-        if (_wcsicmp(ids + offset, hardware_id) == 0) return TRUE;
+        unsigned int found = _wcsicmp(ids + offset, hardware_id) == 0 ? CHMLINK_CONFIG_MODE_ETHERNET :
+            _wcsicmp(ids + offset, ip_hardware_id) == 0 ? CHMLINK_CONFIG_MODE_IP : 0;
+        if (found && mode && found != mode) return 0;
+        if (found) mode = found;
     }
-    return FALSE;
+    return mode;
 }
 
-static int create(const wchar_t *inf, const wchar_t *owner, const wchar_t *name, const wchar_t *mac)
+BOOL ClIsDevice(HDEVINFO set, SP_DEVINFO_DATA *device) { return ClDeviceMode(set, device) != 0; }
+
+static int create(const wchar_t *inf, const wchar_t *owner, const wchar_t *name, const wchar_t *mac, BOOL ip)
 {
     HDEVINFO set;
     SP_DEVINFO_DATA device;
@@ -149,10 +186,15 @@ static int create(const wchar_t *inf, const wchar_t *owner, const wchar_t *name,
     if (!path_length || path_length >= MAX_PATH) {
         fprintf(stderr, "INF path is invalid or too long.\n"); return 1;
     }
+    if (!supported_package_version(path)) { fprintf(stderr, "Unsupported driver package version: %lu\n", GetLastError()); return 1; }
     if (!check_creation_package(path)) {
         fprintf(stderr, "Package preflight failed: %lu\n", GetLastError()); return 1;
     }
-    if (!ClNewConfig(&config, owner, name, mac) || !ClCheckUnique(NULL, NULL, &config)) {
+    if (!ClNewConfig(&config, owner, name, mac,
+        ip ? CHMLINK_CONFIG_MODE_IP : CHMLINK_CONFIG_MODE_ETHERNET)) {
+        fprintf(stderr, "Invalid or conflicting configuration: %lu\n", GetLastError()); return 1;
+    }
+    if (!ClCheckUnique(&config)) {
         fprintf(stderr, "Invalid or conflicting configuration: %lu\n", GetLastError()); return 1;
     }
     set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
@@ -165,8 +207,9 @@ static int create(const wchar_t *inf, const wchar_t *owner, const wchar_t *name,
                                   DICD_GENERATE_ID, &device)) goto fail;
     /* sizeof includes the terminator; one extra wchar makes a MULTI_SZ. */
     {
-        wchar_t ids[sizeof(hardware_id) / sizeof(wchar_t) + 1] = {0};
-        CopyMemory(ids, hardware_id, sizeof(hardware_id));
+        wchar_t ids[sizeof(ip_hardware_id) / sizeof(wchar_t) + 1] = {0};
+        const wchar_t *selected_id = ip ? ip_hardware_id : hardware_id;
+        CopyMemory(ids, selected_id, (wcslen(selected_id) + 1) * sizeof(wchar_t));
         if (!SetupDiSetDeviceRegistryPropertyW(set, &device, SPDRP_HARDWAREID,
                                                (const BYTE *)ids, sizeof(ids))) goto fail;
     }
@@ -251,6 +294,7 @@ static int install_existing(const wchar_t *instance, const wchar_t *inf)
     BOOL reboot = FALSE;
     CL_DEVICE_CONFIG config;
     if (!length || length >= MAX_PATH) return 1;
+    if (!supported_package_version(path)) { fprintf(stderr, "Unsupported driver package version: %lu\n", GetLastError()); return 1; }
     set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
     if (set == INVALID_HANDLE_VALUE) return 1;
     ZeroMemory(&device, sizeof(device)); device.cbSize = sizeof(device);
@@ -333,27 +377,29 @@ static int check_idle(const wchar_t *text)
 
 int wmain(int argc, wchar_t **argv)
 {
-    const wchar_t *owner = CHMLINK_DEFAULT_OWNER, *name = NULL, *mac = NULL;
-    BOOL creating, adopting, removing, owner_set = FALSE;
+    const wchar_t *owner = CHMLINK_DEFAULT_OWNER, *name = NULL, *mac = NULL, *mode = NULL;
+    BOOL creating, removing, owner_set = FALSE;
     HANDLE mutex;
     DWORD locked;
     int i, result;
-    if (argc == 2 && wcscmp(argv[1], L"version") == 0) { puts("3"); return 0; }
+    if (argc == 2 && wcscmp(argv[1], L"version") == 0) { puts("4"); return 0; }
     if (argc == 3 && wcscmp(argv[1], L"show") == 0) return ClShowConfig(argv[2]);
     if (argc == 4 && wcscmp(argv[1], L"install") == 0) return install_existing(argv[2], argv[3]);
     if (argc == 3 && wcscmp(argv[1], L"package-remove") == 0) return remove_package(argv[2]);
     if (argc == 3 && wcscmp(argv[1], L"check-idle") == 0) return check_idle(argv[2]);
     creating = argc >= 3 && wcscmp(argv[1], L"create") == 0;
-    adopting = argc >= 3 && wcscmp(argv[1], L"adopt") == 0;
     removing = argc >= 3 && wcscmp(argv[1], L"remove") == 0;
-    if (!creating && !adopting && !removing) goto usage;
+    if (!creating && !removing) goto usage;
     for (i = 3; i < argc; i += 2) {
         if (i + 1 == argc) goto usage;
         if (wcscmp(argv[i], L"--owner") == 0 && !owner_set) { owner = argv[i + 1]; owner_set = TRUE; }
         else if (wcscmp(argv[i], L"--name") == 0 && !removing && name == NULL) name = argv[i + 1];
         else if (wcscmp(argv[i], L"--mac") == 0 && creating && mac == NULL) mac = argv[i + 1];
+        else if (wcscmp(argv[i], L"--mode") == 0 && creating && mode == NULL) mode = argv[i + 1];
         else goto usage;
     }
+    if (mode && wcscmp(mode, L"ethernet") != 0 && wcscmp(mode, L"ip") != 0) goto usage;
+    if (mode && wcscmp(mode, L"ip") == 0 && mac != NULL) goto usage;
     mutex = CreateMutexW(NULL, FALSE, L"Global\\ChmLink.AdapterConfiguration");
     if (mutex == NULL) { fprintf(stderr, "Configuration lock failed: %lu\n", GetLastError()); return 1; }
     locked = WaitForSingleObject(mutex, 0);
@@ -362,13 +408,11 @@ int wmain(int argc, wchar_t **argv)
         CloseHandle(mutex);
         fprintf(stderr, "Configuration is busy or was interrupted; inspect the device inventory.\n"); return 1;
     }
-    if (creating) result = create(argv[2], owner, name, mac);
-    else if (adopting) result = ClAdoptDevice(argv[2], owner, name);
+    if (creating) result = create(argv[2], owner, name, mac, mode && wcscmp(mode, L"ip") == 0);
     else result = remove_device(argv[2], owner);
     ReleaseMutex(mutex); CloseHandle(mutex); return result;
 usage:
-    fwprintf(stderr, L"Usage: chmlink-device create <signed-inf-path> [--owner <GUID>] [--name <name>] [--mac <MAC>]\n"
-                     L"       chmlink-device adopt <exact-device-instance-id> [--owner <GUID>] [--name <name>]\n"
+    fwprintf(stderr, L"Usage: chmlink-device create <signed-inf-path> [--owner <GUID>] [--name <name>] [--mac <MAC>] [--mode ethernet|ip]\n"
                      L"       chmlink-device show <exact-device-instance-id>\n"
                      L"       chmlink-device remove <exact-device-instance-id> [--owner <GUID>]\n"
                      L"       chmlink-device install <exact-device-instance-id> <signed-inf-path>\n"

@@ -5,6 +5,8 @@
 #include "version.h"
 #define CHMLINK_ETHERNET_MTU 1500u
 #define CHMLINK_ETHERNET_LIMIT 1522u
+#define CHMLINK_IP_MTU 1500u
+#define CHMLINK_IP_LIMIT CHMLINK_IP_MTU
 #define CHMLINK_QUEUE_PACKETS 256u
 #define CHMLINK_IOCTL_RECEIVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA)
 #define CHMLINK_IOCTL_INJECT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_DATA)
@@ -34,7 +36,8 @@
  * or read-only access for inspection; allow read and write sharing. The
  * driver enforces one data session independently of read-only handles.
  * RECEIVE returns a protocol.h batch, or ERROR_NO_MORE_ITEMS (polling).
- * INJECT accepts a validated Ethernet batch. All requests are synchronous;
+ * INJECT accepts a validated batch matching the adapter mode. IP packets have
+ * no link-layer header. All requests are synchronous;
  * native structures and pointers never cross the device boundary.
  */
 

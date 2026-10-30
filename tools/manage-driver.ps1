@@ -32,7 +32,7 @@ function Get-Inventory {
     $result = @()
     foreach ($device in @(Get-PnpDevice -Class Net -ErrorAction Stop)) {
         $ids = @(Get-Property $device 'DEVPKEY_Device_HardwareIds')
-        if ($ids -inotcontains 'Root\ChmLink') { continue }
+        if ($ids -inotcontains 'Root\ChmLink' -and $ids -inotcontains 'Root\ChmLinkIP') { continue }
         if ((Get-Property $device 'DEVPKEY_Device_Service') -ine 'chmlink') {
             throw "Unexpected service on $($device.InstanceId)."
         }
@@ -42,10 +42,10 @@ function Get-Inventory {
         $index = 0; $guid = $null
         if ($adapter.Count -eq 1) { $index = [uint32]$adapter[0].InterfaceIndex; $guid = $adapter[0].GUID }
         $configuration = & $DeviceTool show $device.InstanceId
-        if ($LASTEXITCODE -ne 0) { throw "Missing or invalid persistent identity on $($device.InstanceId); explicitly adopt legacy devices first." }
+        if ($LASTEXITCODE -ne 0) { throw "Missing or incompatible identity on $($device.InstanceId); back up and recreate old devices." }
         $configuration = $configuration | ConvertFrom-Json
-        if ((!$configuration.Managed -or $configuration.Version -ne 1) -and $Action -ne 'Plan') {
-            throw 'Persistent identity is required; explicitly adopt legacy devices first.'
+        if ((!$configuration.Managed -or $configuration.Version -ne 2) -and $Action -ne 'Plan') {
+            throw 'Configuration version 2 is required; recreate old experimental devices after backing up their settings.'
         }
         $result += [pscustomobject]@{
             InstanceId = $device.InstanceId; PublishedInf = $inf
@@ -97,6 +97,17 @@ function Get-PackageVersion([string]$Path) {
         throw 'The INF is not a recognized ChmLink package.'
     }
     return $version
+}
+
+function Assert-TargetModes([string]$Path, $Devices) {
+    if (@($Devices | Where-Object { $_.Configuration.Mode -eq 2 }).Count) {
+        $targetInf = Get-Content -LiteralPath $Path -Raw
+        foreach ($install in @('InstallIpLegacy', 'InstallIpStore')) {
+            if ($targetInf -notmatch "(?im)^\s*[^;=\r\n]+\s*=\s*$install\s*,\s*Root\\ChmLinkIP\s*`$") {
+                throw 'Target package does not support existing IP devices on both OS paths.'
+            }
+        }
+    }
 }
 
 function Save-Journal {
@@ -258,6 +269,7 @@ function Assert-Inventory($Current) {
                 throw "Persistent configuration changed for $($device.InstanceId)."
             }
         }
+        if ($device.Configuration.Mode -ne $original.Configuration.Mode) { throw "Adapter mode changed for $($device.InstanceId)." }
         if ($device.PublishedInf -ieq $original.PublishedInf) { continue }
         $step = @($script:record.Steps | Where-Object InstanceId -eq $device.InstanceId)
         if ($step.Count -ne 1) { throw 'An untouched device changed package.' }
@@ -284,7 +296,7 @@ $configMutex = $null; $configLocked = $false
 try {
     $DeviceTool = (Resolve-Path -LiteralPath $DeviceTool).Path
     $toolVersion = & $DeviceTool version
-    if ($LASTEXITCODE -ne 0 -or ($toolVersion -join '').Trim() -ne '3') { throw 'Device tool version 3 is required.' }
+    if ($LASTEXITCODE -ne 0 -or ($toolVersion -join '').Trim() -ne '4') { throw 'Device tool version 4 is required.' }
     if ($Action -eq 'Plan') {
         $inventory = @(Get-Inventory)
         $target = if ($InfPath) { [string](Get-PackageVersion (Resolve-Path -LiteralPath $InfPath).Path) } else { $null }
@@ -317,7 +329,7 @@ try {
     if ($Action -eq 'Rollback') {
         $journal = (Resolve-Path -LiteralPath $JournalPath).Path
         $record = Get-Content -LiteralPath $journal -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($record.Schema -ne 2 -or $record.ComputerName -ine $env:COMPUTERNAME -or
+        if ($record.Schema -ne 3 -or $record.ComputerName -ine $env:COMPUTERNAME -or
             $record.MachineId -ne (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid -or
             $record.Status -notin @('Installing', 'UpgradeFailed', 'Upgraded', 'UpgradePendingReboot', 'RecoveryPendingReboot', 'RollingBack', 'RollbackIncomplete', 'RollbackPendingReboot')) {
             throw 'Journal schema, computer or recovery state is invalid.'
@@ -340,13 +352,16 @@ try {
     $source = (Resolve-Path -LiteralPath $InfPath).Path
     if ([IO.Path]::GetFileName($source) -ine 'chmlink.inf') { throw 'Expected chmlink.inf.' }
     $version = Get-PackageVersion $source
+    if ($version -lt [version]'0.3.0.0') { throw 'Target package predates configuration version 2.' }
     Assert-NoPendingReboot
     $devices = @(Get-Inventory)
     if (!$devices.Count) { throw 'No installed ChmLink devices; use create instead.' }
+    Assert-TargetModes $source $devices
     if (@($devices.PublishedInf | Sort-Object -Unique).Count -ne 1) {
         throw 'Instances have inconsistent package bindings; reconcile them before a shared-service upgrade.'
     }
     foreach ($device in $devices) {
+        if ([version]$device.Version -lt [version]'0.3.0.0') { throw 'Installed package predates configuration version 2.' }
         if (!$AllowDowngrade -and $version -le [version]$device.Version) {
             throw 'Target must be newer than every installed version; use -AllowDowngrade for explicit repair/downgrade.'
         }
@@ -355,7 +370,7 @@ try {
     if (Test-Path -LiteralPath $RecoveryDirectory) { throw 'RecoveryDirectory must not already exist.' }
     $directory = New-Item -ItemType Directory -Path $RecoveryDirectory
     $journal = Join-Path $directory.FullName 'journal.json'
-    $record = [pscustomobject]@{ Schema = 2; ComputerName = $env:COMPUTERNAME; Status = 'BackingUp'
+    $record = [pscustomobject]@{ Schema = 3; ComputerName = $env:COMPUTERNAME; Status = 'BackingUp'
         MachineId = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
         OperationBootUtc = (Get-BootTime)
         TargetVersion = [string]$version; Devices = $devices; Backups = @(); Steps = @()
@@ -376,6 +391,7 @@ try {
     }
     $record | Add-Member -NotePropertyName TargetFiles -NotePropertyValue @(Get-Hashes $payload)
     if ((Get-PackageVersion (Join-Path $payload 'chmlink.inf')) -ne $version) { throw 'Target package changed while copying.' }
+    Assert-TargetModes (Join-Path $payload 'chmlink.inf') $devices
     foreach ($backup in @($record.Backups)) { $null = Assert-Backup $backup }
     $current = @(Get-Inventory)
     Assert-Inventory $current

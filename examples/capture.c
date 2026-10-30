@@ -19,6 +19,7 @@ int main(int argc, char **argv)
     unsigned long index;
     char *end;
     chmlink_adapter *adapter;
+    chmlink_adapter_info info;
     uint8_t *buffer;
     int result = 0;
     if (argc != 2) { fprintf(stderr, "Usage: chmlink-capture <interface-index>\n"); return 2; }
@@ -29,6 +30,9 @@ int main(int argc, char **argv)
     if (!buffer) return 1;
     adapter = chmlink_open((uint32_t)index);
     if (!adapter) { fprintf(stderr, "Open failed: %lu\n", GetLastError()); free(buffer); return 1; }
+    if (!chmlink_query(adapter, &info)) {
+        fprintf(stderr, "Query failed: %lu\n", GetLastError()); chmlink_close(adapter); free(buffer); return 1;
+    }
     SetConsoleCtrlHandler(stop, TRUE);
     while (!InterlockedCompareExchange(&stopping, 0, 0)) {
         uint32_t received, count;
@@ -41,8 +45,8 @@ int main(int argc, char **argv)
             }
             fprintf(stderr, "Receive failed: %lu\n", error); result = 1; break;
         }
-        if (chmlink_batch_validate(buffer, received, CHMLINK_MODE_ETHERNET, 1522, &count) == CHMLINK_OK)
-            printf("Received %lu frames (%lu batch bytes)\n", (unsigned long)count, (unsigned long)received);
+        if (chmlink_batch_validate(buffer, received, (chmlink_mode)info.mode, info.packet_limit, &count) == CHMLINK_OK)
+            printf("Received %lu packets (%lu batch bytes)\n", (unsigned long)count, (unsigned long)received);
     }
     chmlink_close(adapter);
     free(buffer);

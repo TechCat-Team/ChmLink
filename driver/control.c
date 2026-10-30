@@ -39,7 +39,8 @@ static NTSTATUS receive(CL_ADAPTER *a, PIRP irp, ULONG size)
     KIRQL irql;
     if (size > CHMLINK_BATCH_MAX_SIZE) return STATUS_INVALID_BUFFER_SIZE;
     result = chmlink_batch_begin(&writer, irp->AssociatedIrp.SystemBuffer, size,
-                                CHMLINK_MODE_ETHERNET, CHMLINK_ETHERNET_LIMIT);
+                                (chmlink_mode)a->Mode,
+                                a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT);
     if (result != CHMLINK_OK) return STATUS_BUFFER_TOO_SMALL;
     KeAcquireSpinLock(&a->Lock, &irql);
     while (a->Count != 0) {
@@ -87,8 +88,9 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
     NTSTATUS status = STATUS_SUCCESS;
 
     /* METHOD_BUFFERED provides the owned, nonpaged snapshot. */
-    if (chmlink_batch_validate(bytes, size, CHMLINK_MODE_ETHERNET,
-        CHMLINK_ETHERNET_LIMIT, &count) != CHMLINK_OK) return STATUS_INVALID_PARAMETER;
+    if (chmlink_batch_validate(bytes, size, a->Mode,
+        a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT, &count) != CHMLINK_OK)
+        return STATUS_INVALID_PARAMETER;
     mdl = IoAllocateMdl((PVOID)bytes, size, FALSE, FALSE, NULL);
     if (mdl == NULL) return STATUS_INSUFFICIENT_RESOURCES;
     MmBuildMdlForNonPagedPool(mdl);
@@ -99,12 +101,20 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
         NdisMoveMemory(&length, bytes + offset, sizeof(length));
         offset += 4;
         KeAcquireSpinLock(&a->Lock, &irql);
-        accept = accepts(a, bytes + offset);
+        accept = a->Mode == CHMLINK_MODE_IP ? TRUE : accepts(a, bytes + offset);
         KeReleaseSpinLock(&a->Lock, irql);
         if (accept) {
             nbl = NdisAllocateNetBufferAndNetBufferList(a->Pool, 0, 0, mdl, offset, length);
             if (nbl == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
             nbl->SourceHandle = a->Handle;
+            if (a->Mode == CHMLINK_MODE_IP) {
+                BOOLEAN ipv4 = (bytes[offset] >> 4) == 4;
+                NdisClearNblFlag(nbl, NDIS_NBL_FLAGS_IS_IPV4 | NDIS_NBL_FLAGS_IS_IPV6);
+                NdisSetNblFlag(nbl, ipv4 ? NDIS_NBL_FLAGS_IS_IPV4 : NDIS_NBL_FLAGS_IS_IPV6);
+                /* NetBufferListFrameType stores the network-order EtherType;
+                 * all supported Windows targets use little-endian byte order. */
+                NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) = (PVOID)(ULONG_PTR)(ipv4 ? 0x0008u : 0xdd86u);
+            }
             NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
             if (last != NULL) NET_BUFFER_LIST_NEXT_NBL(last) = nbl;
             else first = nbl;
@@ -180,11 +190,12 @@ static NTSTATUS query(CL_ADAPTER *a, PIRP irp, ULONG size)
     if (size < CHMLINK_INFO_SIZE) return STATUS_BUFFER_TOO_SMALL;
     NdisZeroMemory(p, CHMLINK_INFO_SIZE);
     put32(p, CHMLINK_DEVICE_VERSION); put32(p + 4, CHMLINK_INFO_SIZE);
-    put32(p + 8, CHMLINK_CAP_ETHERNET | CHMLINK_CAP_BATCH | CHMLINK_CAP_STATISTICS | CHMLINK_CAP_WAIT);
-    put32(p + 16, CHMLINK_MODE_ETHERNET);
+    put32(p + 8, (a->Mode == CHMLINK_MODE_IP ? CHMLINK_CAP_IP : CHMLINK_CAP_ETHERNET) |
+          CHMLINK_CAP_BATCH | CHMLINK_CAP_STATISTICS | CHMLINK_CAP_WAIT);
+    put32(p + 16, (ULONG)a->Mode);
     put32(p + 20, a->InterfaceIndex); put32(p + 24, CHMLINK_ETHERNET_MTU);
-    put32(p + 28, CHMLINK_ETHERNET_LIMIT); put32(p + 32, CHMLINK_QUEUE_PACKETS);
-    NdisMoveMemory(p + 48, a->Mac, sizeof(a->Mac));
+    put32(p + 28, a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT); put32(p + 32, CHMLINK_QUEUE_PACKETS);
+    if (a->Mode != CHMLINK_MODE_IP) NdisMoveMemory(p + 48, a->Mac, sizeof(a->Mac));
     put64(p + 56, a->Luid.Value);
     KeAcquireSpinLock(&a->Lock, &irql);
     put32(p + 12, (a->State == ClAdapterRunning ? CHMLINK_STATE_RUNNING : 0) |

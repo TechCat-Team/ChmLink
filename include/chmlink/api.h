@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "version.h"
+#include "packet.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,7 +27,7 @@ typedef struct chmlink_adapter_info {
     uint32_t version, capabilities, state, mode;
     uint32_t interface_index, mtu, packet_limit, queue_capacity, queued_packets;
     uint32_t packet_filter;
-    uint8_t mac[6];
+    uint8_t mac[6]; /* Ethernet MAC; all zero for IP mode. */
     char interface_id[39];
     /* TX means Windows -> user mode; RX means user mode -> Windows.
      * Packet/byte totals count accepted packets, not peer delivery. tx_errors

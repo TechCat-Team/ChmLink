@@ -2,12 +2,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Create', 'Adopt', 'ApplyName')]
+    [ValidateSet('Create', 'ApplyName')]
     [string]$Action,
     [string]$InfPath,
     [string]$InstanceId,
     [string]$Name,
     [string]$Mac,
+    [ValidateSet('ethernet', 'ip')][string]$Mode = 'ethernet',
     [guid]$OwnerId = '7C71F369-78C2-44F4-94CD-A2C14A29469B',
     [string]$DeviceTool = "$PSScriptRoot/../build/Release/chmlink-device.exe"
 )
@@ -25,12 +26,14 @@ try {
     }
     $DeviceTool = (Resolve-Path -LiteralPath $DeviceTool).Path
     $version = & $DeviceTool version
-    if ($LASTEXITCODE -ne 0 -or ($version -join '').Trim() -ne '3') { throw 'Device tool version 3 is required.' }
+    if ($LASTEXITCODE -ne 0 -or ($version -join '').Trim() -ne '4') { throw 'Device tool version 4 is required.' }
     if ($Action -eq 'Create') {
         if (!$InfPath -or $InstanceId) { throw 'Create requires InfPath and does not accept InstanceId.' }
+        if ($Mode -eq 'ip' -and $Mac) { throw 'IP adapters do not have a MAC address.' }
         $arguments = @('create', (Resolve-Path -LiteralPath $InfPath).Path, '--owner', $OwnerId.ToString('B'))
         if ($Name) { $arguments += @('--name', $Name) }
         if ($Mac) { $arguments += @('--mac', $Mac) }
+        $arguments += @('--mode', $Mode.ToLowerInvariant())
         $changed = $true # native stderr can throw before LASTEXITCODE is inspected
         $output = & $DeviceTool @arguments
         $code = $LASTEXITCODE
@@ -39,21 +42,11 @@ try {
         $changed = $true; $nativeRestart = $code -eq 3010
         $created = $output | ConvertFrom-Json
         $InstanceId = $created.InstanceId
-    } elseif ($Action -eq 'Adopt') {
-        if (!$InstanceId -or $InfPath -or $Mac) { throw 'Adopt requires InstanceId and preserves the current MAC.' }
-        $arguments = @('adopt', $InstanceId, '--owner', $OwnerId.ToString('B'))
-        if ($Name) { $arguments += @('--name', $Name) }
-        $changed = $true
-        & $DeviceTool @arguments | Out-Host
-        $code = $LASTEXITCODE
-        $changed = $code -eq 3
-        if ($code -ne 0) { throw 'Adoption failed; inspect the device inventory before retrying.' }
-        $changed = $true
-    } elseif (!$InstanceId -or $InfPath -or $Name -or $Mac) {
+    } elseif (!$InstanceId -or $InfPath -or $Name -or $Mac -or $PSBoundParameters.ContainsKey('Mode')) {
         throw 'ApplyName requires InstanceId and applies its stored name; creation parameters are not accepted.'
     }
 
-    # Native create/adopt take this same lock themselves. Acquire it after they
+    # Native create takes this same lock itself. Acquire it after it
     # return, then recheck identity before applying the connection alias.
     $mutex = [Threading.Mutex]::new($false, 'Global\ChmLink.AdapterConfiguration')
     try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] {
@@ -70,7 +63,7 @@ try {
     }
     $adapter = @(Get-NetAdapter -IncludeHidden | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$windows[0].GUID })
     if ($adapter.Count -ne 1) { throw 'Cannot resolve a unique interface for the saved device.' }
-    if ($adapter[0].MacAddress.Replace('-', ':') -ine $configuration.Mac) {
+    if ($configuration.Mode -eq 1 -and $adapter[0].MacAddress.Replace('-', ':') -ine $configuration.Mac) {
         throw 'The running MAC differs from the stored identity; inspect or restart the adapter before naming it.'
     }
     if ($adapter[0].Name -cne $configuration.Name) {

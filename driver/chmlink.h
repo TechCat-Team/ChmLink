@@ -9,6 +9,9 @@
 #include "chmlink/protocol.h"
 #include "chmlink/config.h"
 
+typedef char CL_MODE_IP_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_IP == CHMLINK_MODE_IP) ? 1 : -1];
+typedef char CL_MODE_ETHERNET_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_ETHERNET == CHMLINK_MODE_ETHERNET) ? 1 : -1];
+
 #define CL_TAG 'kLmC'
 #define CL_FILTERS (NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST | \
     NDIS_PACKET_TYPE_ALL_MULTICAST | NDIS_PACKET_TYPE_BROADCAST | NDIS_PACKET_TYPE_PROMISCUOUS)
@@ -50,6 +53,7 @@ typedef struct CL_ADAPTER {
     ULONG MulticastCount;
     UCHAR Multicast[CL_MULTICAST_MAX][6];
     UCHAR Mac[6];
+    chmlink_mode Mode;
     UCHAR Configuration[CHMLINK_CONFIG_SIZE];
     CL_PACKET *Queue;
     ULONG Head;
@@ -64,6 +68,8 @@ extern LIST_ENTRY ClAdapters;
 extern KSPIN_LOCK ClAdaptersLock;
 extern const NDIS_OID ClOids[];
 extern const ULONG ClOidBytes;
+extern const NDIS_OID ClIpOids[];
+extern const ULONG ClIpOidBytes;
 
 DRIVER_INITIALIZE DriverEntry;
 MINIPORT_UNLOAD ClUnload;

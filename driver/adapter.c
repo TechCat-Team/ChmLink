@@ -87,6 +87,7 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     if (a->Queue == NULL) { ClRelease(a); return NDIS_STATUS_RESOURCES; }
     status = ClReadConfiguration(handle, a->Configuration);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
+    a->Mode = (chmlink_mode)chmlink_config_mode(a->Configuration);
     NdisMoveMemory(a->Mac, a->Configuration + 48, sizeof(a->Mac));
 
     NdisZeroMemory(&registration, sizeof(registration));
@@ -107,7 +108,7 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     general.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES;
     general.Header.Revision = NDIS_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_2;
     general.Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_2;
-    general.MediaType = NdisMedium802_3;
+    general.MediaType = a->Mode == CHMLINK_MODE_IP ? NdisMediumIP : NdisMedium802_3;
     general.PhysicalMediumType = NdisPhysicalMediumUnspecified;
     general.MtuSize = CHMLINK_ETHERNET_MTU;
     general.MaxXmitLinkSpeed = general.MaxRcvLinkSpeed = 1000000000ULL;
@@ -118,17 +119,19 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     general.MacOptions = NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA |
         NDIS_MAC_OPTION_TRANSFERS_NOT_PEND | NDIS_MAC_OPTION_NO_LOOPBACK;
     general.SupportedPacketFilters = CL_FILTERS;
-    general.MaxMulticastListSize = CL_MULTICAST_MAX;
-    general.MacAddressLength = 6;
-    NdisMoveMemory(general.PermanentMacAddress, a->Mac, sizeof(a->Mac));
-    NdisMoveMemory(general.CurrentMacAddress, a->Mac, sizeof(a->Mac));
-    general.AccessType = NET_IF_ACCESS_BROADCAST;
+    general.MaxMulticastListSize = a->Mode == CHMLINK_MODE_IP ? 0 : CL_MULTICAST_MAX;
+    general.MacAddressLength = a->Mode == CHMLINK_MODE_IP ? 0 : 6;
+    if (a->Mode != CHMLINK_MODE_IP) {
+        NdisMoveMemory(general.PermanentMacAddress, a->Mac, sizeof(a->Mac));
+        NdisMoveMemory(general.CurrentMacAddress, a->Mac, sizeof(a->Mac));
+    }
+    general.AccessType = a->Mode == CHMLINK_MODE_IP ? NET_IF_ACCESS_POINT_TO_POINT : NET_IF_ACCESS_BROADCAST;
     general.DirectionType = NET_IF_DIRECTION_SENDRECEIVE;
     general.ConnectionType = NET_IF_CONNECTION_DEDICATED;
-    general.IfType = IF_TYPE_ETHERNET_CSMACD;
+    general.IfType = a->Mode == CHMLINK_MODE_IP ? IF_TYPE_PROP_VIRTUAL : IF_TYPE_ETHERNET_CSMACD;
     general.IfConnectorPresent = FALSE;
-    general.SupportedOidList = (PNDIS_OID)ClOids;
-    general.SupportedOidListLength = ClOidBytes;
+    general.SupportedOidList = (PNDIS_OID)(a->Mode == CHMLINK_MODE_IP ? ClIpOids : ClOids);
+    general.SupportedOidListLength = a->Mode == CHMLINK_MODE_IP ? ClIpOidBytes : ClOidBytes;
     general.PowerManagementCapabilitiesEx = &power;
     general.SupportedStatistics = NDIS_STATISTICS_FLAGS_VALID_BYTES_RCV |
         NDIS_STATISTICS_FLAGS_VALID_BYTES_XMIT | NDIS_STATISTICS_FLAGS_VALID_XMIT_ERROR |
@@ -150,7 +153,8 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     KeAcquireSpinLock(&ClAdaptersLock, &irql);
     for (entry = ClAdapters.Flink; entry != &ClAdapters; entry = entry->Flink) {
         CL_ADAPTER *other = CONTAINING_RECORD(entry, CL_ADAPTER, Link);
-        if (RtlCompareMemory(other->Mac, a->Mac, sizeof(a->Mac)) == sizeof(a->Mac) ||
+        if ((other->Mode == CHMLINK_MODE_ETHERNET && a->Mode == CHMLINK_MODE_ETHERNET &&
+             RtlCompareMemory(other->Mac, a->Mac, sizeof(a->Mac)) == sizeof(a->Mac)) ||
             RtlCompareMemory(other->Configuration + 16, a->Configuration + 16, 16) == 16) {
             KeReleaseSpinLock(&ClAdaptersLock, irql);
             NdisDeregisterDeviceEx(a->ControlHandle);
@@ -253,7 +257,8 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
             ULONG length = NET_BUFFER_DATA_LENGTH(nb);
             CL_PACKET *packet;
             PVOID source;
-            if (length < 14 || length > CHMLINK_ETHERNET_LIMIT) {
+            if (length < (a->Mode == CHMLINK_MODE_IP ? 20u : 14u) ||
+                length > (a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT)) {
                 status = NDIS_STATUS_INVALID_LENGTH; break;
             }
             if (a->Count + added >= CHMLINK_QUEUE_PACKETS) {
@@ -264,6 +269,10 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
             source = NdisGetDataBuffer(nb, length, packet->Bytes, 1, 0);
             if (source == NULL) { status = NDIS_STATUS_RESOURCES; break; }
             if (source != packet->Bytes) NdisMoveMemory(packet->Bytes, source, length);
+            if (a->Mode == CHMLINK_MODE_IP &&
+                !chmlink_ip_packet_valid(packet->Bytes, length, CHMLINK_IP_LIMIT)) {
+                status = NDIS_STATUS_INVALID_DATA; break;
+            }
             packet->Length = length;
             added++;
             bytes += length;

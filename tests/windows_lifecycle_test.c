@@ -195,9 +195,9 @@ int wmain(int argc, wchar_t **argv)
     if (argc != 3) { fwprintf(stderr, L"Usage: chmlink-lifecycle-test <first-index> <second-index>\n"); return 2; }
     first = parse_index(argv[1]); second = parse_index(argv[2]); CHECK(first != second);
     a = chmlink_open(first); b = chmlink_open(second); CHECK(a && b);
-    CHECK(chmlink_inspect(first, &before));
+    CHECK(chmlink_inspect(first, &before) && before.mode == CHMLINK_MODE_ETHERNET);
     duplicate = chmlink_open(first); CHECK(!duplicate && GetLastError() == ERROR_SHARING_VIOLATION);
-    CHECK(chmlink_query(b, &after)); CHECK(after.interface_index == second);
+    CHECK(chmlink_query(b, &after)); CHECK(after.interface_index == second && after.mode == CHMLINK_MODE_ETHERNET);
     timeout_check(a); timeout_check(b);
     CHECK(chmlink_cancel_wait(a)); timeout_check(a); /* no active wait: no latch */
     chmlink_close(a);

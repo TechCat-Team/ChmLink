@@ -7,5 +7,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                                CHMLINK_PACKET_MAX_SIZE, NULL);
     (void)chmlink_batch_validate(data, size, CHMLINK_MODE_IP,
                                CHMLINK_PACKET_MAX_SIZE, NULL);
+    (void)chmlink_ip_packet_valid(data, size, CHMLINK_PACKET_MAX_SIZE);
     return 0;
 }

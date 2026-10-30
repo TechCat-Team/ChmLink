@@ -10,6 +10,11 @@ device provisioning utility. IP mode, Rust device I/O, production signing,
 and runtime qualification have not been completed. It cannot replace TAP or
 Wintun in production yet.
 
+An experimental raw-IP path now includes a separate device ID, NDIS attributes,
+packet queues, injection and SDK mode negotiation. This code has not yet been
+built or validated on Windows. IP protocol binding and packet behavior remain
+unproven; do not use this experimental package outside a disposable test VM.
+
 The compatibility target is Windows 10 version 1607 (build 14393) /
 Windows Server 2016 and later. These are development targets, not verified
 support. The planned NDIS baseline is 6.60.
@@ -36,8 +41,9 @@ The protocol uses explicit little-endian fields and bounded batches. The
 receiver validates the complete batch before submitting packets. Driver code
 must first copy user input into an owned snapshot; parsing a live shared buffer
 does not provide protection against concurrent modification. The current
-packet checks cover minimum header sizes and IP version, not full protocol
-validity. The transport format is experimental and may change before release.
+packet checks cover Ethernet minimum size and IP header/declared lengths;
+they do not validate checksums or complete protocol semantics. The transport
+format is experimental and may change before release.
 
 For fuzz testing, build `tests/fuzz_batch.c`, `src/protocol/batch.c`, and
 `src/packet/packet.c` with Clang using `-Iinclude` and
@@ -65,15 +71,16 @@ registered with CTest. A test failure does not establish a driver defect without
 examining its logs and environment.
 
 On Windows 11 build 26200 x64, initial runs of this suite and the ARP roundtrip
-also passed with standard Driver Verifier enabled for `chmlink.sys`. Broader
+passed with standard Driver Verifier enabled for the earlier 0.2.0.0 Ethernet
+driver. The current 0.3.0.0 development revision has not yet been tested. Broader
 NDIS/WLAN verification, prolonged stress, power transitions, fault injection and
 minimum-version runtime coverage remain outstanding.
 
 ## Windows prototype
 
-The current SDK requires device interface version 2. It rejects older drivers
+The current SDK requires device interface version 3. It rejects older drivers
 without the metadata query instead of silently assuming compatible limits.
-Version 1 packet batches and the existing receive/inject IOCTLs are unchanged.
+Version 1 packet batches and the existing receive/inject IOCTL numbers are unchanged.
 `chmlink-list` enumerates accessible adapters and prints their GUID, state,
 capabilities and cumulative counters without connecting a data session.
 `chmlink_open_by_id` opens by interface GUID and checks the resolved identity;
@@ -145,17 +152,55 @@ the same package. Native creation compares the supplied INF, SYS and CAT against
 the packages bound to existing ChmLink instances and refuses different content;
 upgrade the existing instances explicitly before creating additional adapters.
 
+## Experimental IP adapter
+
+The same INF describes `Root\ChmLink` (Ethernet) and `Root\ChmLinkIP` (raw IP).
+The prototype uses `NdisMediumIP`, a 1500-byte MTU and one complete IPv4 or
+IPv6 packet per batch record. The API's mode and capability fields identify
+the data format; IP metadata has a zero MAC. IPv6 jumbograms are not supported.
+IP packet validation checks framing, not IP checksums or transport semantics.
+
+In a disposable test VM, after signing and installing the experimental package,
+the intended creation command is:
+
+```powershell
+.\tools\manage-adapter.ps1 -Action Create -InfPath C:\packages\signed\chmlink.inf -Mode ip -Name 'ChmLink IP Test'
+```
+
+Creation and binding have not yet been validated. With IPv4/IPv6 addresses and
+routes explicitly configured on the test adapter, `chmlink-ip-test <ifIndex>
+<local4> <peer4> <local6> <peer6>` is intended to exercise UDP in both
+directions using simulated peers. An optional final Ethernet interface index
+adds an isolation check. It opens exclusive sessions and does not configure the
+addresses or routes. Use isolated addresses and run only in the test VM.
+`chmlink-capture` and `chmlink-inject` select the reported adapter format.
+
+`tools/test-ip.ps1 -InfPath <signed-inf> -OutputDirectory <new-directory>` is
+an opt-in test runner for the disposable VM. It creates owned IP and Ethernet adapters,
+temporarily configures documentation-range IPv4/IPv6 addresses in ActiveStore,
+executes the two UDP roundtrips and an isolation check, then removes both. The addresses and
+peer routes must be isolated from the rest of the test VM. The runner and test
+are not automatically registered in CTest and have not yet been executed.
+
+Both modes share one service and package, so package upgrades affect all
+instances. Stop clients and use version 4 maintenance tooling for both modes.
+Do not use older management tools while IP devices exist: their inventory does
+not include the IP hardware ID. A downgrade is refused if the target INF lacks
+the IP model. Complete validation must cover mixed instances, interruption,
+rollback, minimum Windows versions, signing and Driver Verifier.
+
 ## Persistent adapter configuration
 
-Driver package 0.2.0.0 requires configuration version 1. Each device stores an
-immutable adapter GUID, owner GUID and locally administered unicast MAC in a
-64-byte versioned registry value, together with its desired name. The driver
+Driver package 0.3.0.0 requires configuration version 2. Each device stores an
+immutable adapter GUID, owner GUID and mode in a 64-byte versioned registry
+value, together with its desired name. Ethernet also stores a locally
+administered unicast MAC; IP has no MAC address. The driver
 reads this state from the device hardware key rather than deriving a MAC from
 the interface index. Removing and recreating a device creates a new identity;
 this is not persistence across device deletion or cloning to another machine.
 The adapter GUID is distinct from the Windows interface GUID used by the SDK.
 
-Creation generates a random MAC unless `-Mac '02:11:22:33:44:55'` is supplied.
+Ethernet creation generates a random MAC unless `-Mac '02:11:22:33:44:55'` is supplied.
 Names default to `ChmLink-<adapter-guid>`. Configuration rejects multicast and
 globally administered MACs, empty GUIDs, malformed values, duplicate configured
 identities/names/MACs and conflicts with MACs visible in the local interface
@@ -168,23 +213,18 @@ ownership is an administrative mistake-prevention check, not a security boundary
 against administrators. Package maintenance still coordinates every instance
 because they share a driver service.
 
-Migrate old devices explicitly while their original driver is still running:
-
-```powershell
-.\tools\manage-adapter.ps1 -Action Adopt -InstanceId 'ROOT\NET\0000'
-.\build\Release\chmlink-device.exe show 'ROOT\NET\0000'
-```
-
-Adopt preserves the current MAC, records the current connection name unless
-`-Name` is supplied, and never overwrites an existing identity. It does not
-install or restart a driver. Unmanaged devices remain visible in the package
-Plan output; they must be adopted before installation of 0.2.0.0. Missing or
-invalid configuration causes the new driver to refuse initialization instead
-of generating a replacement identity. Recovery to older drivers retains the
-configuration, but older binaries do not implement the new persistence contract.
+This unreleased version deliberately breaks configuration version 1 and removes
+the old Adopt command. Before replacing an older test package, back up the old
+package and the device identity, address, route and DNS settings. Remove old
+devices using their matching old tool and owner ID, then install the new package
+and create new devices. Recreating a device assigns a new identity and can
+change its Windows interface GUID and network configuration. The new tool does
+not upgrade or remove a device whose configuration it cannot validate. Preserve
+the old signed package and version 3 tool before building into any directory
+that could overwrite them; use a separate build directory for 0.3.0.0.
 
 `manage-adapter.ps1` applies the stored name to the exact Windows interface GUID
-after native creation/adoption. Native `create` alone sets the device friendly
+after native creation. Native `create` alone sets the device friendly
 name; the script also sets the network connection alias. If the interface is not
 ready or naming fails, it keeps the device and reports partial completion. Retry
 without creating another adapter:
@@ -193,7 +233,7 @@ without creating another adapter:
 .\tools\manage-adapter.ps1 -Action ApplyName -InstanceId 'ROOT\NET\0000'
 ```
 
-Use the same owner ID on retries. Creation/adoption return native code 3 when
+Use the same owner ID on retries. Creation returns native code 3 when
 device cleanup or configuration persistence is uncertain. The wrapper also
 returns 3 when naming is incomplete; 3010 means a manual restart is required.
 It never removes a successfully created device to undo a naming failure.
@@ -204,7 +244,9 @@ It never removes a successfully created device to undo a naming failure.
 builds and VM checks have passed on Windows 11 build 26200 with PowerShell 5.1:
 legacy migration, invalid configuration rejection, ownership checks, naming
 retry, upgrades, rollback, ARP traffic and identity persistence across a reboot.
-The driver also passed the build's INF and catalog checks. This is initial
+Those results apply to the earlier 0.2.0.0 Ethernet package, not the new IP
+prototype or its changed configuration. The earlier driver also passed the
+build's INF and catalog checks. This is initial
 coverage; minimum-version compatibility, Driver Verifier, stress, power and
 fault-injection qualification remain incomplete. Continue using a disposable
 test VM with a snapshot. The script targets Windows PowerShell 5.1 and the same
@@ -219,7 +261,7 @@ disconnected devices, together with its package, identity and network settings:
 
 Stop all ChmLink clients and provisioning tools before changing packages. Run
 the remaining commands in an elevated PowerShell, using a freshly built version
-3 `chmlink-device.exe`. `-MaintenanceWindow` acknowledges that clients have been
+4 `chmlink-device.exe`. `-MaintenanceWindow` acknowledges that clients have been
 stopped. The idle probe briefly opens a data session and can change link state;
 it cannot prevent a client from opening later. The maintenance mutex serializes
 this script only. Keep other installers and low-level device tools stopped.
@@ -271,7 +313,7 @@ recovery is best effort and cannot promise uninterrupted networking.
 | 3010 | Requested upgrade or rollback was applied and requires a manual restart. |
 
 The script never restarts Windows, removes devices, deletes recovery files or
-forces package deletion. Version 3 tooling writes journal schema 2 and refuses
+forces package deletion. Version 4 tooling writes journal schema 3 and refuses
 older journals; retain the corresponding older tools for any older recovery
 directories. RemovePackage accepts only a recognized ChmLink OEM
 INF and refuses packages still associated with devices. Windows also guards

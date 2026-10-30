@@ -11,6 +11,7 @@
 struct chmlink_adapter {
     HANDLE device;
     uint32_t packet_limit;
+    chmlink_mode mode;
     uint32_t capabilities;
     HANDLE ready_event, cancel_event, close_event;
     SRWLOCK gate;
@@ -84,11 +85,17 @@ static int query_device(HANDLE device, chmlink_adapter_info *info)
         get32(bytes + 4) != sizeof(bytes)) {
         SetLastError(ERROR_REVISION_MISMATCH); return 0;
     }
-    if (get32(bytes + 16) != CHMLINK_MODE_ETHERNET ||
-        (get32(bytes + 8) & (CHMLINK_CAP_ETHERNET | CHMLINK_CAP_BATCH)) !=
-        (CHMLINK_CAP_ETHERNET | CHMLINK_CAP_BATCH) ||
-        get32(bytes + 28) > CHMLINK_PACKET_MAX_SIZE || get32(bytes + 28) < 14 ||
-        get32(bytes + 24) == 0 || get32(bytes + 24) > get32(bytes + 28) - 14 ||
+    if ((get32(bytes + 8) & CHMLINK_CAP_BATCH) == 0 ||
+        (get32(bytes + 16) == CHMLINK_MODE_ETHERNET ?
+            (!(get32(bytes + 8) & CHMLINK_CAP_ETHERNET) || (get32(bytes + 8) & CHMLINK_CAP_IP) ||
+             get32(bytes + 28) < 14 ||
+             get32(bytes + 24) > get32(bytes + 28) - 14) :
+         get32(bytes + 16) == CHMLINK_MODE_IP ?
+            (!(get32(bytes + 8) & CHMLINK_CAP_IP) || (get32(bytes + 8) & CHMLINK_CAP_ETHERNET) ||
+             get32(bytes + 28) < 1280 || get32(bytes + 24) < 1280 ||
+             bytes[48] || bytes[49] || bytes[50] || bytes[51] || bytes[52] || bytes[53] ||
+             get32(bytes + 24) != get32(bytes + 28)) : 1) ||
+        get32(bytes + 28) > CHMLINK_PACKET_MAX_SIZE || get32(bytes + 24) == 0 ||
         get32(bytes + 32) == 0 ||
         get32(bytes + 36) > get32(bytes + 32)) {
         SetLastError(ERROR_INVALID_DATA); return 0;
@@ -164,6 +171,7 @@ chmlink_adapter *chmlink_open(uint32_t index)
     }
     adapter->device = device;
     adapter->packet_limit = info.packet_limit;
+    adapter->mode = (chmlink_mode)info.mode;
     adapter->capabilities = info.capabilities;
     InitializeSRWLock(&adapter->gate);
     InitializeConditionVariable(&adapter->drained);
@@ -290,8 +298,7 @@ int chmlink_receive(chmlink_adapter *adapter, void *buffer, uint32_t capacity,
     result = DeviceIoControl(adapter->device, CHMLINK_IOCTL_RECEIVE, NULL, 0,
                               buffer, capacity, &received, NULL) != 0;
     if (!result) return leave(adapter, 0);
-    if (chmlink_batch_validate(buffer, received, CHMLINK_MODE_ETHERNET,
-        adapter->packet_limit, NULL) != CHMLINK_OK) {
+    if (chmlink_batch_validate(buffer, received, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
         SetLastError(ERROR_INVALID_DATA); return leave(adapter, 0);
     }
     *bytes_received = received;
@@ -303,8 +310,7 @@ int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length)
     DWORD received;
     int result;
     if (!enter(adapter)) return 0;
-    if (chmlink_batch_validate(batch, length, CHMLINK_MODE_ETHERNET,
-        adapter->packet_limit, NULL) != CHMLINK_OK) {
+    if (chmlink_batch_validate(batch, length, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
         SetLastError(ERROR_INVALID_PARAMETER); return leave(adapter, 0);
     }
     result = DeviceIoControl(adapter->device, CHMLINK_IOCTL_INJECT, (void *)batch,

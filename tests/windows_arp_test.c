@@ -65,6 +65,7 @@ static DWORD WINAPI peer_worker(void *arg)
 int main(int argc, char **argv)
 {
     peer_context ctx = {0};
+    chmlink_adapter_info info;
     struct in_addr local, peer;
     MIB_UNICASTIPADDRESS_ROW address;
     MIB_IPNET_ROW2 neighbor;
@@ -105,6 +106,9 @@ int main(int argc, char **argv)
     memcpy(ctx.local, &local.s_addr, 4); memcpy(ctx.peer, &peer.s_addr, 4);
     ctx.adapter = chmlink_open((uint32_t)index);
     if (!ctx.adapter) { fprintf(stderr, "Open failed: %lu\n", GetLastError()); return 1; }
+    if (!chmlink_query(ctx.adapter, &info) || info.mode != CHMLINK_MODE_ETHERNET) {
+        fprintf(stderr, "ARP verification requires an Ethernet adapter.\n"); chmlink_close(ctx.adapter); return 1;
+    }
     thread = CreateThread(NULL, 0, peer_worker, &ctx, 0, NULL);
     if (!thread) { fprintf(stderr, "Thread creation failed: %lu\n", GetLastError()); chmlink_close(ctx.adapter); return 1; }
     /* SendARP uses the chosen source address; the worker owns the same adapter

@@ -15,6 +15,7 @@ static void baseline(unsigned char *p)
     memcpy(p, "CLCF", 4);
     p[4] = CHMLINK_CONFIG_VERSION;
     p[8] = CHMLINK_CONFIG_SIZE;
+    p[12] = CHMLINK_CONFIG_MODE_ETHERNET;
     p[16] = 1; p[32] = 2; p[48] = 2;
 }
 
@@ -48,5 +49,13 @@ int main(void)
     bytes[31] = 1; CHECK(chmlink_config_valid(bytes, sizeof(bytes)));
     memset(bytes + 32, 0, 16); CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
     bytes[47] = 1; CHECK(chmlink_config_valid(bytes, sizeof(bytes)));
+    baseline(bytes); bytes[12] = CHMLINK_CONFIG_MODE_IP;
+    memset(bytes + 48, 0, 6);
+    CHECK(chmlink_config_valid(bytes, sizeof(bytes)));
+    CHECK(chmlink_config_mode(bytes) == CHMLINK_CONFIG_MODE_IP);
+    bytes[48] = 2; CHECK(!chmlink_config_valid(bytes, sizeof(bytes))); bytes[48] = 0;
+    bytes[12] = CHMLINK_CONFIG_MODE_ETHERNET; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+    bytes[12] = CHMLINK_CONFIG_MODE_IP; bytes[4] = 3; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+    bytes[4] = 1; bytes[12] = 0; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
     return 0;
 }

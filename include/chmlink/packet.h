@@ -16,11 +16,17 @@ typedef enum chmlink_mode {
 
 /*
  * Check only the minimum structural requirements. Ethernet frames do not
- * contain an FCS. IP version is checked, but packet lengths and checksums are
- * the responsibility of the network stack. max_length is the adapter's limit.
+ * contain an FCS. IP packets use strict declared-length framing; checksums and
+ * transport semantics remain the responsibility of the network stack.
+ * max_length is the adapter's limit.
  */
 int chmlink_packet_valid(chmlink_mode mode, const uint8_t *data,
                          size_t length, size_t max_length);
+
+/* Strict framing for the experimental raw-IP data path. Accept exactly one
+ * complete IPv4 or IPv6 packet; no checksum or transport validation is done.
+ * IPv6 jumbograms are not supported. Fragmented IP packets are permitted. */
+int chmlink_ip_packet_valid(const uint8_t *data, size_t length, size_t max_length);
 
 #ifdef __cplusplus
 }

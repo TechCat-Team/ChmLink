@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include "chmlink/api.h"
+#include "chmlink/packet.h"
 
 static int show(const chmlink_adapter_info *info, void *context)
 {
@@ -11,8 +12,9 @@ static int show(const chmlink_adapter_info *info, void *context)
            " state=0x%" PRIx32 " capabilities=0x%" PRIx32 "\n",
            info->interface_id, info->interface_index, info->mode, info->mtu,
            info->state, info->capabilities);
-    printf("  mac=%02X:%02X:%02X:%02X:%02X:%02X\n", info->mac[0], info->mac[1],
-           info->mac[2], info->mac[3], info->mac[4], info->mac[5]);
+    if (info->mode == CHMLINK_MODE_ETHERNET)
+        printf("  mac=%02X:%02X:%02X:%02X:%02X:%02X\n", info->mac[0], info->mac[1],
+               info->mac[2], info->mac[3], info->mac[4], info->mac[5]);
     printf("  queued=%" PRIu32 "/%" PRIu32 " tx=%" PRIu64
            " rx=%" PRIu64 " queue_drops=%" PRIu64 "\n",
            info->queued_packets, info->queue_capacity, info->tx_packets,

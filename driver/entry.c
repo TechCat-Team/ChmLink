@@ -17,7 +17,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT object, PUNICODE_STRING path)
     c.MajorNdisVersion = 6;
     c.MinorNdisVersion = 60;
     c.MajorDriverVersion = 0;
-    c.MinorDriverVersion = 2;
+    c.MinorDriverVersion = 3;
     c.InitializeHandlerEx = ClInitialize;
     c.HaltHandlerEx = ClHalt;
     c.UnloadHandler = ClUnload;

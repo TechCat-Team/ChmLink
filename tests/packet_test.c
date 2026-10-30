@@ -22,6 +22,7 @@ int main(void)
     CHECK(!chmlink_packet_valid(CHMLINK_MODE_ETHERNET, packet, 64, 63));
     CHECK(!chmlink_packet_valid((chmlink_mode)99, packet, 64, 64));
     packet[0] = 0x45;
+    packet[3] = 20;
     CHECK(!chmlink_packet_valid(CHMLINK_MODE_IP, packet, 19, 64));
     CHECK(chmlink_packet_valid(CHMLINK_MODE_IP, packet, 20, 64));
     packet[0] = 0x60;
