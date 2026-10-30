@@ -148,6 +148,14 @@ static NDIS_STATUS set(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
                 else a->Lookahead = value;
             } else if (value < NdisDeviceStateD0 || value > NdisDeviceStateD3) {
                 status = NDIS_STATUS_INVALID_DATA;
+            } else {
+                /* NDIS pauses the adapter before a sleep state and restarts it
+                 * after D0; the state only tells the session why it paused. */
+                a->PowerState = (NDIS_DEVICE_POWER_STATE)value;
+                /* A system that resumes after a shutdown notification (fast
+                 * startup hibernates the kernel session) is running again. */
+                if (value == NdisDeviceStateD0) a->ShuttingDown = FALSE;
+                ClUpdateReadEventLocked(a);
             }
         }
     } else status = NDIS_STATUS_NOT_SUPPORTED;

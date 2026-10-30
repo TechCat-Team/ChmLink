@@ -202,6 +202,9 @@ static ULONG ClStateFlagsLocked(const CL_ADAPTER *a)
     default: break;
     }
     if (a->SessionState == ClSessionOpen) state |= CHMLINK_STATE_SESSION;
+    if (a->PowerState != NdisDeviceStateD0) state |= CHMLINK_STATE_LOW_POWER;
+    if (a->ShuttingDown) state |= CHMLINK_STATE_SHUTDOWN;
+    if (a->SurpriseRemoved) state = (state & ~(ULONG)CHMLINK_STATE_RUNNING) | CHMLINK_STATE_REMOVING;
     return state;
 }
 
@@ -267,7 +270,7 @@ static BOOLEAN ClIsRemoved(CL_ADAPTER *a)
     BOOLEAN removed;
     KIRQL irql;
     KeAcquireSpinLock(&ClAdaptersLock, &irql);
-    removed = a->Removed;
+    removed = a->Removed || a->SurpriseRemoved;
     KeReleaseSpinLock(&ClAdaptersLock, irql);
     return removed;
 }
@@ -359,7 +362,8 @@ static NTSTATUS ClDataControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
     BOOLEAN running;
     KIRQL irql;
     KeAcquireSpinLock(&a->Lock, &irql);
-    running = a->State == ClAdapterRunning && a->SessionState == ClSessionOpen;
+    running = a->State == ClAdapterRunning && a->SessionState == ClSessionOpen &&
+              a->PowerState == NdisDeviceStateD0 && !a->ShuttingDown;
     KeReleaseSpinLock(&a->Lock, irql);
     if (!running) return STATUS_DEVICE_NOT_READY;
     switch (stack->Parameters.DeviceIoControl.IoControlCode) {

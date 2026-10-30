@@ -42,6 +42,12 @@ typedef struct CL_ADAPTER {
     PKEVENT ReadEvent; /* referenced object; protected by Lock */
     BOOLEAN IoDrained; /* NDIS lifecycle callbacks are serialized */
     BOOLEAN Removed;
+    /* Written under Lock, read without it where a stale value only lets one
+     * more request run into the paused path. SurpriseRemoved is never cleared;
+     * ShuttingDown is cleared by a return to D0. */
+    BOOLEAN SurpriseRemoved;
+    BOOLEAN ShuttingDown;
+    NDIS_DEVICE_POWER_STATE PowerState; /* protected by Lock */
     ULONG InterfaceIndex;
     NET_LUID Luid;
     ULONG PacketFilter;

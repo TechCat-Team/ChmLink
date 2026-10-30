@@ -3,7 +3,8 @@
 void ClUpdateReadEventLocked(CL_ADAPTER *a)
 {
     if (a->ReadEvent != NULL) {
-        if (a->Queue.count != 0 || a->State != ClAdapterRunning || a->SessionState != ClSessionOpen)
+        if (a->Queue.count != 0 || a->State != ClAdapterRunning || a->SessionState != ClSessionOpen ||
+            a->PowerState != NdisDeviceStateD0 || a->ShuttingDown || a->SurpriseRemoved)
             KeSetEvent(a->ReadEvent, IO_NO_INCREMENT, FALSE);
         else KeClearEvent(a->ReadEvent);
     }
@@ -84,6 +85,7 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     a->InterfaceIndex = index;
     a->Luid = parameters->NetLuid;
     a->Lookahead = CHMLINK_ETHERNET_MTU;
+    a->PowerState = NdisDeviceStateD0;
     KeInitializeSpinLock(&a->Lock);
     KeInitializeMutex(&a->ControlMutex, 0);
     ExInitializeRundownProtection(&a->IoRundown);

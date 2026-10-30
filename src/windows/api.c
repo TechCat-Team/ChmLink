@@ -423,6 +423,7 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
         }
         if (!query_device(a->device, request, &info)) { error = GetLastError(); break; }
         if (info.state & CHMLINK_STATE_REMOVING) { error = ERROR_DEVICE_NOT_CONNECTED; break; }
+        if (info.state & CHMLINK_STATE_SHUTDOWN) { error = ERROR_SHUTDOWN_IN_PROGRESS; break; }
         if (!(info.state & CHMLINK_STATE_RUNNING)) { error = ERROR_NOT_READY; break; }
         if (!(info.state & CHMLINK_STATE_SESSION)) { error = ERROR_OPERATION_ABORTED; break; }
         if (info.queued_packets != 0) { result = 1; break; }

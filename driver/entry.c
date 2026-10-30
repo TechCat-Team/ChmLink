@@ -43,20 +43,34 @@ void ClUnload(PDRIVER_OBJECT object)
     NdisMDeregisterMiniportDriver(ClDriverHandle);
 }
 
+/* PASSIVE_LEVEL. A surprise removal is followed by pause and halt; until then
+ * new requests fail as removed instead of running into a device that is gone,
+ * and a waiting session wakes up to see REMOVING. */
 _Use_decl_annotations_
 void ClPnp(NDIS_HANDLE context, PNET_DEVICE_PNP_EVENT event)
 {
-    UNREFERENCED_PARAMETER(context);
-    UNREFERENCED_PARAMETER(event);
+    CL_ADAPTER *a = context;
+    KIRQL irql;
+    if (event->DevicePnPEvent != NdisDevicePnPEventSurpriseRemoved) return;   /* power profile: nothing to adapt */
+    KeAcquireSpinLock(&a->Lock, &irql);
+    a->SurpriseRemoved = TRUE;
+    ClUpdateReadEventLocked(a);
+    KeReleaseSpinLock(&a->Lock, irql);
 }
 
+/* NdisShutdownPowerOff runs at PASSIVE_LEVEL while the system powers off,
+ * without a pause or halt: close the data path and wake a waiting session.
+ * NdisShutdownBugCheck runs at HIGH_LEVEL; nothing may be touched then. */
 _Use_decl_annotations_
 void ClShutdown(NDIS_HANDLE context, NDIS_SHUTDOWN_ACTION action)
 {
     CL_ADAPTER *a = context;
-    UNREFERENCED_PARAMETER(action);
-    /* Shutdown may run at high IRQL. No allocation, waiting, or I/O here. */
-    UNREFERENCED_PARAMETER(a);
+    KIRQL irql;
+    if (action != NdisShutdownPowerOff) return;
+    KeAcquireSpinLock(&a->Lock, &irql);
+    a->ShuttingDown = TRUE;
+    ClUpdateReadEventLocked(a);
+    KeReleaseSpinLock(&a->Lock, irql);
 }
 
 _Use_decl_annotations_

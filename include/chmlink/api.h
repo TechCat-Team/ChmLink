@@ -61,7 +61,8 @@ void chmlink_close(chmlink_adapter *adapter);
  * before the caller receives; ERROR_NO_MORE_ITEMS remains valid.
  * Zero polls readiness, INFINITE has no deadline. Failure uses GetLastError:
  * ERROR_TIMEOUT, ERROR_OPERATION_ABORTED (cancel/close), ERROR_NOT_READY
- * (paused), device-removal errors, or ERROR_NOT_SUPPORTED on older drivers.
+ * (paused, including system sleep: CHMLINK_STATE_LOW_POWER), device-removal
+ * errors, ERROR_SHUTDOWN_IN_PROGRESS, or ERROR_NOT_SUPPORTED on older drivers.
  * Cancel affects the current wait only; later waits start uncancelled.
  * Readiness and cancellation can race; an already completed wait may succeed.
  */
