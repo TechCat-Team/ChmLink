@@ -72,7 +72,8 @@ Windows keys a published driver package on its INF. If the binary changes but `D
 reuses the old package and the new `.sys` is **not installed**. Every build also differs in its link
 timestamp, so a leftover package of the same version beats the new binary. CI therefore:
 
-- fails when driver files changed without a higher `DriverVer` (`check_driver_version.py`, cloud layer);
+- fails when driver code changed without a higher `DriverVer` (`check_driver_version.py`, cloud layer;
+  comment-only edits to C sources do not count, an edit to the INF always does);
 - removes leftover packages of the candidate's version before installing, and refuses a candidate whose
   version equals the baseline's.
 

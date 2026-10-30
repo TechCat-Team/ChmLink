@@ -85,7 +85,7 @@ class DriverVersionTest(unittest.TestCase):
         self.assertIn("still 0.3.0.0", out)
 
     def test_shared_header_without_bump_fails(self):
-        self.repo.write("include/chmlink/query.h", "/* changed */\n")
+        self.repo.write("include/chmlink/query.h", "#define CHMLINK_INFO_SIZE 256u\n")
         self.repo.commit("wire")
         self.assertEqual(self.check()[0], 1)
 
@@ -143,6 +143,48 @@ class DriverVersionTest(unittest.TestCase):
         main_tip = self.repo.commit("main driver change")
         self.repo.git("checkout", "-q", "feature")
         self.assertEqual(self.check(base=main_tip)[0], 0)
+
+    def test_comment_only_change_needs_no_bump(self):
+        # Same compiled code: a comment edit, a reflowed block comment, trailing whitespace.
+        self.repo.write("driver/control.c", "int a; /* now with a note */\n")
+        self.repo.commit("comment")
+        self.assertEqual(self.check()[0], 0)
+        self.repo.write("include/chmlink/query.h", "/* wire,\n   reworded */\n")
+        self.repo.commit("header comment")
+        self.assertEqual(self.check()[0], 0)
+
+    def test_line_comment_changes_need_no_bump(self):
+        self.repo.write("driver/control.c", "int a; // added a note\n")
+        self.repo.commit("line comment")
+        self.assertEqual(self.check()[0], 0)
+        self.repo.write("driver/control.c", "int a; // a different note\n// and a new line\n")
+        self.repo.commit("line comment again")
+        self.assertEqual(self.check()[0], 0)
+
+    def test_code_change_hidden_next_to_a_comment_still_needs_a_bump(self):
+        self.repo.write("driver/control.c", "int b; /* a is now b */\n")
+        self.repo.commit("code")
+        self.assertEqual(self.check()[0], 1)
+
+    def test_comment_markers_inside_strings_are_code(self):
+        self.repo.write("driver/control.c", 'int a; char *s = "x";\n')
+        base = self.repo.commit("one")
+        self.repo.write("driver/control.c", 'int a; char *s = "/* not a comment */";\n')
+        self.repo.commit("string")
+        self.assertEqual(self.check(base=base)[0], 1)
+
+    def test_line_comment_markers_in_strings_and_urls(self):
+        self.repo.write("driver/control.c", 'char *u = "http://a";\n')
+        base = self.repo.commit("url")
+        self.repo.write("driver/control.c", 'char *u = "http://b";\n')
+        self.repo.commit("url changed")
+        self.assertEqual(self.check(base=base)[0], 1)
+
+    def test_inf_comment_change_still_needs_a_bump(self):
+        # Windows hashes the INF text, comments included.
+        self.repo.write("driver/chmlink.inf", inf("0.3.0.0") + "; comment\n")
+        self.repo.commit("inf")
+        self.assertEqual(self.check()[0], 1)
 
     def test_bad_repo_is_an_error(self):
         with tempfile.TemporaryDirectory() as empty:

@@ -79,12 +79,55 @@ def affects_driver(path):
     return any(path == entry or (entry.endswith("/") and path.startswith(entry)) for entry in DRIVER_FILES)
 
 
+C_SOURCES = (".c", ".h")
+
+
+def strip_c_comments(text):
+    """The text with C comments and insignificant whitespace removed.
+
+    Comments do not reach the binary, so a comment-only edit must not demand a version bump. String
+    and character literals are respected: "http://x" is code, and changing it changes the driver.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            out.append(" ")
+        else:
+            out.append(c)
+            i += 1
+    return " ".join("".join(out).split())
+
+
+def code_changed(repo, base, head, path):
+    """True when the file's compiled content differs. Anything but C sources is compared verbatim:
+    Windows hashes the INF text, comments included."""
+    def content(rev):
+        probe = subprocess.run(("git", "-C", repo, "cat-file", "-e", "%s:%s" % (rev, path)), capture_output=True)
+        return None if probe.returncode else git(repo, "show", "%s:%s" % (rev, path))
+    before, after = content(base), content(head)
+    if before is None or after is None or not path.endswith(C_SOURCES):
+        return before != after
+    return strip_c_comments(before) != strip_c_comments(after)
+
+
 def check(repo, base, head):
     """Returns (ok, message)."""
     changed = [p for p in git(repo, "diff", "--name-only", base, head).splitlines() if p]
-    touched = sorted(p for p in changed if affects_driver(p))
+    touched = sorted(p for p in changed if affects_driver(p) and code_changed(repo, base, head, p))
     if not touched:
-        return True, "No driver-affecting files changed; DriverVer not required."
+        return True, "No driver code changed (comment-only edits do not count); DriverVer not required."
     old, new = driver_version(repo, base), driver_version(repo, head)
     if new is None:
         return False, "%s is missing at %s." % (INF, head)
