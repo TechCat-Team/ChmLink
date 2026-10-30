@@ -88,7 +88,7 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     status = ClReadConfiguration(handle, a->Configuration);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
     a->Mode = (chmlink_mode)chmlink_config_mode(a->Configuration);
-    NdisMoveMemory(a->Mac, a->Configuration + 48, sizeof(a->Mac));
+    NdisMoveMemory(a->Mac, a->Configuration + CHMLINK_CONFIG_MAC, sizeof(a->Mac));
 
     NdisZeroMemory(&registration, sizeof(registration));
     registration.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_REGISTRATION_ATTRIBUTES;
@@ -155,7 +155,9 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
         CL_ADAPTER *other = CONTAINING_RECORD(entry, CL_ADAPTER, Link);
         if ((other->Mode == CHMLINK_MODE_ETHERNET && a->Mode == CHMLINK_MODE_ETHERNET &&
              RtlCompareMemory(other->Mac, a->Mac, sizeof(a->Mac)) == sizeof(a->Mac)) ||
-            RtlCompareMemory(other->Configuration + 16, a->Configuration + 16, 16) == 16) {
+            RtlCompareMemory(other->Configuration + CHMLINK_CONFIG_ADAPTER_ID,
+                             a->Configuration + CHMLINK_CONFIG_ADAPTER_ID,
+                             CHMLINK_CONFIG_ID_SIZE) == CHMLINK_CONFIG_ID_SIZE) {
             KeReleaseSpinLock(&ClAdaptersLock, irql);
             NdisDeregisterDeviceEx(a->ControlHandle);
             status = NDIS_STATUS_INVALID_DATA;

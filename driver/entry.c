@@ -1,5 +1,8 @@
 #include "chmlink.h"
 
+typedef char CL_VERSION_FITS_CHARACTERISTICS[
+    (CHMLINK_VERSION_MAJOR <= 0xff && CHMLINK_VERSION_MINOR <= 0xff) ? 1 : -1];
+
 NDIS_HANDLE ClDriverHandle;
 LIST_ENTRY ClAdapters;
 KSPIN_LOCK ClAdaptersLock;
@@ -16,8 +19,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT object, PUNICODE_STRING path)
     c.Header.Size = NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2;
     c.MajorNdisVersion = 6;
     c.MinorNdisVersion = 60;
-    c.MajorDriverVersion = 0;
-    c.MinorDriverVersion = 3;
+    c.MajorDriverVersion = (UCHAR)CHMLINK_VERSION_MAJOR;
+    c.MinorDriverVersion = (UCHAR)CHMLINK_VERSION_MINOR;
     c.InitializeHandlerEx = ClInitialize;
     c.HaltHandlerEx = ClHalt;
     c.UnloadHandler = ClUnload;
