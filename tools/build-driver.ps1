@@ -2,7 +2,9 @@
 param(
     [string]$KitRoot,
     [string]$Output,
-    [switch]$Restore
+    [switch]$Restore,
+    # Also run PREfast (/analyze). Findings in our own sources fail the build.
+    [switch]$Analyze
 )
 # Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
 if (-not $KitRoot) { $KitRoot = Join-Path $PSScriptRoot '../build/wdk' }
@@ -77,6 +79,20 @@ $sdk = "$KitRoot/microsoft.windows.sdk.cpp/c"
 $sources = @('driver/entry.c', 'driver/adapter.c', 'driver/config.c', 'driver/oid.c', 'driver/control.c',
              'src/packet/packet.c', 'src/protocol/batch.c', 'src/protocol/query.c',
              'src/queue/ring.c')
+$analysis = @()
+if ($Analyze) {
+    # PREfast through the engine that ships with the Visual Studio C++ workload. Header
+    # directories are "external" so only our own sources are reported on.
+    #
+    # Not used: the WDK's driver rule sets (DriverRecommendedRules.ruleset). On this toolchain the
+    # engine rejects them (C6800) and loads no C28xxx driver rules either way, so they add noise and
+    # no findings. Revisit with a full Visual Studio + WDK integration.
+    $engine = Get-ChildItem "$env:VCToolsInstallDir\bin\Hostx64\x64\EspXEngine.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $engine) { throw 'Code analysis engine (EspXEngine.dll) not found in this Visual Studio installation.' }
+    $analysis = @('/analyze', "/analyze:plugin$($engine.FullName)", '/analyze:external-', '/external:W0',
+        "/external:I$wdk/Include/$kitVersion/km", "/external:I$wdk/Include/$kitVersion/shared",
+        "/external:I$sdk/Include/$kitVersion/shared", "/external:I$sdk/Include/$kitVersion/ucrt")
+}
 $objects = @()
 $compileFailed = $false
 foreach ($source in $sources) {
@@ -84,12 +100,12 @@ foreach ($source in $sources) {
     $object = Join-Path $Output (([IO.Path]::GetFileNameWithoutExtension($source)) + '.obj')
     $objects += $object
     try {
-        Invoke-Checked 'cl.exe' @('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/W4', '/WX',
+        Invoke-Checked 'cl.exe' (@('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/W4', '/WX',
         '/wd4201', '/wd4324', '/wd4996', '/D_AMD64_', '/DNDIS660_MINIPORT=1',
         '/D_WIN32_WINNT=0x0A00', '/DNTDDI_VERSION=0x0A000002',
         "/I$repo/include", "/I$repo/driver", "/I$repo/src/queue", "/I$wdk/Include/$kitVersion/km",
         "/I$sdk/Include/$kitVersion/shared", "/I$sdk/Include/$kitVersion/ucrt",
-            "/Fo$object", "$repo/$source")
+            "/Fo$object") + $analysis + @("$repo/$source"))
     } catch {
         Write-Warning "Compilation failed for $source : $_"
         $compileFailed = $true
