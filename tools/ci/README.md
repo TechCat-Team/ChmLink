@@ -28,10 +28,10 @@ tools/ci/vm-run.sh init --baseline-dir 'C:\path\on\vm\to\signed'   # once; see "
 tools/ci/vm-run.sh doctor                    # is the VM ready?
 tools/ci/vm-run.sh run smoke                 # HEAD: build, ctest, install, lifecycle, IP   (~70 s)
 tools/ci/vm-run.sh run full                  # smoke + 3x benchmark gated on the baseline    (~6.5 min)
-tools/ci/vm-run.sh run nightly               # smoke + Driver Verifier + fault injection, three reboots
-tools/ci/vm-run.sh run nightly --stress-minutes 1 --lowres-minutes 3   # quick version (~12 min)
-#   defaults: 20 stress minutes, 10 fault-injection minutes (0 skips it), or NightlyStressMinutes /
-#   NightlyLowResMinutes in C:\ci\config.json
+tools/ci/vm-run.sh run nightly               # smoke + Driver Verifier + two kinds of fault injection, four reboots
+tools/ci/vm-run.sh run nightly --stress-minutes 1 --lowres-minutes 2 --systematic-minutes 3   # quick (~18 min)
+#   defaults: 20 stress, 10 randomized and 5 systematic fault-injection minutes (0 skips a phase), or
+#   NightlyStressMinutes / NightlyLowResMinutes / NightlySystematicMinutes in C:\ci\config.json
 tools/ci/vm-run.sh renew-cert                # new test certificate; re-signs and re-installs the baseline
 tools/ci/vm-run.sh run smoke --commit abc123 # any commit; the CI scripts are always this checkout's
 tools/ci/vm-run.sh run smoke --worktree      # include uncommitted and untracked files
@@ -60,7 +60,10 @@ Only one run at a time; a second is refused with the id of the one holding the V
 ### The nightly lane (Driver Verifier)
 
 Phase A is the smoke lane. It then registers a startup task (`ChmLinkCiResume`, SYSTEM), turns on the
-**persistent** verifier setting for `chmlink.sys` and reboots. Phase B runs after the boot: the lifecycle and
+**persistent** verifier setting for `chmlink.sys` (the standard options plus NDIS/WiFi verification,
+`0x2209BB`) and reboots. The fault-injection phases below use the standard options only: with NDIS
+verification the injection also fails NDIS's own allocations for the miniport, and AddDevice then fails
+(Code 31) nearly every time before any chmlink code runs. Phase B runs after the boot: the lifecycle and
 IP suites, a duplex benchmark and a stress loop (lifecycle, IP and a two-injector benchmark, repeated for
 `--stress-minutes`), all with the driver verified from `DriverEntry` on. It ends by comparing the driver's live
 pool allocations and bytes with the idle values taken right after boot; any growth is a leak. The verifier
@@ -73,7 +76,18 @@ into phase L instead. `tools/test-lowres.ps1` then repeats, until the time is up
 tolerant mode while disabling and enabling it, remove it. Operations may fail; each PnP step runs with a
 deadline, so a hang fails the run, and every adapter must still be removable. Phase L passes only if Verifier
 reports deliberately failed allocations (otherwise no failure path ran) and the driver's live allocations are
-back at the boot-idle level. It then clears Verifier and reboots into phase C.
+back at the boot-idle level.
+
+Phase S does the same under **systematic low resources simulation** (`0x40000`), switched on at run time
+(`verifier /faultssystematic enableruntime`) once the idle allocations are measured. It fails every distinct
+allocation call stack once, so each failure path runs at least once, `ClInitialize`'s included; it counts as
+exercised when `querystatistics` reports a non-zero `InjectionCount` (these injections are not counted as
+"failed deliberately"). Then Verifier is cleared and the last reboot lands in phase C.
+
+Every reboot out of phase B, L or S happens with a **live session**: a detached fuzzer holds the resting
+adapter's data session with requests in flight, so the driver's shutdown handler runs against it under
+Verifier. A bugcheck on the way down still ends in the reboot that was asked for; the resume therefore also
+looks for bugcheck and power-loss events (1001, 41, 6008) after the reboot request and treats them as a crash.
 
 - An unexpected reboot or bugcheck in phase B is recognised by the boot id; the run records the bugcheck
   events and the newest minidump in `crash.json`, fails, and goes to phase C.
@@ -85,7 +99,17 @@ back at the boot-idle level. It then clears Verifier and reboots into phase C.
   to 3 minutes for it to appear in `verifier /query`. `verifier /query` is localised; it is parsed by structure.
 - `verifier /faults` and `verifier /flags` each reset the other's settings; the CI sets the flags and then
   writes `VerifierFaultProbability` and `VerifierFaultBootMinutes` directly.
-- Not covered: systematic low resources simulation (`0x40000`) and NDIS/WiFi verification (`0x200000`).
+- Not covered: surprise removal (a root-enumerated device cannot be surprise-removed without the WDK's
+  Device Fundamentals tests), and sleep/resume on the current VM (VMware without S3/S4; see below).
+
+### Sleep and resume
+
+`chmlink-power-test` suspends the system with a session open (standby, else hibernation), resumes it with
+a waitable timer 30 s later and checks that the session survived, the adapter is running and no longer in
+low power, and the data path works. The lifecycle suite runs it when `"PowerTests": true` is in
+`C:\ci\config.json`; it prints SKIP where the platform has no sleep state or the system did not sleep. In
+VMware the guest needs VMware Tools (the basic display driver disables S1-S3) and standby allowed in the VM's
+power options.
 
 ### IOCTL fuzzing
 

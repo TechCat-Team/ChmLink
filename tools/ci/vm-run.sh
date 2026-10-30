@@ -6,7 +6,7 @@
 #
 #   vm-run.sh init  --baseline-dir <dir on the VM with signed chmlink.inf/.sys/.cat>
 #   vm-run.sh doctor
-#   vm-run.sh run <smoke|full|nightly> [--commit REV | --worktree] [--no-wait] [--stress-minutes N] [--lowres-minutes N]
+#   vm-run.sh run <smoke|full|nightly> [--commit REV | --worktree] [--no-wait] [--stress-minutes N] [--lowres-minutes N] [--systematic-minutes N]
 #   vm-run.sh attach <run-id>          # follow a run and fetch its results
 #   vm-run.sh abort <run-id>
 #   vm-run.sh restore                  # put the baseline driver back
@@ -120,8 +120,8 @@ export_tree() {   # $1 = commit | worktree, $2 = output tar
 
 cmd_run() {
     local lane=${1:-}; shift || true
-    case $lane in smoke|full|nightly) ;; *) die "usage: run <smoke|full|nightly> [--commit REV | --worktree] [--no-wait] [--stress-minutes N] [--lowres-minutes N]" ;; esac
-    local source=HEAD wait=1 label stress=0 lowres=-1
+    case $lane in smoke|full|nightly) ;; *) die "usage: run <smoke|full|nightly> [--commit REV | --worktree] [--no-wait] [--stress-minutes N] [--lowres-minutes N] [--systematic-minutes N]" ;; esac
+    local source=HEAD wait=1 label stress=0 lowres=-1 systematic=-1
     while [ $# -gt 0 ]; do
         case $1 in
             --commit) source=$2; shift 2 ;;
@@ -129,6 +129,7 @@ cmd_run() {
             --no-wait) wait=0; shift ;;
             --stress-minutes) stress=$2; shift 2 ;;
             --lowres-minutes) lowres=$2; shift 2 ;;
+            --systematic-minutes) systematic=$2; shift 2 ;;
             *) die "unknown option $1" ;;
         esac
     done
@@ -161,7 +162,7 @@ cmd_run() {
     local launched
     # The CI script is always this checkout's copy, so any commit can be tested, including
     # ones that predate tools/ci. The commit under test supplies only the code to build and run.
-    launched=$(vmps "$BIN" -Action Launch -RunId "$run_id" -Lane "$lane" -StressMinutes "$stress" -LowResMinutes "$lowres" 2>&1)
+    launched=$(vmps "$BIN" -Action Launch -RunId "$run_id" -Lane "$lane" -StressMinutes "$stress" -LowResMinutes "$lowres" -SystematicMinutes "$systematic" 2>&1)
     case $launched in LAUNCHED*) ;; *) echo "$launched" >&2; die "the VM did not start the run" 3 ;; esac
     echo "started on the VM ($launched); follow later with: vm-run.sh attach $run_id"
     [ $wait -eq 1 ] || exit 0

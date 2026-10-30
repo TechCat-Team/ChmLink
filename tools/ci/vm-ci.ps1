@@ -21,6 +21,8 @@ param(
     [int]$StressMinutes = 0,
     # Minutes under Driver Verifier fault injection in the nightly lane; -1 = config or 10, 0 = skip.
     [int]$LowResMinutes = -1,
+    # Minutes under systematic low resources simulation; -1 = config or 5, 0 = skip.
+    [int]$SystematicMinutes = -1,
     [int]$Offset = 0,
     [string]$BaselineFrom,
     [string]$CertThumbprint,
@@ -41,6 +43,7 @@ function Get-Config {
                             MinFreeGB = 5; CertWarnDays = 14; CertFailDays = 3 }.GetEnumerator()) {
         if ($null -eq $config.($default.Key)) { $config | Add-Member -NotePropertyName $default.Key -NotePropertyValue $default.Value }
     }
+    $script:powerTests = [bool]$config.PowerTests
     return $config
 }
 
@@ -259,8 +262,15 @@ function Get-VerifierPersistent {
 }
 
 # Set for the next boot. Takes effect only after a reboot.
+# The standard options (0x209BB, what /standard selects for a non-WDF driver). Phase B adds NDIS/WiFi
+# verification (0x200000), which checks the miniport's use of NDIS. The fault-injection phases leave it
+# out: with it, the injection also fails NDIS's own allocations for the miniport, and AddDevice then
+# fails (Code 31) nearly every time before any chmlink code runs.
+$script:verifierStandardFlags = '0x209BB'
+$script:verifierNdisFlag = '0x200000'
+
 function Set-VerifierPersistent {
-    & verifier.exe /standard /driver chmlink.sys 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
+    & verifier.exe /flags $script:verifierStandardFlags $script:verifierNdisFlag /driver chmlink.sys 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
     if ((Get-VerifierPersistent).Drivers -notmatch 'chmlink\.sys') { throw 'Could not set the persistent Driver Verifier configuration.' }
 }
 
@@ -269,12 +279,64 @@ function Set-VerifierPersistent {
 # on. 'verifier /faults' and '/flags' each reset the other's values, so the fault parameters are
 # written after the flags.
 function Set-VerifierLowResources([int]$Probability = 600, [int]$DelayMinutes = 1) {
-    & verifier.exe /flags 0x209BF /driver chmlink.sys 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
+    & verifier.exe /flags $script:verifierStandardFlags 0x4 /driver chmlink.sys 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
     $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
     Set-ItemProperty -LiteralPath $key -Name VerifierFaultProbability -Value $Probability -Type DWord
     Set-ItemProperty -LiteralPath $key -Name VerifierFaultBootMinutes -Value $DelayMinutes -Type DWord
     $now = Get-VerifierPersistent
     if ($now.Drivers -notmatch 'chmlink\.sys' -or !($now.Level -band 4)) { throw 'Could not set the low resources Driver Verifier configuration.' }
+}
+
+# Standard checks plus systematic low resources simulation (0x40000). Injection stays off until
+# 'verifier /faultssystematic enableruntime'.
+function Set-VerifierSystematic {
+    & verifier.exe /flags $script:verifierStandardFlags 0x40000 /driver chmlink.sys 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
+    $now = Get-VerifierPersistent
+    if ($now.Drivers -notmatch 'chmlink\.sys' -or !($now.Level -band 0x40000)) { throw 'Could not set the systematic low resources Driver Verifier configuration.' }
+}
+
+# Bugcheck or power-loss events since a requested reboot: a crash on the way down (in a shutdown
+# handler, say) still ends in the reboot that was asked for, so the boot id alone does not show it.
+function Test-CrashSince([string]$SinceUtc) {
+    if (!$SinceUtc) { return $false }
+    $since = [datetime]::Parse($SinceUtc).ToUniversalTime().ToLocalTime()
+    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001, 41, 6008; StartTime = $since } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Id -ne 1001 -or $_.ProviderName -match 'WER-SystemErrorReporting' })
+    return $events.Count -gt 0
+}
+
+# Hold a data session with requests in flight on the resting adapter while the system shuts down, so
+# that the shutdown handler runs against a live session (and under Verifier in phases B, L and S). The
+# process is detached and simply dies with the system.
+function Start-SessionHolder([string]$BuildDir) {
+    try {
+        $fuzz = Join-Path $BuildDir 'chmlink-ioctl-fuzz.exe'
+        $device = Get-ChmLinkDevices | Where-Object Status -eq 'OK' | Select-Object -First 1
+        if (!$device -or !(Test-Path -LiteralPath $fuzz)) { Write-Log 'no session holder: no resting adapter or fuzzer'; return }
+        $windows = Get-CimInstance Win32_NetworkAdapter | Where-Object PNPDeviceID -eq $device.InstanceId
+        $adapter = Get-NetAdapter -IncludeHidden | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$windows.GUID }
+        $created = ([wmiclass]'Win32_Process').Create(('"{0}" {1} 900 --tolerant' -f $fuzz, $adapter.ifIndex), $BuildDir, $null)
+        Write-Log "session holder on interface $($adapter.ifIndex) (pid $($created.ProcessId)) runs through the shutdown"
+        Start-Sleep -Seconds 3
+    } catch { Write-Log "warning: no session holder: $($_.Exception.Message)" }
+}
+
+# After phase B, L or S: the next fault-injection phase that is enabled, else verifier off and phase C.
+# A failed phase goes straight to C. Request-Reboot does not return.
+function Request-NextVerifierPhase($State, [string]$Result, [string]$From, [string]$BuildDir) {
+    if ($BuildDir) { Start-SessionHolder $BuildDir }
+    if ($Result -eq 'passed') {
+        if ($From -eq 'B' -and [int]$State.LowResMinutes -gt 0) {
+            Set-VerifierLowResources
+            Request-Reboot $State 'L' 'turning on randomized low resources simulation'
+        }
+        if (($From -eq 'B' -or $From -eq 'L') -and [int]$State.SystematicMinutes -gt 0) {
+            Set-VerifierSystematic
+            Request-Reboot $State 'S' 'turning on systematic low resources simulation'
+        }
+    }
+    Clear-VerifierPersistent
+    Request-Reboot $State 'C' 'switching driver verifier off'
 }
 
 # Clear for the next boot. The current boot keeps tracking until it reboots.
@@ -395,7 +457,7 @@ function Invoke-Launch {
     if (!(Test-Path -LiteralPath $dir)) { throw "No such run directory: $dir" }
     $holder = Get-LockHolder
     if ($holder) { Write-Output "BUSY run=$($holder.RunId)"; exit 4 }
-    $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Run -RunId {1} -Lane {2} -StressMinutes {3} -LowResMinutes {4}' -f $PSCommandPath, $RunId, $Lane, $StressMinutes, $LowResMinutes
+    $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Run -RunId {1} -Lane {2} -StressMinutes {3} -LowResMinutes {4} -SystematicMinutes {5}' -f $PSCommandPath, $RunId, $Lane, $StressMinutes, $LowResMinutes, $SystematicMinutes
     $created = ([wmiclass]'Win32_Process').Create($command, $dir, $null)
     if ($created.ReturnValue -ne 0) { throw "Cannot start the run (WMI code $($created.ReturnValue))." }
     Write-Json (Join-Path $dir 'status.json') ([ordered]@{ State = 'queued'; Stage = ''; Pid = $created.ProcessId
@@ -541,6 +603,8 @@ function New-SuiteRunner([string]$InfPath, [string]$BuildDir) {
             (Join-Path $script:srcDir "tools\$script"), $script:suiteInf, $script:suiteBuild, $Directory
         if ($Kind -eq 'bench') { $arguments += ' -Seconds 3'; if ($Filter) { $arguments += " -Filter $Filter" } }
         if ($Kind -eq 'lowres') { $arguments += " -Minutes $Filter" }
+        # Sleep and resume need platform support and put the VM to sleep; opt in with PowerTests.
+        if ($Kind -eq 'lifecycle' -and $script:powerTests) { $arguments += ' -PowerCycle' }
         Invoke-Process "$Kind suite" 'powershell.exe' $arguments $Timeout
     }
 }
@@ -603,6 +667,7 @@ function Request-Reboot($State, [string]$NextPhase, [string]$Why) {
     $State.Phase = $NextPhase
     $State.ExpectedReboot = $true
     $State.BootIdBeforeReboot = Get-BootId
+    $State | Add-Member -NotePropertyName RebootRequestedUtc -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o')) -Force
     Save-RunState $State
     Set-Status 'rebooting' $Why
     Write-Log "rebooting for: $Why (continues in phase $NextPhase)"
@@ -713,7 +778,11 @@ function Invoke-Resume {
 
     # What kind of boot is this?
     $bootNow = Get-BootId
-    if ($state.ExpectedReboot -and $bootNow -ne $state.BootIdBeforeReboot) {
+    if ($state.ExpectedReboot -and $bootNow -ne $state.BootIdBeforeReboot -and (Test-CrashSince $state.RebootRequestedUtc)) {
+        $unexpected = $true
+        Write-Log "CRASH DURING A REQUESTED REBOOT: bugcheck or power-loss events after the reboot request (phase $($state.Phase))"
+        Save-CrashEvidence $out
+    } elseif ($state.ExpectedReboot -and $bootNow -ne $state.BootIdBeforeReboot) {
         Write-Log "boot after a requested reboot (phase $($state.Phase))"
     } elseif ($bootNow -eq $state.BootIdBeforeReboot) {
         Write-Log 'resume task fired again within the same boot; nothing to do'
@@ -776,34 +845,52 @@ function Invoke-Resume {
                 $result = 'failed'
             }
             $state.Result = $result; $state.Stages = @($script:stages)
-            if ($result -eq 'passed' -and [int]$state.LowResMinutes -gt 0) {
-                Set-VerifierLowResources
-                Request-Reboot $state 'L' 'turning on low resources simulation'
-            }
-            Clear-VerifierPersistent
-            Request-Reboot $state 'C' 'switching driver verifier off'
+            Request-NextVerifierPhase $state $result 'B' $build
         }
-        if ($state.Phase -eq 'L') {
+        # L: randomized low resources simulation (from a minute after boot). S: systematic low resources
+        # simulation, switched on at run time once the idle allocations are measured; it fails every
+        # distinct allocation call stack once, so each failure path in the driver runs at least once.
+        if ($state.Phase -eq 'L' -or $state.Phase -eq 'S') {
+            $systematic = $state.Phase -eq 'S'
+            $phaseName = if ($systematic) { 'systematic' } else { 'lowres' }
+            $minutes = if ($systematic) { [int]$state.SystematicMinutes } else { [int]$state.LowResMinutes }
             try {
-                Invoke-Stage 'lowres-active' {
+                Invoke-Stage "$phaseName-active" {
                     $waitEnd = (Get-Date).AddSeconds(180)
                     $now = Get-VerifierState
                     while (!$now.Listed -and (Get-Date) -lt $waitEnd) { Start-Sleep -Seconds 5; $now = Get-VerifierState }
                     if (!$now.Listed) { throw 'Driver Verifier is not tracking chmlink.sys after the reboot.' }
                     $state.LowIdleAllocations = $now.CurrentAllocations; $state.LowIdleBytes = $now.CurrentBytes
-                    Write-Log ("low resources simulation armed. Idle driver: {0} live allocations, {1} bytes" -f $now.CurrentAllocations, $now.CurrentBytes)
+                    Write-Log ("{0} armed. Idle driver: {1} live allocations, {2} bytes" -f $phaseName, $now.CurrentAllocations, $now.CurrentBytes)
                     Save-RunState $state
-                    # Faults start one minute after boot; the suite must run inside that window.
-                    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-                    $armed = $boot.AddSeconds(75)
-                    if ((Get-Date) -lt $armed) { Start-Sleep -Seconds ([int][math]::Ceiling(($armed - (Get-Date)).TotalSeconds)) }
+                    if ($systematic) {
+                        & verifier.exe /faultssystematic enableruntime 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
+                    } else {
+                        # Faults start one minute after boot; the suite must run inside that window.
+                        $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+                        $armed = $boot.AddSeconds(75)
+                        if ((Get-Date) -lt $armed) { Start-Sleep -Seconds ([int][math]::Ceiling(($armed - (Get-Date)).TotalSeconds)) }
+                    }
                 }
-                Invoke-Stage 'lowres-stress' { & $suite 'lowres' (Join-Path $out 'lowres') ([int]$state.LowResMinutes * 60 + 900) ([string][int]$state.LowResMinutes) }
-                Invoke-Stage 'lowres-leaks' {
+                Invoke-Stage "$phaseName-stress" { & $suite 'lowres' (Join-Path $out $phaseName) ($minutes * 60 + 900) ([string]$minutes) }
+                Invoke-Stage "$phaseName-leaks" {
                     $stats = Get-VerifierStatistics
-                    Write-Log ("fault injection: {0} of {1} pool allocations failed deliberately (counters {2})" -f $stats.FailedDeliberately, $stats.Attempted, $stats.Raw)
+                    $injected = $stats.FailedDeliberately
+                    if ($systematic) {
+                        # Systematic injections are not counted as "failed deliberately"; querystatistics
+                        # reports them (InjectionCount = distinct call stacks failed, labels not localised).
+                        $injected = 0
+                        foreach ($line in (& verifier.exe /faultssystematic querystatistics 2>&1)) {
+                            Write-Log "  verifier: $line"
+                            if ("$line" -match 'InjectionCount:\s*(\d+)') { $injected = [int64]$matches[1] }
+                        }
+                        & verifier.exe /faultssystematic disableruntime 2>&1 | Out-Null
+                        Write-Log ("fault injection: {0} distinct allocation call stacks failed once each" -f $injected)
+                    } else {
+                        Write-Log ("fault injection: {0} of {1} pool allocations failed deliberately (counters {2})" -f $stats.FailedDeliberately, $stats.Attempted, $stats.Raw)
+                    }
                     # A run in which nothing was failed proves nothing about the failure paths.
-                    if ($stats.FailedDeliberately -eq 0) { throw 'Driver Verifier injected no allocation failures; the low resources suite did not exercise any failure path.' }
+                    if ($injected -le 0) { throw 'Driver Verifier injected no allocation failures; the suite did not exercise any failure path.' }
                     $after = Get-VerifierState
                     Write-Log ("after fault injection: {0} live allocations, {1} bytes (idle at boot: {2}, {3} bytes)" -f `
                         $after.CurrentAllocations, $after.CurrentBytes, $state.LowIdleAllocations, $state.LowIdleBytes)
@@ -813,12 +900,11 @@ function Invoke-Resume {
                     }
                 }
             } catch {
-                Write-Log "phase L failed: $($_.Exception.Message)"
+                Write-Log "phase $($state.Phase) failed: $($_.Exception.Message)"
                 $result = 'failed'
             }
             $state.Result = $result; $state.Stages = @($script:stages)
-            Clear-VerifierPersistent
-            Request-Reboot $state 'C' 'switching driver verifier off'
+            Request-NextVerifierPhase $state $result $state.Phase $build
         }
     } catch {
         Stop-IfRebooting
@@ -870,7 +956,12 @@ function Invoke-Run {
     New-Item -ItemType Directory -Force $out | Out-Null
     $stressMinutes = if ($StressMinutes -gt 0) { $StressMinutes } elseif ($config.NightlyStressMinutes) { [int]$config.NightlyStressMinutes } else { 20 }
     $lowResMinutes = if ($LowResMinutes -ge 0) { $LowResMinutes } elseif ($null -ne $config.NightlyLowResMinutes) { [int]$config.NightlyLowResMinutes } else { 10 }
-    $laneMinutes = switch ($Lane) { 'full' { 75 } 'nightly' { 40 + $stressMinutes + $(if ($lowResMinutes) { $lowResMinutes + 15 } else { 0 }) } default { 30 } }
+    $systematicMinutes = if ($SystematicMinutes -ge 0) { $SystematicMinutes } elseif ($null -ne $config.NightlySystematicMinutes) { [int]$config.NightlySystematicMinutes } else { 5 }
+    $laneMinutes = switch ($Lane) {
+        'full' { 75 }
+        'nightly' { 40 + $stressMinutes + $(if ($lowResMinutes) { $lowResMinutes + 15 } else { 0 }) + $(if ($systematicMinutes) { $systematicMinutes + 15 } else { 0 }) }
+        default { 30 }
+    }
     $script:deadline = (Get-Date).AddMinutes($laneMinutes)
     $started = Get-Date
     $result = 'failed'; $vmClean = $true; $handedOver = $false
@@ -953,12 +1044,7 @@ function Invoke-Run {
             $script:candidateOem = Get-BoundInf (Get-ChmLinkDevices | Select-Object -First 1).InstanceId
             Write-Log "candidate bound as $($script:candidateOem)"
         }
-        $suite = {
-            param([string]$Kind, [string]$Directory, [int]$Timeout)
-            $script = if ($Kind -eq 'lifecycle') { 'test-lifecycle.ps1' } else { 'test-ip.ps1' }
-            Invoke-Process "$Kind suite" 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`" -InfPath `"{1}`" -BuildDirectory `"{2}`" -OutputDirectory `"{3}`"" -f `
-                (Join-Path $script:srcDir "tools\$script"), $candidateInf, $build, $Directory) $Timeout
-        }
+        $suite = New-SuiteRunner $candidateInf $build
         Invoke-Stage 'lifecycle' { & $suite 'lifecycle' (Join-Path $out 'lifecycle') 900 }
         Invoke-Stage 'ip' { & $suite 'ip' (Join-Path $out 'ip') 600 }
         if ($Lane -eq 'full') {
@@ -974,7 +1060,7 @@ function Invoke-Run {
             # survives the reboot. Order matters (see Request-Reboot): state, task, verifier, reboot.
             $state = [pscustomobject]@{
                 Lane = $Lane; Phase = 'B'; ExpectedReboot = $false; BootIdBeforeReboot = ''; Result = ''
-                StressMinutes = $stressMinutes; LowResMinutes = $lowResMinutes; LowIdleAllocations = -1; LowIdleBytes = -1
+                StressMinutes = $stressMinutes; LowResMinutes = $lowResMinutes; SystematicMinutes = $systematicMinutes; LowIdleAllocations = -1; LowIdleBytes = -1
                 StartedUtc = $started.ToUniversalTime().ToString('s')
                 DeadlineUtc = $script:deadline.ToUniversalTime().ToString('o')
                 CandidateOem = $script:candidateOem; DriverVersion = $script:driverVersion

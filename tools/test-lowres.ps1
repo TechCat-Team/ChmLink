@@ -39,9 +39,13 @@ function Invoke-Bounded([scriptblock]$Block, [object[]]$Arguments, [int]$Seconds
         return $job.State -eq 'Completed' -and !$job.ChildJobs[0].Error.Count
     } finally { Remove-Job $job -Force -ErrorAction SilentlyContinue }
 }
+# The interface of a started device. A device whose start failed under injection (for example Code 31,
+# AddDevice failed) still has a "Not Present" network adapter; it does not count as started.
 function Find-Interface($Device, [int]$Seconds) {
     $end = (Get-Date).AddSeconds($Seconds)
     do {
+        $pnp = Get-PnpDevice -InstanceId $Device.InstanceId -ErrorAction SilentlyContinue
+        if (!$pnp -or $pnp.Status -ne 'OK') { Start-Sleep -Milliseconds 500; continue }
         $windows = @(Get-CimInstance Win32_NetworkAdapter | Where-Object PNPDeviceID -eq $Device.InstanceId)
         if ($windows.Count -eq 1 -and $windows[0].GUID) {
             $adapter = @(Get-NetAdapter -IncludeHidden | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$windows[0].GUID })
@@ -78,13 +82,16 @@ try {
         $adapter = Find-Interface $device 20
         if ($null -eq $adapter) {
             # ClInitialize failed under injection: the device exists without an interface.
-            $stats.NeverStarted++; Log "cycle $($stats.Cycles): adapter never started"
+            $stats.NeverStarted++
+            $pnp = Get-PnpDevice -InstanceId $device.InstanceId -ErrorAction SilentlyContinue
+            Log "cycle $($stats.Cycles): adapter never started ($($pnp.Status), $($pnp.Problem))"
         } else {
             $fuzzOut = Join-Path $output.FullName "fuzz-$($stats.Cycles).out"
             $process = Start-Process $fuzz -ArgumentList @($adapter.ifIndex, 15, '--tolerant') -PassThru -NoNewWindow `
                 -RedirectStandardOutput $fuzzOut -RedirectStandardError ($fuzzOut -replace '\.out$', '.err')
             $null = $process.Handle   # PowerShell 5.1 reports no ExitCode unless the handle was taken while running
-            $toggleEnd = (Get-Date).AddSeconds(12)
+            Start-Sleep -Seconds 2   # let the fuzzer open its first session before the adapter starts flapping
+            $toggleEnd = (Get-Date).AddSeconds(10)
             while ((Get-Date) -lt $toggleEnd -and !$process.HasExited) {
                 foreach ($verb in 'Disable', 'Enable') {
                     $stats.Toggles++
