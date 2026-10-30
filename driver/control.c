@@ -73,8 +73,9 @@ static void ClSnapshotFilter(CL_ADAPTER *a, CL_FILTER *f)
     KIRQL irql;
     KeAcquireSpinLock(&a->Lock, &irql);
     f->PacketFilter = a->PacketFilter;
-    f->MulticastCount = a->MulticastCount;
-    NdisMoveMemory(f->Multicast, a->Multicast, f->MulticastCount * 6);
+    /* The OID path already limits the list; clamp again where the length is used. */
+    f->MulticastCount = min(a->MulticastCount, (ULONG)CL_MULTICAST_MAX);
+    NdisMoveMemory(f->Multicast, a->Multicast, (SIZE_T)f->MulticastCount * sizeof(f->Multicast[0]));
     NdisMoveMemory(f->Mac, a->Mac, sizeof(f->Mac));
     KeReleaseSpinLock(&a->Lock, irql);
 }
