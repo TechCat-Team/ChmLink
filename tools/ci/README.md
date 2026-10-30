@@ -28,6 +28,9 @@ tools/ci/vm-run.sh init --baseline-dir 'C:\path\on\vm\to\signed'   # once; see "
 tools/ci/vm-run.sh doctor                    # is the VM ready?
 tools/ci/vm-run.sh run smoke                 # HEAD: build, ctest, install, lifecycle, IP   (~70 s)
 tools/ci/vm-run.sh run full                  # smoke + 3x benchmark gated on the baseline    (~6.5 min)
+tools/ci/vm-run.sh run nightly               # smoke + the driver under Driver Verifier, two reboots (~7 min with --stress-minutes 1)
+tools/ci/vm-run.sh run nightly --stress-minutes 20   # longer stress; default 20, or NightlyStressMinutes in C:\ci\config.json
+tools/ci/vm-run.sh renew-cert                # new test certificate; re-signs and re-installs the baseline
 tools/ci/vm-run.sh run smoke --commit abc123 # any commit; the CI scripts are always this checkout's
 tools/ci/vm-run.sh run smoke --worktree      # include uncommitted and untracked files
 tools/ci/vm-run.sh run full --no-wait        # start and return; later:
@@ -51,6 +54,34 @@ previous run was killed, the next one notices (wrong driver image, leftover adap
 suites) and repairs it first.
 
 Only one run at a time; a second is refused with the id of the one holding the VM.
+
+### The nightly lane (Driver Verifier)
+
+Phase A is the smoke lane. It then registers a startup task (`ChmLinkCiResume`, SYSTEM), turns on the
+**persistent** verifier setting for `chmlink.sys` and reboots. Phase B runs after the boot: the lifecycle and
+IP suites, a duplex benchmark and a stress loop (lifecycle, IP and a two-injector benchmark, repeated for
+`--stress-minutes`), all with the driver verified from `DriverEntry` on. It ends by comparing the driver's live
+pool allocations and bytes with the idle values taken right after boot; any growth is a leak. The verifier
+setting is then cleared and a second reboot lands in phase C, which restores the baseline driver and writes
+`summary.json`. Throughput is never compared with the baseline here, since Verifier slows the data path.
+
+- An unexpected reboot or bugcheck in phase B is recognised by the boot id; the run records the bugcheck
+  events and the newest minidump in `crash.json`, fails, and goes to phase C.
+- After `abort` run `restore`: it also removes the startup task and the persistent setting, so that no later
+  boot runs under verification or continues an abandoned run.
+- Why persistent: `verifier /standard /driver chmlink.sys /now`-style volatile activation cannot be switched
+  off, stops tracking a driver that is reloaded, and misses `DriverEntry`. The persistent form needs the reboot.
+- The startup task starts seconds after boot, before PnP has loaded the adapter driver, so phase B waits up
+  to 3 minutes for it to appear in `verifier /query`. `verifier /query` is localised; it is parsed by structure.
+- Not covered: low-resources simulation (`0x4`, `0x40000`) is off, as the driver is not written to survive
+  deliberate allocation failures yet.
+
+### Certificate renewal
+
+`renew-cert` creates a new certificate, trusts it, re-signs the baseline package with a raised DriverVer
+(Windows reuses a published package whose INF text is unchanged), reinstalls it and records the new
+thumbprint in `C:\ci\config.json`. `-WhatIfRenew` on the VM script shows the plan only. The previous test
+certificate expires on 2026-11-29.
 
 ### VM prerequisites
 
@@ -109,7 +140,7 @@ suppression in `driver/adapter.c` (C28197, reference-counted release) is documen
 | file | purpose |
 |---|---|
 | `vm-run.sh` | entry point; pushes, launches, follows, fetches, applies gates |
-| `vm-ci.ps1` | everything that runs on the VM (`Init Doctor Launch Run Poll Abort Restore Clean`) |
+| `vm-ci.ps1` | everything that runs on the VM (`Init Doctor Launch Run Poll Abort Restore Clean RenewCert Resume`) |
 | `compare_bench.py` | benchmark gate and baseline recording |
 | `check_driver_version.py` | the DriverVer rule |
 | `bench-baseline.json` | recorded baseline |
@@ -122,4 +153,9 @@ suppression in `driver/adapter.c` (C28197, reference-counted release) is documen
   drive. Defaults are computed in the script body instead; `test_ci.py` enforces it.
 - PowerShell 5.1 reads files in the system code page unless told otherwise. JSON written by these scripts
   is UTF-8 and read as UTF-8; `compare_bench.py` also accepts an older GBK `environment.json`.
+- **PowerShell unwinds on shutdown.** Windows signals processes at shutdown and `catch`/`finally` blocks then
+  run; a run that cleaned up there undid its own verifier handover. After a requested reboot those blocks
+  only wait to be stopped.
+- `GetNewClosure()` gives the block its own script scope: `$script:` variables and helper functions are not
+  the caller's. The suite runner is a plain script block.
 - BSD `sed` (macOS) does not understand `\r`; `vm-run.sh` strips carriage returns with `tr`.

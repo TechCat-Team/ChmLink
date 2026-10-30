@@ -14,13 +14,16 @@ Actions: Init, Doctor, Launch, Run, Poll, Abort, Restore, Clean.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Init', 'Doctor', 'Launch', 'Run', 'Poll', 'Abort', 'Restore', 'Clean')]
+    [ValidateSet('Init', 'Doctor', 'Launch', 'Run', 'Poll', 'Abort', 'Restore', 'Clean', 'RenewCert', 'Resume')]
     [string]$Action,
     [string]$RunId,
-    [ValidateSet('smoke', 'full')][string]$Lane = 'smoke',
+    [ValidateSet('smoke', 'full', 'nightly')][string]$Lane = 'smoke',
+    [int]$StressMinutes = 0,
     [int]$Offset = 0,
     [string]$BaselineFrom,
-    [string]$CertThumbprint
+    [string]$CertThumbprint,
+    [int]$ValidDays = 730,
+    [switch]$WhatIfRenew
 )
 $ErrorActionPreference = 'Stop'
 $ciRoot = 'C:\ci'
@@ -84,6 +87,7 @@ function Get-InfVersion([string]$InfPath) {
 $script:runDir = $null; $script:logPath = $null; $script:stages = @(); $script:deadline = $null
 $script:srcDir = $null; $script:manageScript = $null; $script:needsRestore = $false
 $script:installStarted = $false; $script:candidateOem = ''; $script:driverVersion = ''
+$script:leakReference = 0
 $kitDir = Join-Path $ciRoot 'kit'   # manage-driver.ps1 + chmlink-device.exe of the last good build, for Restore
 
 function Write-Log([string]$Message) {
@@ -167,7 +171,8 @@ function Get-Preflight($Config, [bool]$Quiet) {
         Where-Object { Test-Path $_ }
     if ($pending) { $problems.Add('a reboot is pending') }
     $memory = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
-    if ($memory.VerifyDrivers -or $memory.VerifyDriverLevel) { $warnings.Add('Driver Verifier is enabled; timings are not comparable') }
+    if ($memory.VerifyDrivers -or $memory.VerifyDriverLevel) { $warnings.Add('Driver Verifier is enabled (persistent); timings are not comparable') }
+    if (Get-ScheduledTask -TaskName $resumeTask -ErrorAction SilentlyContinue) { $problems.Add('the nightly resume task is registered: a nightly run is in progress or was abandoned (vm-run.sh restore clears it)') }
     $expected = @($Config.ExpectedDevices)
     $actual = @(Get-ChmLinkDevices | ForEach-Object InstanceId)
     $extra = @($actual | Where-Object { $expected -notcontains $_ })
@@ -199,6 +204,52 @@ function Remove-LeftoverTestDevices([string]$DeviceTool, $Config) {
         $removed += $device.InstanceId
     }
     return $removed
+}
+
+# ------------------------------------------------------------ Driver Verifier
+# The nightly lane runs the suites with Driver Verifier's standard rule classes (special pool, IRQL
+# checks, pool tracking, I/O verification, deadlock detection, DMA, security and miscellaneous
+# checks, DDI compliance) on chmlink.sys, set persistently so that it applies from boot, which also
+# covers DriverEntry, and keeps applying to every image Windows loads afterwards, including the ones
+# an upgrade or rollback installs.
+#
+# Why not "verifier /dif ... /now", which needs no reboot? Measured on this VM: it can be used once
+# per boot, cannot be switched off (/reset reports "No settings were changed") until the next
+# reboot, and it stops tracking the driver after an upgrade reloads it. A lane that must test the
+# upgrade and rollback paths under verification cannot work with that.
+#
+# The text of "verifier /query" is localized (the same call prints English from a script and
+# Chinese from a bare ssh command), so Get-VerifierState reads structure, not labels.
+function Get-VerifierState {
+    $query = (& verifier.exe /query 2>&1 | Out-String) -split "`r?`n"
+    $listed = $false; $inModule = $false; $counters = @()
+    foreach ($line in $query) {
+        if ($line -match ':\s*chmlink\.sys\s*\(') { $listed = $true; $inModule = $true; continue }
+        if ($line -match '^\s*\S[^:]*:\s*\S+\.sys\s*\(') { $inModule = $false; continue }   # the next module
+        # Counter lines read "<label>: ( nonpaged / paged )", in this order: current allocations,
+        # current bytes, peak allocations, peak bytes.
+        if ($inModule -and $line -match ':\s*\(\s*(\d+)\s*/\s*(\d+)\s*\)') { $counters += ([int64]$matches[1] + [int64]$matches[2]) }
+    }
+    $at = { param($n) if ($counters.Count -gt $n) { $counters[$n] } else { -1 } }
+    [pscustomobject]@{ Listed = $listed; CurrentAllocations = (& $at 0); CurrentBytes = (& $at 1); PeakAllocations = (& $at 2) }
+}
+
+# The persistent setting, as the registry has it. This is what survives a reboot.
+function Get-VerifierPersistent {
+    $memory = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+    [pscustomobject]@{ Drivers = [string]$memory.VerifyDrivers; Level = $memory.VerifyDriverLevel }
+}
+
+# Set for the next boot. Takes effect only after a reboot.
+function Set-VerifierPersistent {
+    & verifier.exe /standard /driver chmlink.sys 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
+    if ((Get-VerifierPersistent).Drivers -notmatch 'chmlink\.sys') { throw 'Could not set the persistent Driver Verifier configuration.' }
+}
+
+# Clear for the next boot. The current boot keeps tracking until it reboots.
+function Clear-VerifierPersistent {
+    & verifier.exe /reset 2>&1 | Out-Null
+    if ((Get-VerifierPersistent).Drivers) { throw 'Could not clear the persistent Driver Verifier configuration.' }
 }
 
 # ----------------------------------------------------- driver install state
@@ -268,6 +319,8 @@ function Invoke-Doctor {
         else { Write-Output "PROBLEM: $problem"; $blocking++ }
     }
     if (!$check.ImageMatchesBaseline) { Write-Output 'HEALABLE: resting driver is not the baseline (the next run restores it)' }
+    if ((Get-VerifierPersistent).Drivers) { Write-Output "HEALABLE: persistent Driver Verifier setting ($((Get-VerifierPersistent).Drivers)); the next run or 'restore' clears it" }
+    if (Get-ScheduledTask -TaskName $resumeTask -ErrorAction SilentlyContinue) { Write-Output 'HEALABLE: the nightly resume task is registered (a run is between reboots, or was abandoned: abort/restore removes it)' }
     $bound = @(Get-ChmLinkDevices | ForEach-Object { Get-BoundInf $_.InstanceId })
     $stale = @(Get-ChmLinkPackages | Where-Object { $bound -notcontains $_.Inf })
     Write-Output ("driver store: bound {0}; unbound {1}" -f ($bound -join ', '), $(if ($stale) { ($stale | ForEach-Object { "$($_.Inf) $($_.Version)" }) -join ', ' } else { 'none' }))
@@ -307,7 +360,7 @@ function Invoke-Launch {
     if (!(Test-Path -LiteralPath $dir)) { throw "No such run directory: $dir" }
     $holder = Get-LockHolder
     if ($holder) { Write-Output "BUSY run=$($holder.RunId)"; exit 4 }
-    $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Run -RunId {1} -Lane {2}' -f $PSCommandPath, $RunId, $Lane
+    $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Run -RunId {1} -Lane {2} -StressMinutes {3}' -f $PSCommandPath, $RunId, $Lane, $StressMinutes
     $created = ([wmiclass]'Win32_Process').Create($command, $dir, $null)
     if ($created.ReturnValue -ne 0) { throw "Cannot start the run (WMI code $($created.ReturnValue))." }
     Write-Json (Join-Path $dir 'status.json') ([ordered]@{ State = 'queued'; Stage = ''; Pid = $created.ProcessId
@@ -331,6 +384,7 @@ function Invoke-Poll {
     if (Test-Path -LiteralPath $statusPath) {
         $status = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $state = $status.State; $stage = $status.Stage
+        # "rebooting" is expected to have no process: the run continues after the boot (nightly lane).
         if (!(Test-Path (Join-Path $dir 'done')) -and $state -in @('queued', 'running') -and
             !(Get-Process -Id $status.Pid -ErrorAction SilentlyContinue)) { $state = 'crashed' }
     }
@@ -349,6 +403,13 @@ function Invoke-Abort {
         Write-Output "killed run process tree $($status.Pid)"
     }
     Exit-Lock
+    Unregister-ResumeTask   # a run between reboots would otherwise wake up and continue
+    $statePath = Join-Path $dir 'state.json'
+    if (Test-Path -LiteralPath $statePath) {
+        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $state.Phase = 'done'; $state.ExpectedReboot = $false
+        Write-Json $statePath $state
+    }
     Write-Json (Join-Path $dir 'status.json') ([ordered]@{ State = 'aborted'; Stage = ''; Pid = 0; Updated = (Get-Date).ToUniversalTime().ToString('s') })
     Write-Output 'aborted; run "restore" to put the baseline driver back'
 }
@@ -364,7 +425,16 @@ function Invoke-Restore {
     $RunId = 'restore'
     Enter-Lock
     try {
-        # Devices first: a killed suite leaves adapters bound to the candidate package.
+        # A killed nightly run can leave the startup task and the persistent verifier setting behind.
+        # Without the setting cleared the next boot would start under verification; without the task
+        # removed it would try to continue a run that was abandoned.
+        Unregister-ResumeTask
+        if ((Get-VerifierPersistent).Drivers) {
+            Clear-VerifierPersistent
+            Write-Log 'persistent driver verifier setting cleared (takes effect at the next boot)'
+        }
+        if ((Get-VerifierState).Listed) { Write-Log 'driver verifier is still tracking chmlink.sys in this boot; reboot to stop it (timings are affected until then)' }
+        # Devices next: a killed suite leaves adapters bound to the candidate package.
         Remove-LeftoverTestDevices $tool $config | Out-Null
         Restore-Baseline $config $tool
     } finally { Exit-Lock }
@@ -384,6 +454,333 @@ function Invoke-Clean {
     Write-Output "kept $([math]::Min($runs.Count, $config.KeepRuns)) run(s)"
 }
 
+# ------------------------------------------------- runs that span reboots (nightly)
+# The nightly lane reboots the VM twice, so a run is a sequence of phases and the process that
+# started it does not survive. Everything that must outlive a reboot is written to state.json, and
+# a startup task (ChmLinkCiResume, SYSTEM) continues the run:
+#   A  before: build, sign, install the candidate, run the suites WITHOUT verifier, then set
+#      verifier persistently and reboot. Failing here means the candidate is simply broken.
+#   B  verifier on, from boot: suites, a short two-way benchmark, a stress loop, a leak check.
+#      Then clear the persistent setting and reboot.
+#   C  verifier gone: restore the baseline, remove the candidate package, write the summary.
+# A boot that nobody asked for (a bugcheck, a power loss) is recognised because ExpectedReboot is
+# only ever set by the code that requests the reboot; the run then skips to C and says why.
+$resumeTask = 'ChmLinkCiResume'
+
+function Get-BootId { (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o') }
+
+function Read-RunState {
+    $path = Join-Path $script:runDir 'state.json'
+    if (!(Test-Path -LiteralPath $path)) { return $null }
+    Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+function Save-RunState($State) { Write-Json (Join-Path $script:runDir 'state.json') $State }
+
+function Register-ResumeTask {
+    # A copy inside the run directory: the file in bin\ is replaced by the next vm-run.sh command,
+    # and the run must continue with the code it started with.
+    $frozen = Join-Path $script:runDir 'vm-ci.frozen.ps1'
+    Copy-Item -LiteralPath $PSCommandPath $frozen -Force
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Resume -RunId {1}' -f $frozen, $RunId)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 3) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName $resumeTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+function Unregister-ResumeTask {
+    Unregister-ScheduledTask -TaskName $resumeTask -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+# One runner for every suite, so phases A and B call the suites the same way. $Filter only matters
+# for the benchmark.
+# Returns a script block that runs one suite. It is not a closure on purpose: a closure gets its own
+# script scope, where $script:srcDir and the helper functions are not the ones of this script.
+function New-SuiteRunner([string]$InfPath, [string]$BuildDir) {
+    $script:suiteInf = $InfPath; $script:suiteBuild = $BuildDir
+    {
+        param([string]$Kind, [string]$Directory, [int]$Timeout, [string]$Filter = '')
+        $script = switch ($Kind) { 'lifecycle' { 'test-lifecycle.ps1' } 'ip' { 'test-ip.ps1' } 'bench' { 'bench.ps1' } }
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -InfPath "{1}" -BuildDirectory "{2}" -OutputDirectory "{3}"' -f `
+            (Join-Path $script:srcDir "tools\$script"), $script:suiteInf, $script:suiteBuild, $Directory
+        if ($Kind -eq 'bench') { $arguments += ' -Seconds 3'; if ($Filter) { $arguments += " -Filter $Filter" } }
+        Invoke-Process "$Kind suite" 'powershell.exe' $arguments $Timeout
+    }
+}
+
+# Take the lock again after a reboot, for a run that already owns this VM.
+function Enter-Lock-For([string]$Id) {
+    $holder = Get-LockHolder
+    if ($holder -and $holder.RunId -ne $Id) { throw "VM busy with run $($holder.RunId) (pid $($holder.Pid))." }
+    Write-Json $lockPath ([ordered]@{ RunId = $Id; Pid = $PID; Started = (Get-Date).ToUniversalTime().ToString('s') })
+}
+
+# After an unexpected reboot, keep what explains it: the bugcheck event and the newest dump.
+function Save-CrashEvidence([string]$OutDir) {
+    New-Item -ItemType Directory -Force $OutDir | Out-Null
+    $evidence = [ordered]@{ BugcheckEvents = @(); Dumps = @() }
+    try {
+        $events = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001, 41, 6008 } -MaxEvents 6 -ErrorAction Stop
+        $evidence.BugcheckEvents = @($events | ForEach-Object { [ordered]@{ Id = $_.Id; Time = $_.TimeCreated.ToUniversalTime().ToString('s'); Message = (($_.Message -replace '\s+', ' ').Trim()) } })
+    } catch { }
+    $dump = Get-ChildItem 'C:\Windows\Minidump' -Filter *.dmp -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($dump) {
+        Copy-Item -LiteralPath $dump.FullName (Join-Path $OutDir $dump.Name) -Force
+        $evidence.Dumps = @([ordered]@{ Name = $dump.Name; Bytes = $dump.Length; Time = $dump.LastWriteTime.ToUniversalTime().ToString('s') })
+    }
+    Write-Json (Join-Path $OutDir 'crash.json') $evidence
+    foreach ($e in $evidence.BugcheckEvents | Select-Object -First 2) { Write-Log "  event $($e.Id) at $($e.Time): $(([string]$e.Message).Substring(0, [math]::Min(160, ([string]$e.Message).Length)))" }
+    if ($dump) { Write-Log "  minidump kept: $($dump.Name) ($($dump.Length) bytes)" }
+}
+
+function Write-RunSummary([string]$OutDir, $State, [string]$Result, [bool]$VmClean) {
+    $config = Get-Config
+    $summary = [ordered]@{
+        RunId = $RunId; Lane = $State.Lane; Result = $Result; VmClean = $VmClean; Crashed = [bool]$State.Crashed
+        Started = $State.StartedUtc; Finished = (Get-Date).ToUniversalTime().ToString('s')
+        Seconds = [math]::Round(((Get-Date).ToUniversalTime() - [datetime]::Parse($State.StartedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal)).TotalSeconds, 0)
+        DriverVersion = $State.DriverVersion; Stages = @($script:stages)
+        Computer = $env:COMPUTERNAME; BaselineVersion = (Get-InfVersion (Join-Path $config.Baseline 'chmlink.inf'))
+    }
+    Write-Json (Join-Path $OutDir 'summary.json') $summary
+    Copy-Item -LiteralPath $script:logPath (Join-Path $OutDir 'log.txt') -Force
+    Set-Status $Result ''
+    Write-Log "result: $Result in $($summary.Seconds) s"
+    Set-Content -LiteralPath (Join-Path $script:runDir 'done') -Value $Result
+    try { Invoke-Clean | Out-Null } catch { }
+}
+
+# Mark the reboot as ours, release the lock (the next boot's process takes it again) and restart.
+# Order matters when verifier is being armed (phase A): state first, then the startup task, then
+# the verifier setting, then the reboot. Interrupted at any point, either verifier is not set yet or
+# a task exists that will find the state and clear it.
+# Windows signals running processes when it shuts down, and PowerShell then unwinds: catch and finally
+# blocks run on the way out. Anything they did (clearing the verifier setting, restoring the baseline)
+# would undo the handover or race the shutdown. Once a reboot is requested they only wait to be stopped.
+$script:rebootPending = $false
+function Stop-IfRebooting {
+    if ($script:rebootPending) { Start-Sleep -Seconds 600 }
+}
+
+function Request-Reboot($State, [string]$NextPhase, [string]$Why) {
+    $State.Phase = $NextPhase
+    $State.ExpectedReboot = $true
+    $State.BootIdBeforeReboot = Get-BootId
+    Save-RunState $State
+    Set-Status 'rebooting' $Why
+    Write-Log "rebooting for: $Why (continues in phase $NextPhase)"
+    Exit-Lock
+    $script:rebootPending = $true
+    & shutdown.exe /r /t 5 /c "ChmLink CI: $Why" | Out-Null
+    # shutdown returns at once; stay alive so that the caller does not run on into the next stage.
+    Start-Sleep -Seconds 120
+    $script:rebootPending = $false
+    throw 'The reboot did not happen within two minutes.'
+}
+
+# ----------------------------------------------------- certificate renewal
+# The test certificate expires. Renewing means more than a new certificate: the baseline package
+# is signed with the old one, and Windows reuses a published package whose INF text is unchanged,
+# so the baseline is re-signed AND given a new DriverVer before it is installed again.
+function Invoke-RenewCert {
+    if (!(Test-Admin)) { throw 'Run elevated.' }
+    $config = Get-Config
+    $holder = Get-LockHolder
+    if ($holder) { throw "VM busy with run $($holder.RunId)." }
+    $old = Get-ChildItem Cert:\LocalMachine\My | Where-Object Thumbprint -eq $config.CertThumbprint
+    if ($old) { Write-Output ("current certificate: {0} expires {1} ({2} days)" -f $config.CertThumbprint.Substring(0, 8), $old.NotAfter.ToString('yyyy-MM-dd'), [int]($old.NotAfter - (Get-Date)).TotalDays) }
+    $kitTool = Join-Path $kitDir 'chmlink-device.exe'; $kitManage = Join-Path $kitDir 'manage-driver.ps1'
+    if (!(Test-Path $kitTool) -or !(Test-Path $kitManage)) { throw 'No restore kit yet; a run must build once first.' }
+    $sdk = Join-Path $config.WdkRoot "microsoft.windows.sdk.cpp\c\bin\$($config.KitVersion)\x64\signtool.exe"
+    $inf2cat = Join-Path $config.WdkRoot "microsoft.windows.wdk.x64\c\bin\$($config.KitVersion)\x86\Inf2Cat.exe"
+
+    $work = Join-Path $ciRoot ('renew-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Force $work | Out-Null
+    $script:runDir = $work; $script:logPath = Join-Path $work 'log.txt'; $script:deadline = $null
+    $stage = Join-Path $work 'package'
+    New-Item -ItemType Directory -Force $stage | Out-Null
+    foreach ($file in 'chmlink.inf', 'chmlink.sys') { Copy-Item (Join-Path $config.Baseline $file) $stage -Force }
+
+    # DriverVer: raise the last component. The date part stays; only the version decides.
+    $infPath = Join-Path $stage 'chmlink.inf'
+    $text = [IO.File]::ReadAllText($infPath)
+    $match = [regex]::Match($text, '(?m)^(\s*DriverVer\s*=\s*[^,]+,\s*)(\d+)\.(\d+)\.(\d+)\.(\d+)\s*$')
+    if (!$match.Success) { throw 'No DriverVer in the baseline INF.' }
+    $oldVersion = '{0}.{1}.{2}.{3}' -f $match.Groups[2].Value, $match.Groups[3].Value, $match.Groups[4].Value, $match.Groups[5].Value
+    $newVersion = '{0}.{1}.{2}.{3}' -f $match.Groups[2].Value, $match.Groups[3].Value, $match.Groups[4].Value, ([int]$match.Groups[5].Value + 1)
+    [IO.File]::WriteAllText($infPath, $text.Replace($match.Value, $match.Groups[1].Value + $newVersion), (New-Object Text.UTF8Encoding($false)))
+    Write-Output "baseline DriverVer: $oldVersion -> $newVersion"
+    if ($WhatIfRenew) { Write-Output "WHATIF: would create a $ValidDays-day certificate, re-sign and reinstall the baseline. Nothing changed."; Remove-Item $work -Recurse -Force; return }
+
+    # 1) new certificate, trusted the same way as the current one
+    $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ChmLink VM Test Signing' -CertStoreLocation Cert:\LocalMachine\My `
+        -NotAfter (Get-Date).AddDays($ValidDays) -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable
+    $cer = Join-Path $work 'test-signing.cer'
+    Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+    foreach ($store in 'Root', 'TrustedPublisher') { Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null }
+    Write-Output ("new certificate: {0} expires {1}" -f $cert.Thumbprint.Substring(0, 8), $cert.NotAfter.ToString('yyyy-MM-dd'))
+
+    # 2) re-sign. Everything is verified before any device is touched.
+    $sign = '/fd sha256 /sm /s My /sha1 {0}' -f $cert.Thumbprint
+    Invoke-Process 'sign sys' $sdk ("sign /q $sign `"$stage\chmlink.sys`"") 120
+    Invoke-Process 'inf2cat' $inf2cat ("/driver:`"$stage`" /os:10_X64,Server10_X64 /uselocaltime") 300
+    Invoke-Process 'sign cat' $sdk ("sign /q $sign `"$stage\chmlink.cat`"") 120
+    Invoke-Process 'verify catalog' $sdk ("verify /q /pa /c `"$stage\chmlink.cat`" `"$stage\chmlink.sys`"") 120
+    $signer = (Get-AuthenticodeSignature (Join-Path $stage 'chmlink.sys')).SignerCertificate.Thumbprint
+    if ($signer -ne $cert.Thumbprint) { throw 'The re-signed driver is not signed by the new certificate.' }
+
+    # 3) install it over the anchor device through the normal upgrade path (it rolls itself back on failure)
+    $script:manageScript = $kitManage
+    $newSys = Get-Sha256 (Join-Path $stage 'chmlink.sys')
+    try { Install-Package $config (Join-Path $stage 'chmlink.inf') $kitTool 'renewed baseline' $newSys }
+    catch {
+        Write-Output "FAILED to install the renewed baseline: $($_.Exception.Message)"
+        Write-Output 'The old baseline and certificate are unchanged. The new certificate stays in the stores; remove it if unwanted.'
+        throw
+    }
+
+    # 4) only now switch the baseline and the configuration
+    foreach ($file in 'chmlink.inf', 'chmlink.sys', 'chmlink.cat') { Copy-Item (Join-Path $stage $file) $config.Baseline -Force }
+    $raw = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $raw.CertThumbprint = $cert.Thumbprint
+    Write-Json $configPath $raw
+    Write-Output ("baseline is now {0}, signed by {1}; config updated." -f $newVersion, $cert.Thumbprint.Substring(0, 8))
+    Write-Output "The old certificate $($config.CertThumbprint.Substring(0, 8)) is left in place (existing signatures keep chaining to it)."
+    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Continues a nightly run after a reboot. Started by the startup task, so it runs as SYSTEM.
+function Invoke-Resume {
+    if (!$RunId) { throw 'Resume needs -RunId.' }
+    $config = Get-Config
+    $script:runDir = Join-Path $ciRoot "runs\$RunId"
+    $script:srcDir = Join-Path $script:runDir 'src'
+    $script:manageScript = Join-Path $script:srcDir 'tools\manage-driver.ps1'
+    $script:logPath = Join-Path $script:runDir 'log.txt'
+    $out = Join-Path $script:runDir 'out'
+    $state = Read-RunState
+    if (!$state) { return }                                   # not a run of ours: nothing to do
+    if ($state.Phase -eq 'done') { Unregister-ResumeTask; return }
+    $build = Join-Path $script:srcDir 'build\verify\Release'
+    $signed = Join-Path $script:srcDir 'build\signed'
+    $candidateInf = Join-Path $signed 'chmlink.inf'
+    $tool = Join-Path $build 'chmlink-device.exe'
+    $script:deadline = [datetime]::Parse($state.DeadlineUtc).ToUniversalTime()
+    $script:deadline = [TimeZoneInfo]::ConvertTimeFromUtc($script:deadline, [TimeZoneInfo]::Local)
+    $script:stages = @($state.Stages)
+    $script:candidateOem = [string]$state.CandidateOem
+    $script:driverVersion = [string]$state.DriverVersion
+    $script:installStarted = $true
+    $suite = New-SuiteRunner $candidateInf $build
+    $unexpected = $false
+
+    # What kind of boot is this?
+    $bootNow = Get-BootId
+    if ($state.ExpectedReboot -and $bootNow -ne $state.BootIdBeforeReboot) {
+        Write-Log "boot after a requested reboot (phase $($state.Phase))"
+    } elseif ($bootNow -eq $state.BootIdBeforeReboot) {
+        Write-Log 'resume task fired again within the same boot; nothing to do'
+        return
+    } else {
+        $unexpected = $true
+        Write-Log "UNEXPECTED REBOOT: the system restarted while phase $($state.Phase) was not asking for it"
+        Save-CrashEvidence $out
+    }
+    $state.ExpectedReboot = $false
+    Enter-Lock-For $RunId
+    Set-Status 'running' "resume-$($state.Phase)"
+    $result = [string]$state.Result
+    if ($unexpected) { $result = 'failed'; $state.Phase = 'C'; $state.Crashed = $true }
+    Save-RunState $state
+
+    try {
+        if ($state.Phase -eq 'B') {
+            try {
+                Invoke-Stage 'verifier-active' {
+                    # The startup task runs seconds after boot, before PnP has started the root-enumerated
+                    # adapter; the driver is not loaded (so not listed) until then.
+                    $waitEnd = (Get-Date).AddSeconds(180)
+                    $now = Get-VerifierState
+                    while (!$now.Listed -and (Get-Date) -lt $waitEnd) { Start-Sleep -Seconds 5; $now = Get-VerifierState }
+                    if (!$now.Listed) { throw 'Driver Verifier is not tracking chmlink.sys after the reboot.' }
+                    $state.LeakCurrent = $now.CurrentAllocations; $state.LeakBytes = $now.CurrentBytes
+                    Write-Log ("verifier on from boot. Idle driver: {0} live allocations, {1} bytes" -f $now.CurrentAllocations, $now.CurrentBytes)
+                    Save-RunState $state
+                }
+                Invoke-Stage 'verifier-lifecycle' { & $suite 'lifecycle' (Join-Path $out 'verifier-lifecycle') 1500 }
+                Invoke-Stage 'verifier-ip' { & $suite 'ip' (Join-Path $out 'verifier-ip') 900 }
+                # Verifier slows the data path several times over, so the benchmark here proves behaviour
+                # under concurrency, not speed. Its numbers are never compared with the baseline.
+                Invoke-Stage 'verifier-duplex' { & $suite 'bench' (Join-Path $out 'verifier-duplex') 900 'duplex' }
+                $stressEnd = (Get-Date).AddMinutes([int]$state.StressMinutes)
+                $iteration = 0
+                while ((Get-Date) -lt $stressEnd) {
+                    $iteration++
+                    Invoke-Stage "stress-$iteration" {
+                        & $suite 'lifecycle' (Join-Path $out "stress-$iteration-lifecycle") 1500
+                        & $suite 'ip' (Join-Path $out "stress-$iteration-ip") 900
+                        & $suite 'bench' (Join-Path $out "stress-$iteration-bench") 900 '2injectors'
+                    }
+                }
+                Invoke-Stage 'verifier-leaks' {
+                    # Every suite adapter is gone. What the driver holds must be back at the level measured
+                    # at boot; the reference is measured, not assumed.
+                    $after = Get-VerifierState
+                    Write-Log ("after {0} stress iteration(s): {1} live allocations, {2} bytes, peak {3} (idle at boot: {4}, {5} bytes)" -f `
+                        $iteration, $after.CurrentAllocations, $after.CurrentBytes, $after.PeakAllocations, $state.LeakCurrent, $state.LeakBytes)
+                    if ($after.CurrentAllocations -gt $state.LeakCurrent -or $after.CurrentBytes -gt $state.LeakBytes) {
+                        throw ("chmlink.sys holds {0} allocations / {1} bytes after the suites, {2} / {3} when idle: possible leak." -f `
+                            $after.CurrentAllocations, $after.CurrentBytes, $state.LeakCurrent, $state.LeakBytes)
+                    }
+                }
+                $result = 'passed'
+            } catch {
+                Write-Log "phase B failed: $($_.Exception.Message)"
+                $result = 'failed'
+            }
+            $state.Result = $result; $state.Stages = @($script:stages)
+            Clear-VerifierPersistent
+            Request-Reboot $state 'C' 'switching driver verifier off'
+        }
+    } catch {
+        Stop-IfRebooting
+        Write-Log "resume failed: $($_.Exception.Message)"
+        if ($result -ne 'failed') { $result = 'infra-failed' }
+    }
+    Stop-IfRebooting
+
+    # Phase C: verifier is off (or the run is being abandoned): put the VM back and report.
+    $vmClean = $true
+    try {
+        if ((Get-VerifierPersistent).Drivers) { Clear-VerifierPersistent }
+        if ((Get-VerifierState).Listed) {
+            # Still tracked: this boot began with verifier on. Restoring now would reload the driver under
+            # verification, which is harmless but slow; one more reboot makes the end state clean.
+            if (!$state.ExtraRebootDone) {
+                $state.ExtraRebootDone = $true; $state.Result = $result; $state.Stages = @($script:stages)
+                Request-Reboot $state 'C' 'verifier still tracking after a crash; clearing it'
+            }
+        }
+        $script:deadline = (Get-Date).AddMinutes(15)
+        Invoke-Stage 'restore' { Restore-Baseline $config $tool }
+        $bound = Get-BoundInf (Get-ChmLinkDevices | Select-Object -First 1).InstanceId
+        if ($script:candidateOem -and $script:candidateOem -ne $bound) {
+            try {
+                Invoke-Process 'remove candidate package' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`" -Action RemovePackage -PublishedInf {1} -MaintenanceWindow -DeviceTool `"{2}`"" -f `
+                    $script:manageScript, $script:candidateOem, $tool) 120
+            } catch { Write-Log "warning: could not remove $($script:candidateOem): $($_.Exception.Message)" }
+        }
+    } catch {
+        $vmClean = $false; $result = 'infra-failed'
+        Write-Log "RESTORE FAILED; the VM needs attention: $($_.Exception.Message)"
+    }
+    Unregister-ResumeTask
+    $state.Phase = 'done'; Save-RunState $state
+    Exit-Lock
+    Write-RunSummary $out $state $result $vmClean
+}
+
 # --------------------------------------------------------------------- run
 function Invoke-Run {
     if (!$RunId) { throw 'Run needs -RunId.' }
@@ -394,10 +791,11 @@ function Invoke-Run {
     $script:logPath = Join-Path $script:runDir 'log.txt'
     $out = Join-Path $script:runDir 'out'
     New-Item -ItemType Directory -Force $out | Out-Null
-    $laneMinutes = if ($Lane -eq 'full') { 75 } else { 30 }
+    $stressMinutes = if ($StressMinutes -gt 0) { $StressMinutes } elseif ($config.NightlyStressMinutes) { [int]$config.NightlyStressMinutes } else { 20 }
+    $laneMinutes = switch ($Lane) { 'full' { 75 } 'nightly' { 40 + $stressMinutes } default { 30 } }
     $script:deadline = (Get-Date).AddMinutes($laneMinutes)
     $started = Get-Date
-    $result = 'failed'; $vmClean = $true
+    $result = 'failed'; $vmClean = $true; $handedOver = $false
     $build = Join-Path $script:srcDir 'build\verify\Release'
     $signed = Join-Path $script:srcDir 'build\signed'
     $tool = $null
@@ -474,14 +872,14 @@ function Invoke-Run {
             $script:candidateOem = Get-BoundInf (Get-ChmLinkDevices | Select-Object -First 1).InstanceId
             Write-Log "candidate bound as $($script:candidateOem)"
         }
-        Invoke-Stage 'lifecycle' {
-            Invoke-Process 'lifecycle suite' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`" -InfPath `"{1}`" -BuildDirectory `"{2}`" -OutputDirectory `"{3}`"" -f `
-                (Join-Path $script:srcDir 'tools\test-lifecycle.ps1'), $candidateInf, $build, (Join-Path $out 'lifecycle')) 900
+        $suite = {
+            param([string]$Kind, [string]$Directory, [int]$Timeout)
+            $script = if ($Kind -eq 'lifecycle') { 'test-lifecycle.ps1' } else { 'test-ip.ps1' }
+            Invoke-Process "$Kind suite" 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`" -InfPath `"{1}`" -BuildDirectory `"{2}`" -OutputDirectory `"{3}`"" -f `
+                (Join-Path $script:srcDir "tools\$script"), $candidateInf, $build, $Directory) $Timeout
         }
-        Invoke-Stage 'ip' {
-            Invoke-Process 'ip suite' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`" -InfPath `"{1}`" -BuildDirectory `"{2}`" -OutputDirectory `"{3}`"" -f `
-                (Join-Path $script:srcDir 'tools\test-ip.ps1'), $candidateInf, $build, (Join-Path $out 'ip')) 600
-        }
+        Invoke-Stage 'lifecycle' { & $suite 'lifecycle' (Join-Path $out 'lifecycle') 900 }
+        Invoke-Stage 'ip' { & $suite 'ip' (Join-Path $out 'ip') 600 }
         if ($Lane -eq 'full') {
             for ($i = 1; $i -le $config.BenchRepeats; $i++) {
                 Invoke-Stage "bench-$i" {
@@ -490,14 +888,39 @@ function Invoke-Run {
                 }
             }
         }
+        if ($Lane -eq 'nightly') {
+            # Candidate installed and healthy without verifier. Hand the rest to the phase machine, which
+            # survives the reboot. Order matters (see Request-Reboot): state, task, verifier, reboot.
+            $state = [pscustomobject]@{
+                Lane = $Lane; Phase = 'B'; ExpectedReboot = $false; BootIdBeforeReboot = ''; Result = ''
+                StressMinutes = $stressMinutes; StartedUtc = $started.ToUniversalTime().ToString('s')
+                DeadlineUtc = $script:deadline.ToUniversalTime().ToString('o')
+                CandidateOem = $script:candidateOem; DriverVersion = $script:driverVersion
+                Stages = @($script:stages); Crashed = $false; ExtraRebootDone = $false
+                LeakCurrent = -1; LeakBytes = -1
+            }
+            Save-RunState $state
+            Register-ResumeTask
+            Set-VerifierPersistent
+            $handedOver = $true
+            Request-Reboot $state 'B' 'turning driver verifier on'
+        }
         $result = 'passed'
     }
     catch {
+        Stop-IfRebooting
         Write-Log "run failed: $($_.Exception.Message)"
         $failedStage = @($script:stages | Where-Object Status -eq 'failed' | Select-Object -First 1)
         $result = if ($failedStage.Count -and $failedStage[0].Name -eq 'preflight') { 'infra-failed' } else { 'failed' }
     }
     finally {
+        Stop-IfRebooting
+        # Reached with $handedOver only when the reboot was requested but did not happen (the process
+        # would otherwise have been stopped by it). Undo the arming so that the VM is left as found.
+        if ($handedOver) {
+            try { Clear-VerifierPersistent } catch { Write-Log "warning: $($_.Exception.Message)" }
+            Unregister-ResumeTask
+        }
         # The VM must come back to the baseline whatever happened above.
         if ($script:installStarted -or ((Get-InstalledImageHash) -ne (Get-Sha256 (Join-Path $config.Baseline 'chmlink.sys')) -and $tool)) {
             try {
@@ -541,4 +964,6 @@ switch ($Action) {
     'Abort'   { Invoke-Abort }
     'Restore' { Invoke-Restore }
     'Clean'   { Invoke-Clean }
+    'RenewCert' { Invoke-RenewCert }
+    'Resume'  { Invoke-Resume }
 }

@@ -6,10 +6,11 @@
 #
 #   vm-run.sh init  --baseline-dir <dir on the VM with signed chmlink.inf/.sys/.cat>
 #   vm-run.sh doctor
-#   vm-run.sh run <smoke|full> [--commit REV | --worktree] [--no-wait]
+#   vm-run.sh run <smoke|full|nightly> [--commit REV | --worktree] [--no-wait] [--stress-minutes N]
 #   vm-run.sh attach <run-id>          # follow a run and fetch its results
 #   vm-run.sh abort <run-id>
 #   vm-run.sh restore                  # put the baseline driver back
+#   vm-run.sh renew-cert [--dry-run]   # new test certificate, re-signed and reinstalled baseline
 #   vm-run.sh clean
 #
 # Exit status: 0 passed, 1 tests or build failed, 2 benchmark gate failed,
@@ -82,6 +83,14 @@ cmd_restore() {
     vmps "$BIN" -Action Restore
 }
 
+cmd_renew_cert() {
+    local extra=""
+    case ${1:-} in --dry-run) extra="-WhatIfRenew" ;; "") ;; *) die "usage: renew-cert [--dry-run]" ;; esac
+    install_bin || die "cannot reach the VM" 3
+    # shellcheck disable=SC2086
+    vmps "$BIN" -Action RenewCert $extra
+}
+
 cmd_clean() {
     install_bin || die "cannot reach the VM" 3
     vmps "$BIN" -Action Clean
@@ -111,13 +120,14 @@ export_tree() {   # $1 = commit | worktree, $2 = output tar
 
 cmd_run() {
     local lane=${1:-}; shift || true
-    case $lane in smoke|full) ;; *) die "usage: run <smoke|full> [--commit REV | --worktree] [--no-wait]" ;; esac
-    local source=HEAD wait=1 label
+    case $lane in smoke|full|nightly) ;; *) die "usage: run <smoke|full|nightly> [--commit REV | --worktree] [--no-wait] [--stress-minutes N]" ;; esac
+    local source=HEAD wait=1 label stress=0
     while [ $# -gt 0 ]; do
         case $1 in
             --commit) source=$2; shift 2 ;;
             --worktree) source=worktree; shift ;;
             --no-wait) wait=0; shift ;;
+            --stress-minutes) stress=$2; shift 2 ;;
             *) die "unknown option $1" ;;
         esac
     done
@@ -150,7 +160,7 @@ cmd_run() {
     local launched
     # The CI script is always this checkout's copy, so any commit can be tested, including
     # ones that predate tools/ci. The commit under test supplies only the code to build and run.
-    launched=$(vmps "$BIN" -Action Launch -RunId "$run_id" -Lane "$lane" 2>&1)
+    launched=$(vmps "$BIN" -Action Launch -RunId "$run_id" -Lane "$lane" -StressMinutes "$stress" 2>&1)
     case $launched in LAUNCHED*) ;; *) echo "$launched" >&2; die "the VM did not start the run" 3 ;; esac
     echo "started on the VM ($launched); follow later with: vm-run.sh attach $run_id"
     [ $wait -eq 1 ] || exit 0
@@ -159,10 +169,17 @@ cmd_run() {
 
 # Follow a run's log until it finishes, then fetch results and apply the gates.
 follow() {
-    local run_id=$1 lane=$2 offset=0 failures=0 out state stage next last_stage="" poll_err
+    local run_id=$1 lane=$2 offset=0 failures=0 out state stage next last_stage="" poll_err max_silent
+    local started limit
     poll_err=$(mktemp) || die "mktemp failed" 3
+    max_silent=$(( 900 / POLL_SECONDS ))
+    # The VM enforces its own deadline too; this one only stops us waiting for a run that has stalled
+    # without ending (for example a reboot whose startup task never fired).
+    case $lane in nightly) limit=${CHMLINK_CI_NIGHTLY_LIMIT:-7200} ;; full) limit=5400 ;; *) limit=2400 ;; esac
+    started=$(date +%s)
     while :; do
         if out=$(vmps "$BIN" -Action Poll -RunId "$run_id" -Offset "$offset" 2>"$poll_err"); then
+            [ $failures -eq 0 ] || echo "(VM answering again)" >&2
             failures=0
             out=$(printf '%s\n' "$out" | tr -d '\r')
             printf '%s\n' "$out" | grep -v -e '^@@STATE' -e '^$'
@@ -175,12 +192,17 @@ follow() {
             case $state in
                 passed|failed|infra-failed|aborted|crashed|missing) break ;;
             esac
+            if [ $(( $(date +%s) - started )) -gt "$limit" ]; then
+                die "run $run_id has not finished after $((limit / 60)) minutes (state: $state $stage). It may be stuck on the VM: vm-run.sh doctor, then abort and restore. Resume watching: vm-run.sh attach $run_id" 3
+            fi
         else
             failures=$((failures + 1))
-            if [ $failures -eq 1 ] || [ $failures -gt 30 ]; then
-                echo "poll failed (attempt $failures): $(tr -d '\r' < "$poll_err" | grep -v '^$' | head -3 | cut -c1-200)" >&2
+            # A nightly run reboots the VM twice, each time unreachable for a minute or two. Allow it
+            # a quarter of an hour of silence in a row before giving up (the run itself keeps going).
+            if [ $failures -eq 1 ]; then
+                echo "(VM not answering: $(tr -d '\r' < "$poll_err" | grep -v '^$' | head -1 | cut -c1-120); waiting, it may be rebooting)" >&2
             fi
-            [ $failures -le 30 ] || die "cannot read the run's state; it continues on the VM. Resume: vm-run.sh attach $run_id" 3
+            [ $failures -le "$max_silent" ] || die "cannot read the run's state; it continues on the VM. Resume: vm-run.sh attach $run_id" 3
         fi
         sleep "$POLL_SECONDS"
     done
@@ -210,6 +232,9 @@ finish() {
     fi
     echo
     echo "results: $dest"
+    if [ "$lane" = nightly ] && [ -f "$dest/crash.json" ]; then
+        echo "crash evidence (unexpected reboot or bugcheck during the verifier phase): $dest/crash.json"
+    fi
     case $state in
         passed) ;;
         failed) echo "RESULT: FAILED (see log above and $dest/summary.json)"; exit 1 ;;
@@ -232,7 +257,7 @@ finish() {
 }
 
 # ---------------------------------------------------------------------- main
-[ $# -ge 1 ] || die "usage: vm-run.sh <init|doctor|run|attach|abort|restore|clean> ..."
+[ $# -ge 1 ] || die "usage: vm-run.sh <init|doctor|run|attach|abort|restore|renew-cert|clean> ..."
 command=$1; shift
 case $command in
     init) cmd_init "$@" ;;
@@ -242,5 +267,6 @@ case $command in
     abort) cmd_abort "$@" ;;
     restore) cmd_restore ;;
     clean) cmd_clean ;;
+    renew-cert) cmd_renew_cert "$@" ;;
     *) die "unknown command $command" ;;
 esac
