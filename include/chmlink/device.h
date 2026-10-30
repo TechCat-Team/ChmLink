@@ -10,7 +10,7 @@
 #define CHMLINK_IP_LIMIT CHMLINK_IP_MTU
 /* Per-adapter transmit queue (Windows -> user mode): a byte ring of
  * CHMLINK_QUEUE_BYTES holding at most CHMLINK_QUEUE_PACKETS packets. Small
- * packets are bounded by the count, large ones by the bytes (about 2900
+ * packets are bounded by the count, large ones by the bytes (about 2700
  * full-size Ethernet frames). QUERY reports the packet bound as capacity. */
 #define CHMLINK_QUEUE_PACKETS 16384u
 #define CHMLINK_QUEUE_BYTES (4u * 1024u * 1024u)
