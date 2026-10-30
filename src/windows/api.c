@@ -45,13 +45,78 @@ static int leave(chmlink_adapter *a, int result)
     return result;
 }
 
+/* Device handles are opened for overlapped I/O. On a synchronous handle the
+ * I/O manager serializes every request on the file object, so a thread in a
+ * tight inject loop would starve a concurrent receive or readiness query.
+ * Each request still behaves synchronously for the caller: device_ioctl waits
+ * on a per-thread event until the driver completes it.
+ *
+ * The event lives in a fiber-local slot whose destructor closes it when the
+ * thread exits. The slot is allocated once for the process and never freed;
+ * if allocation fails, a temporary event is used for each request. */
+static INIT_ONCE event_slot_once = INIT_ONCE_STATIC_INIT;
+static DWORD event_slot = FLS_OUT_OF_INDEXES;
+
+static void WINAPI close_thread_event(void *value)
+{
+    if (value != NULL) CloseHandle((HANDLE)value);
+}
+
+static BOOL CALLBACK allocate_event_slot(PINIT_ONCE once, void *parameter, void **context)
+{
+    (void)once; (void)parameter; (void)context;
+    event_slot = FlsAlloc(close_thread_event);
+    return TRUE;
+}
+
+static HANDLE thread_event(void)
+{
+    HANDLE event;
+    InitOnceExecuteOnce(&event_slot_once, allocate_event_slot, NULL, NULL);
+    if (event_slot == FLS_OUT_OF_INDEXES) return NULL;
+    event = (HANDLE)FlsGetValue(event_slot);
+    if (event == NULL) {
+        event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (event != NULL && !FlsSetValue(event_slot, event)) { CloseHandle(event); event = NULL; }
+    }
+    return event;
+}
+
+/* Synchronous wrapper over an overlapped DeviceIoControl. Preserves the
+ * request's error code; a request cancelled by chmlink_close fails with
+ * ERROR_OPERATION_ABORTED. */
+static BOOL device_ioctl(HANDLE device, DWORD code, const void *input, DWORD input_size,
+                         void *output, DWORD output_size, DWORD *returned)
+{
+    OVERLAPPED overlapped;
+    HANDLE event = thread_event(), owned = NULL;
+    DWORD bytes = 0, error = ERROR_SUCCESS;
+    BOOL ok;
+    if (event == NULL) {
+        owned = event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (event == NULL) return FALSE;
+    }
+    memset(&overlapped, 0, sizeof(overlapped));
+    overlapped.hEvent = event;
+    ok = DeviceIoControl(device, code, (void *)input, input_size, output, output_size,
+                         NULL, &overlapped);
+    if (ok || GetLastError() == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(device, &overlapped, &bytes, TRUE);
+    }
+    if (!ok) error = GetLastError();
+    if (owned != NULL) CloseHandle(owned);
+    if (returned != NULL) *returned = ok ? bytes : 0;
+    if (!ok) SetLastError(error);
+    return ok;
+}
+
 static HANDLE open_device(uint32_t index, DWORD access)
 {
     wchar_t path[64];
     if (index == 0) { SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
     swprintf(path, sizeof(path) / sizeof(path[0]), L"\\\\.\\ChmLink%lu", (unsigned long)index);
     return CreateFileW(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 }
 
 static int query_device(HANDLE device, chmlink_adapter_info *info)
@@ -66,8 +131,8 @@ static int query_device(HANDLE device, chmlink_adapter_info *info)
     wchar_t id[39];
     int i;
     if (info == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
-    if (!DeviceIoControl(device, CHMLINK_IOCTL_QUERY, NULL, 0, bytes,
-                         sizeof(bytes), &received, NULL)) {
+    if (!device_ioctl(device, CHMLINK_IOCTL_QUERY, NULL, 0, bytes,
+                      sizeof(bytes), &received)) {
         error = GetLastError();
         SetLastError(error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED ?
                      ERROR_REVISION_MISMATCH : error);
@@ -172,8 +237,8 @@ chmlink_adapter *chmlink_open(uint32_t index)
         DWORD received;
         unsigned int i;
         for (i = 0; i < 8; ++i) bytes[i] = (uint8_t)(handle >> (i * 8));
-        if (!DeviceIoControl(device, CHMLINK_IOCTL_REGISTER_READ_EVENT, bytes,
-                             sizeof(bytes), NULL, 0, &received, NULL)) {
+        if (!device_ioctl(device, CHMLINK_IOCTL_REGISTER_READ_EVENT, bytes,
+                          sizeof(bytes), NULL, 0, &received)) {
             DWORD error = GetLastError(); chmlink_close(adapter); SetLastError(error); return NULL;
         }
     }
@@ -252,6 +317,12 @@ void chmlink_close(chmlink_adapter *adapter)
         AcquireSRWLockExclusive(&adapter->gate);
         adapter->closing = TRUE;
         if (adapter->close_event) SetEvent(adapter->close_event);
+        ReleaseSRWLockExclusive(&adapter->gate);
+        /* The current driver completes every request without pending it, but
+         * cancel anything outstanding so close can never wait on the driver.
+         * ERROR_NOT_FOUND (nothing outstanding) is the normal result. */
+        (void)CancelIoEx(adapter->device, NULL);
+        AcquireSRWLockExclusive(&adapter->gate);
         while (adapter->active != 0)
             SleepConditionVariableSRW(&adapter->drained, &adapter->gate, INFINITE, 0);
         ReleaseSRWLockExclusive(&adapter->gate);
@@ -274,8 +345,8 @@ int chmlink_receive(chmlink_adapter *adapter, void *buffer, uint32_t capacity,
         SetLastError(ERROR_INVALID_PARAMETER); return 0;
     }
     if (!enter(adapter)) return 0;
-    result = DeviceIoControl(adapter->device, CHMLINK_IOCTL_RECEIVE, NULL, 0,
-                              buffer, capacity, &received, NULL) != 0;
+    result = device_ioctl(adapter->device, CHMLINK_IOCTL_RECEIVE, NULL, 0,
+                          buffer, capacity, &received) != 0;
     if (!result) return leave(adapter, 0);
     if (chmlink_batch_validate(buffer, received, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
         SetLastError(ERROR_INVALID_DATA); return leave(adapter, 0);
@@ -292,8 +363,8 @@ int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length)
     if (chmlink_batch_validate(batch, length, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
         SetLastError(ERROR_INVALID_PARAMETER); return leave(adapter, 0);
     }
-    result = DeviceIoControl(adapter->device, CHMLINK_IOCTL_INJECT, (void *)batch,
-                           length, NULL, 0, &received, NULL) != 0;
+    result = device_ioctl(adapter->device, CHMLINK_IOCTL_INJECT, batch,
+                          length, NULL, 0, &received) != 0;
     return leave(adapter, result);
 }
 

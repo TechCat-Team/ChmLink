@@ -12,6 +12,8 @@ extern "C" {
 /* Experimental synchronous C API. Errors use Windows GetLastError().
  * One open session per adapter. Calls may run on different threads, but the
  * caller must prevent new calls before closing, and close exactly once.
+ * Calls from different threads proceed concurrently in the driver (the device
+ * handle is overlapped internally); each call still blocks until it completes.
  * Close cancels an existing wait, drains calls already in progress, then
  * destroys the handle. The pointer must never be used after close returns.
  * These functions do not create devices or modify IP addresses/routes.
