@@ -82,7 +82,9 @@ termination, repeated GUID opens, queue saturation and recovery, 1000 uniquely
 numbered UDP packets, adapter isolation, waits during disable/removal, SDK handle
 release after concurrent calls from 16 threads, and IOCTL fuzzing (`chmlink-ioctl-fuzz`,
 `-FuzzSeconds`, default 20): strictly on one adapter, and tolerantly on another
-that is disabled and enabled while the requests run.
+that is disabled and enabled while the requests run. With `-PowerCycle` it also suspends
+and resumes the system with a session open (`chmlink-power-test`); this puts the
+machine to sleep and is skipped where no sleep state exists.
 Normal configuration traffic is drained before timing checks; readiness may
 legally win a cancellation race. Process deadlines and per-stage stdout/stderr
 logs distinguish hangs from assertion failures. The mutating suite is not
@@ -373,13 +375,17 @@ calls and copies further; it would change the device contract and is not done.
 ## Status
 
 Not production ready. Open work: signing and installation outside a test-signed
-VM, minimum-version and ARM64 testing, power transitions (the PnP and shutdown
-callbacks are empty), systematic low resources simulation and NDIS verification,
-and the Rust device I/O and agent integration. Package 0.3.1.2 passed the nightly
-lane: lifecycle (with IOCTL fuzzing), IP and stress suites under standard Driver
-Verifier, then adapter churn and fuzzing under randomized low resources
-simulation, with no leaked allocations. The C interface and device contract are
-experimental.
+VM, minimum-version and ARM64 testing, running the sleep/resume test on a
+platform with sleep states, surprise-removal testing, and the Rust device I/O
+and agent integration. Sleep is reported to a session as
+`CHMLINK_STATE_LOW_POWER`, a system power-off as `CHMLINK_STATE_SHUTDOWN`
+(`ERROR_SHUTDOWN_IN_PROGRESS` from a wait), and a surprise removal as
+`CHMLINK_STATE_REMOVING`. Package 0.3.1.3 passed the nightly lane: lifecycle
+(with IOCTL fuzzing), IP and stress suites under standard Driver Verifier with
+NDIS verification, then adapter churn and fuzzing under randomized and under
+systematic low resources simulation (initialization failures included), with no
+leaked allocations, and reboots with a live session. The C interface and device
+contract are experimental.
 
 ## License
 
