@@ -259,8 +259,7 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
             ULONG length = NET_BUFFER_DATA_LENGTH(nb);
             CL_PACKET *packet;
             PVOID source;
-            if (length < (a->Mode == CHMLINK_MODE_IP ? 20u : 14u) ||
-                length > (a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT)) {
+            if (length < ClPacketMinimum(a) || length > ClPacketLimit(a)) {
                 status = NDIS_STATUS_INVALID_LENGTH; break;
             }
             if (a->Count + added >= CHMLINK_QUEUE_PACKETS) {
