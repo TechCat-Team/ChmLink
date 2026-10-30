@@ -7,6 +7,7 @@
 #include "chmlink/protocol.h"
 
 void lifecycle_queue_check(uint32_t first, uint32_t second);
+void lifecycle_sdk_check(uint32_t index);
 
 /* Fail the process rather than unwinding a stack still used by a worker.
  * The external runner bounds the whole process, including a stuck SDK close. */
@@ -210,5 +211,6 @@ int wmain(int argc, wchar_t **argv)
     }
     puts("PASS timeout, cancellation, busy wait, close drain, session isolation, process exit and reopen");
     lifecycle_queue_check(first, second);
+    lifecycle_sdk_check(first);
     return 0;
 }

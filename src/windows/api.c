@@ -9,6 +9,15 @@
 #include "chmlink/protocol.h"
 #include "chmlink/query.h"
 
+/* Completion events for the overlapped requests (see device_ioctl) are
+ * cached per adapter: a call takes one in enter() and returns it in leave(),
+ * under the lock those already take. The cache holds at most
+ * CHMLINK_EVENT_CACHE events, enough for the usual receive, inject, query and
+ * wait threads; more concurrent calls create and close their own. Close frees
+ * them all. The SDK keeps no per-thread or process-wide state, so it can be
+ * linked into a DLL that is unloaded. */
+#define CHMLINK_EVENT_CACHE 8
+
 struct chmlink_adapter {
     HANDLE device;
     uint32_t packet_limit;
@@ -19,10 +28,19 @@ struct chmlink_adapter {
     CONDITION_VARIABLE drained;
     ULONG active;
     BOOL closing, waiting;
+    ULONG cached;
+    HANDLE events[CHMLINK_EVENT_CACHE];
 };
 
-static int enter(chmlink_adapter *a)
+static HANDLE new_request_event(void)
 {
+    return CreateEventW(NULL, TRUE, FALSE, NULL);
+}
+
+/* Admit a call and give it a completion event. */
+static int enter(chmlink_adapter *a, HANDLE *event)
+{
+    *event = NULL;
     if (a == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
     AcquireSRWLockExclusive(&a->gate);
     if (a->closing) {
@@ -30,17 +48,28 @@ static int enter(chmlink_adapter *a)
         SetLastError(ERROR_OPERATION_ABORTED); return 0;
     }
     a->active++;
+    if (a->cached != 0) *event = a->events[--a->cached];
     ReleaseSRWLockExclusive(&a->gate);
+    if (*event == NULL) *event = new_request_event();
+    if (*event == NULL) {
+        DWORD error = GetLastError();
+        AcquireSRWLockExclusive(&a->gate);
+        if (--a->active == 0) WakeAllConditionVariable(&a->drained);
+        ReleaseSRWLockExclusive(&a->gate);
+        SetLastError(error); return 0;
+    }
     return 1;
 }
 
-static int leave(chmlink_adapter *a, int result)
+static int leave(chmlink_adapter *a, HANDLE event, int result)
 {
     DWORD error = GetLastError();
     AcquireSRWLockExclusive(&a->gate);
+    if (event != NULL && a->cached < CHMLINK_EVENT_CACHE) { a->events[a->cached++] = event; event = NULL; }
     a->active--;
     if (a->active == 0) WakeAllConditionVariable(&a->drained);
     ReleaseSRWLockExclusive(&a->gate);
+    if (event != NULL) CloseHandle(event);
     if (!result) SetLastError(error);
     return result;
 }
@@ -49,53 +78,16 @@ static int leave(chmlink_adapter *a, int result)
  * I/O manager serializes every request on the file object, so a thread in a
  * tight inject loop would starve a concurrent receive or readiness query.
  * Each request still behaves synchronously for the caller: device_ioctl waits
- * on a per-thread event until the driver completes it.
- *
- * The event lives in a fiber-local slot whose destructor closes it when the
- * thread exits. The slot is allocated once for the process and never freed;
- * if allocation fails, a temporary event is used for each request. */
-static INIT_ONCE event_slot_once = INIT_ONCE_STATIC_INIT;
-static DWORD event_slot = FLS_OUT_OF_INDEXES;
-
-static void WINAPI close_thread_event(void *value)
-{
-    if (value != NULL) CloseHandle((HANDLE)value);
-}
-
-static BOOL CALLBACK allocate_event_slot(PINIT_ONCE once, void *parameter, void **context)
-{
-    (void)once; (void)parameter; (void)context;
-    event_slot = FlsAlloc(close_thread_event);
-    return TRUE;
-}
-
-static HANDLE thread_event(void)
-{
-    HANDLE event;
-    InitOnceExecuteOnce(&event_slot_once, allocate_event_slot, NULL, NULL);
-    if (event_slot == FLS_OUT_OF_INDEXES) return NULL;
-    event = (HANDLE)FlsGetValue(event_slot);
-    if (event == NULL) {
-        event = CreateEventW(NULL, TRUE, FALSE, NULL);
-        if (event != NULL && !FlsSetValue(event_slot, event)) { CloseHandle(event); event = NULL; }
-    }
-    return event;
-}
-
-/* Synchronous wrapper over an overlapped DeviceIoControl. Preserves the
+ * on the caller's event until the driver completes it. Preserves the
  * request's error code; a request cancelled by chmlink_close fails with
- * ERROR_OPERATION_ABORTED. */
-static BOOL device_ioctl(HANDLE device, DWORD code, const void *input, DWORD input_size,
+ * ERROR_OPERATION_ABORTED. The event is manual-reset; DeviceIoControl resets
+ * it when the request starts. */
+static BOOL device_ioctl(HANDLE device, HANDLE event, DWORD code, const void *input, DWORD input_size,
                          void *output, DWORD output_size, DWORD *returned)
 {
     OVERLAPPED overlapped;
-    HANDLE event = thread_event(), owned = NULL;
     DWORD bytes = 0, error = ERROR_SUCCESS;
     BOOL ok;
-    if (event == NULL) {
-        owned = event = CreateEventW(NULL, TRUE, FALSE, NULL);
-        if (event == NULL) return FALSE;
-    }
     memset(&overlapped, 0, sizeof(overlapped));
     overlapped.hEvent = event;
     ok = DeviceIoControl(device, code, (void *)input, input_size, output, output_size,
@@ -104,7 +96,6 @@ static BOOL device_ioctl(HANDLE device, DWORD code, const void *input, DWORD inp
         ok = GetOverlappedResult(device, &overlapped, &bytes, TRUE);
     }
     if (!ok) error = GetLastError();
-    if (owned != NULL) CloseHandle(owned);
     if (returned != NULL) *returned = ok ? bytes : 0;
     if (!ok) SetLastError(error);
     return ok;
@@ -119,7 +110,7 @@ static HANDLE open_device(uint32_t index, DWORD access)
                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 }
 
-static int query_device(HANDLE device, chmlink_adapter_info *info)
+static int query_device(HANDLE device, HANDLE event, chmlink_adapter_info *info)
 {
     uint8_t bytes[CHMLINK_INFO_SIZE];
     chmlink_query_info wire;
@@ -131,7 +122,7 @@ static int query_device(HANDLE device, chmlink_adapter_info *info)
     wchar_t id[39];
     int i;
     if (info == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
-    if (!device_ioctl(device, CHMLINK_IOCTL_QUERY, NULL, 0, bytes,
+    if (!device_ioctl(device, event, CHMLINK_IOCTL_QUERY, NULL, 0, bytes,
                       sizeof(bytes), &received)) {
         error = GetLastError();
         SetLastError(error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED ?
@@ -168,51 +159,62 @@ static int query_device(HANDLE device, chmlink_adapter_info *info)
 
 int chmlink_inspect(uint32_t index, chmlink_adapter_info *info)
 {
-    HANDLE device;
+    HANDLE device, event;
     DWORD error;
     int result;
     if (info == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    event = new_request_event();
+    if (event == NULL) return 0;
     device = open_device(index, GENERIC_READ);
-    if (device == INVALID_HANDLE_VALUE) return 0;
-    result = query_device(device, info);
+    if (device == INVALID_HANDLE_VALUE) {
+        error = GetLastError(); CloseHandle(event); SetLastError(error); return 0;
+    }
+    result = query_device(device, event, info);
     error = GetLastError();
     CloseHandle(device);
+    CloseHandle(event);
     if (!result) SetLastError(error);
     return result;
 }
 
 int chmlink_query(chmlink_adapter *adapter, chmlink_adapter_info *info)
 {
+    HANDLE event;
     int result;
-    if (!enter(adapter)) return 0;
-    result = query_device(adapter->device, info);
-    return leave(adapter, result);
+    if (!enter(adapter, &event)) return 0;
+    result = query_device(adapter->device, event, info);
+    return leave(adapter, event, result);
 }
 
 chmlink_adapter *chmlink_open(uint32_t index)
 {
-    HANDLE device;
+    HANDLE device, event;
     chmlink_adapter *adapter;
     chmlink_adapter_info info;
+    DWORD error;
+    event = new_request_event();
+    if (event == NULL) return NULL;
     device = open_device(index, GENERIC_READ | GENERIC_WRITE);
-    if (device == INVALID_HANDLE_VALUE) return NULL;
-    if (!query_device(device, &info)) {
-        DWORD error = GetLastError();
-        CloseHandle(device);
-        SetLastError(error);
+    if (device == INVALID_HANDLE_VALUE) {
+        error = GetLastError(); CloseHandle(event); SetLastError(error); return NULL;
+    }
+    if (!query_device(device, event, &info)) {
+        error = GetLastError(); CloseHandle(device); CloseHandle(event); SetLastError(error);
         return NULL;
     }
     if (info.interface_index != index) {
-        CloseHandle(device);
+        CloseHandle(device); CloseHandle(event);
         SetLastError(ERROR_NOT_FOUND);
         return NULL;
     }
     adapter = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*adapter));
     if (adapter == NULL) {
-        CloseHandle(device);
+        CloseHandle(device); CloseHandle(event);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+    /* The first cached event; chmlink_close frees it from here on. */
+    adapter->events[adapter->cached++] = event;
     adapter->device = device;
     adapter->packet_limit = info.packet_limit;
     adapter->mode = (chmlink_mode)info.mode;
@@ -237,7 +239,7 @@ chmlink_adapter *chmlink_open(uint32_t index)
         DWORD received;
         unsigned int i;
         for (i = 0; i < 8; ++i) bytes[i] = (uint8_t)(handle >> (i * 8));
-        if (!device_ioctl(device, CHMLINK_IOCTL_REGISTER_READ_EVENT, bytes,
+        if (!device_ioctl(device, event, CHMLINK_IOCTL_REGISTER_READ_EVENT, bytes,
                           sizeof(bytes), NULL, 0, &received)) {
             DWORD error = GetLastError(); chmlink_close(adapter); SetLastError(error); return NULL;
         }
@@ -314,19 +316,27 @@ int chmlink_enumerate(chmlink_enum_callback callback, void *context)
 void chmlink_close(chmlink_adapter *adapter)
 {
     if (adapter != NULL) {
+        ULONG i;
         AcquireSRWLockExclusive(&adapter->gate);
         adapter->closing = TRUE;
         if (adapter->close_event) SetEvent(adapter->close_event);
-        ReleaseSRWLockExclusive(&adapter->gate);
-        /* The current driver completes every request without pending it, but
-         * cancel anything outstanding so close can never wait on the driver.
+        /* No new call is admitted now. Cancel what the calls in progress have
+         * outstanding, and keep cancelling until they have left: a call that
+         * was admitted but had not yet issued its request when one round of
+         * cancellation ran would otherwise be missed. The current driver
+         * completes every request without pending it, so this normally ends
+         * after one round; it guarantees that close never waits on the driver.
          * ERROR_NOT_FOUND (nothing outstanding) is the normal result. */
-        (void)CancelIoEx(adapter->device, NULL);
-        AcquireSRWLockExclusive(&adapter->gate);
-        while (adapter->active != 0)
-            SleepConditionVariableSRW(&adapter->drained, &adapter->gate, INFINITE, 0);
+        while (adapter->active != 0) {
+            ReleaseSRWLockExclusive(&adapter->gate);
+            (void)CancelIoEx(adapter->device, NULL);
+            AcquireSRWLockExclusive(&adapter->gate);
+            if (adapter->active != 0)
+                SleepConditionVariableSRW(&adapter->drained, &adapter->gate, 10, 0);
+        }
         ReleaseSRWLockExclusive(&adapter->gate);
         CloseHandle(adapter->device);
+        for (i = 0; i < adapter->cached; ++i) CloseHandle(adapter->events[i]);
         if (adapter->ready_event) CloseHandle(adapter->ready_event);
         if (adapter->cancel_event) CloseHandle(adapter->cancel_event);
         if (adapter->close_event) CloseHandle(adapter->close_event);
@@ -338,60 +348,66 @@ int chmlink_receive(chmlink_adapter *adapter, void *buffer, uint32_t capacity,
                     uint32_t *bytes_received)
 {
     DWORD received = 0;
+    HANDLE event;
     int result;
     if (bytes_received != NULL) *bytes_received = 0;
     if (adapter == NULL || buffer == NULL || bytes_received == NULL ||
         capacity < CHMLINK_BATCH_HEADER_SIZE || capacity > CHMLINK_BATCH_MAX_SIZE) {
         SetLastError(ERROR_INVALID_PARAMETER); return 0;
     }
-    if (!enter(adapter)) return 0;
-    result = device_ioctl(adapter->device, CHMLINK_IOCTL_RECEIVE, NULL, 0,
+    if (!enter(adapter, &event)) return 0;
+    result = device_ioctl(adapter->device, event, CHMLINK_IOCTL_RECEIVE, NULL, 0,
                           buffer, capacity, &received) != 0;
-    if (!result) return leave(adapter, 0);
+    if (!result) return leave(adapter, event, 0);
     if (chmlink_batch_validate(buffer, received, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
-        SetLastError(ERROR_INVALID_DATA); return leave(adapter, 0);
+        SetLastError(ERROR_INVALID_DATA); return leave(adapter, event, 0);
     }
     *bytes_received = received;
-    return leave(adapter, 1);
+    return leave(adapter, event, 1);
 }
 
 int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length)
 {
     DWORD received;
+    HANDLE event;
     int result;
-    if (!enter(adapter)) return 0;
+    if (!enter(adapter, &event)) return 0;
     if (chmlink_batch_validate(batch, length, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
-        SetLastError(ERROR_INVALID_PARAMETER); return leave(adapter, 0);
+        SetLastError(ERROR_INVALID_PARAMETER); return leave(adapter, event, 0);
     }
-    result = device_ioctl(adapter->device, CHMLINK_IOCTL_INJECT, batch,
+    result = device_ioctl(adapter->device, event, CHMLINK_IOCTL_INJECT, batch,
                           length, NULL, 0, &received) != 0;
-    return leave(adapter, result);
+    return leave(adapter, event, result);
 }
 
 int chmlink_cancel_wait(chmlink_adapter *a)
 {
-    if (!enter(a)) return 0;
+    if (a == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
     AcquireSRWLockExclusive(&a->gate);
+    if (a->closing) {
+        ReleaseSRWLockExclusive(&a->gate);
+        SetLastError(ERROR_OPERATION_ABORTED); return 0;
+    }
     if (a->waiting) SetEvent(a->cancel_event);
     ReleaseSRWLockExclusive(&a->gate);
-    return leave(a, 1);
+    return 1;
 }
 
 int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
 {
-    HANDLE events[3];
+    HANDLE events[3], request;
     ULONGLONG started = GetTickCount64();
     int result = 0;
     DWORD error = ERROR_SUCCESS;
-    if (!enter(a)) return 0;
+    if (!enter(a, &request)) return 0;
     if (!(a->capabilities & CHMLINK_CAP_WAIT)) {
-        SetLastError(ERROR_NOT_SUPPORTED); return leave(a, 0);
+        SetLastError(ERROR_NOT_SUPPORTED); return leave(a, request, 0);
     }
     AcquireSRWLockExclusive(&a->gate);
     if (a->closing || a->waiting) {
         error = a->closing ? ERROR_OPERATION_ABORTED : ERROR_BUSY;
         ReleaseSRWLockExclusive(&a->gate);
-        SetLastError(error); return leave(a, 0);
+        SetLastError(error); return leave(a, request, 0);
     }
     a->waiting = TRUE;
     ResetEvent(a->cancel_event);
@@ -405,7 +421,7 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
             WaitForSingleObject(events[1], 0) == WAIT_OBJECT_0) {
             error = ERROR_OPERATION_ABORTED; break;
         }
-        if (!query_device(a->device, &info)) { error = GetLastError(); break; }
+        if (!query_device(a->device, request, &info)) { error = GetLastError(); break; }
         if (info.state & CHMLINK_STATE_REMOVING) { error = ERROR_DEVICE_NOT_CONNECTED; break; }
         if (!(info.state & CHMLINK_STATE_RUNNING)) { error = ERROR_NOT_READY; break; }
         if (!(info.state & CHMLINK_STATE_SESSION)) { error = ERROR_OPERATION_ABORTED; break; }
@@ -426,5 +442,5 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
     a->waiting = FALSE;
     ReleaseSRWLockExclusive(&a->gate);
     if (!result) SetLastError(error);
-    return leave(a, result);
+    return leave(a, request, result);
 }
