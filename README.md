@@ -43,6 +43,32 @@ For fuzz testing, build `tests/fuzz_batch.c`, `src/protocol/batch.c`, and
 `src/packet/packet.c` with Clang using `-Iinclude` and
 `-fsanitize=fuzzer,address,undefined`.
 
+For Windows lifecycle checks, build `chmlink-lifecycle-test` and run the following
+from an elevated PowerShell in a disposable test VM with an installed driver
+and the identical signed package:
+
+```powershell
+.\tools\test-lifecycle.ps1 -InfPath C:\packages\signed\chmlink.inf `
+    -BuildDirectory .\build\verify\Release -OutputDirectory .\build\lifecycle-run-001
+```
+
+This opt-in runner creates two owned temporary adapters, assigns active-store
+test addresses `169.254.250.1/24` and `169.254.251.1/24`, then removes the adapters
+in cleanup. It refuses addresses already assigned locally. It exercises wait
+timeout/cancel/close races, concurrent waiter rejection, abrupt child-process
+termination, repeated GUID opens, queue saturation and recovery, 1000 uniquely
+numbered UDP packets, adapter isolation, and waits during disable/removal.
+Normal configuration traffic is drained before timing checks; readiness may
+legally win a cancellation race. Process deadlines and per-stage stdout/stderr
+logs distinguish hangs from assertion failures. The mutating suite is not
+registered with CTest. A test failure does not establish a driver defect without
+examining its logs and environment.
+
+On Windows 11 build 26200 x64, initial runs of this suite and the ARP roundtrip
+also passed with standard Driver Verifier enabled for `chmlink.sys`. Broader
+NDIS/WLAN verification, prolonged stress, power transitions, fault injection and
+minimum-version runtime coverage remain outstanding.
+
 ## Windows prototype
 
 The current SDK requires device interface version 2. It rejects older drivers
