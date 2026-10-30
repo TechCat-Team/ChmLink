@@ -72,7 +72,8 @@ foreach ($package in @('microsoft.windows.wdk.x64', 'microsoft.windows.sdk.cpp')
 $wdk = "$KitRoot/microsoft.windows.wdk.x64/c"
 $sdk = "$KitRoot/microsoft.windows.sdk.cpp/c"
 $sources = @('driver/entry.c', 'driver/adapter.c', 'driver/config.c', 'driver/oid.c', 'driver/control.c',
-             'src/packet/packet.c', 'src/protocol/batch.c', 'src/protocol/query.c')
+             'src/packet/packet.c', 'src/protocol/batch.c', 'src/protocol/query.c',
+             'src/queue/ring.c')
 $objects = @()
 $compileFailed = $false
 foreach ($source in $sources) {
@@ -83,7 +84,7 @@ foreach ($source in $sources) {
         Invoke-Checked 'cl.exe' @('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/W4', '/WX',
         '/wd4201', '/wd4324', '/wd4996', '/D_AMD64_', '/DNDIS660_MINIPORT=1',
         '/D_WIN32_WINNT=0x0A00', '/DNTDDI_VERSION=0x0A000002',
-        "/I$repo/include", "/I$repo/driver", "/I$wdk/Include/$kitVersion/km",
+        "/I$repo/include", "/I$repo/driver", "/I$repo/src/queue", "/I$wdk/Include/$kitVersion/km",
         "/I$sdk/Include/$kitVersion/shared", "/I$sdk/Include/$kitVersion/ucrt",
             "/Fo$object", "$repo/$source")
     } catch {

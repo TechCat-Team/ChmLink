@@ -3,7 +3,7 @@
 void ClUpdateReadEventLocked(CL_ADAPTER *a)
 {
     if (a->ReadEvent != NULL) {
-        if (a->Count != 0 || a->State != ClAdapterRunning || a->SessionState != ClSessionOpen)
+        if (a->Queue.count != 0 || a->State != ClAdapterRunning || a->SessionState != ClSessionOpen)
             KeSetEvent(a->ReadEvent, IO_NO_INCREMENT, FALSE);
         else KeClearEvent(a->ReadEvent);
     }
@@ -25,7 +25,7 @@ void ClRelease(CL_ADAPTER *a)
 {
     if (InterlockedDecrement(&a->References) == 0) {
         NT_ASSERT(a->ReadEvent == NULL);
-        if (a->Queue != NULL) ExFreePoolWithTag(a->Queue, CL_TAG);
+        if (a->QueueStorage != NULL) ExFreePoolWithTag(a->QueueStorage, CL_TAG);
         ExFreePoolWithTag(a, CL_TAG);
     }
 }
@@ -82,9 +82,11 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     KeInitializeSpinLock(&a->Lock);
     KeInitializeMutex(&a->ControlMutex, 0);
     ExInitializeRundownProtection(&a->IoRundown);
-    a->Queue = ExAllocatePoolWithTag(NonPagedPoolNx,
-        sizeof(CL_PACKET) * CHMLINK_QUEUE_PACKETS, CL_TAG);
-    if (a->Queue == NULL) { ClRelease(a); return NDIS_STATUS_RESOURCES; }
+    a->QueueStorage = ExAllocatePoolWithTag(NonPagedPoolNx, CHMLINK_QUEUE_BYTES, CL_TAG);
+    if (a->QueueStorage == NULL ||
+        !chmlink_ring_init(&a->Queue, a->QueueStorage, CHMLINK_QUEUE_BYTES, CHMLINK_QUEUE_PACKETS)) {
+        ClRelease(a); return NDIS_STATUS_RESOURCES;
+    }
     status = ClReadConfiguration(handle, a->Configuration);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
     a->Mode = (chmlink_mode)chmlink_config_mode(a->Configuration);
@@ -181,8 +183,7 @@ NDIS_STATUS ClPause(NDIS_HANDLE context, PNDIS_MINIPORT_PAUSE_PARAMETERS paramet
     UNREFERENCED_PARAMETER(parameters);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->State = ClAdapterPausing;
-    a->TxQueueDrops += a->Count;
-    a->Count = a->Head = 0;
+    a->TxQueueDrops += chmlink_ring_clear(&a->Queue);
     ClUpdateReadEventLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     ExWaitForRundownProtectionRelease(&a->IoRundown);
@@ -226,8 +227,7 @@ void ClHalt(NDIS_HANDLE context, NDIS_HALT_ACTION action)
     KeReleaseSpinLock(&ClAdaptersLock, irql);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->State = ClAdapterRemoving;
-    a->TxQueueDrops += a->Count;
-    a->Count = a->Head = 0;
+    a->TxQueueDrops += chmlink_ring_clear(&a->Queue);
     ClUpdateReadEventLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     ExWaitForRundownProtectionRelease(&a->IoRundown);
@@ -247,6 +247,7 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
     UNREFERENCED_PARAMETER(port);
     for (nbl = lists; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
         PNET_BUFFER nb;
+        chmlink_ring_txn txn;
         ULONG added = 0;
         ULONG64 bytes = 0;
         BOOLEAN queue_full = FALSE;
@@ -254,32 +255,33 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
         KeAcquireSpinLock(&a->Lock, &irql);
         if (!acquired || a->State != ClAdapterRunning) status = NDIS_STATUS_PAUSED;
         else if (a->SessionState != ClSessionOpen) status = NDIS_STATUS_MEDIA_DISCONNECTED;
+        /* All packets of one NBL are staged and published together. */
+        chmlink_ring_begin(&a->Queue, &txn);
         for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL && status == NDIS_STATUS_SUCCESS;
              nb = NET_BUFFER_NEXT_NB(nb)) {
             ULONG length = NET_BUFFER_DATA_LENGTH(nb);
-            CL_PACKET *packet;
+            UCHAR *slot;
             PVOID source;
             if (length < ClPacketMinimum(a) || length > ClPacketLimit(a)) {
                 status = NDIS_STATUS_INVALID_LENGTH; break;
             }
-            if (a->Count + added >= CHMLINK_QUEUE_PACKETS) {
+            slot = chmlink_ring_reserve(&a->Queue, &txn, length);
+            if (slot == NULL) {
                 queue_full = TRUE;
                 status = NDIS_STATUS_RESOURCES; break;
             }
-            packet = &a->Queue[(a->Head + a->Count + added) % CHMLINK_QUEUE_PACKETS];
-            source = NdisGetDataBuffer(nb, length, packet->Bytes, 1, 0);
+            source = NdisGetDataBuffer(nb, length, slot, 1, 0);
             if (source == NULL) { status = NDIS_STATUS_RESOURCES; break; }
-            if (source != packet->Bytes) NdisMoveMemory(packet->Bytes, source, length);
+            if (source != slot) NdisMoveMemory(slot, source, length);
             if (a->Mode == CHMLINK_MODE_IP &&
-                !chmlink_ip_packet_valid(packet->Bytes, length, CHMLINK_IP_LIMIT)) {
+                !chmlink_ip_packet_valid(slot, length, CHMLINK_IP_LIMIT)) {
                 status = NDIS_STATUS_INVALID_DATA; break;
             }
-            packet->Length = length;
             added++;
             bytes += length;
         }
         if (status == NDIS_STATUS_SUCCESS) {
-            a->Count += added;
+            chmlink_ring_commit(&a->Queue, &txn);
             a->TxPackets += added;
             a->TxBytes += bytes;
         } else {

@@ -8,7 +8,12 @@
 #define CHMLINK_ETHERNET_LIMIT 1522u
 #define CHMLINK_IP_MTU 1500u
 #define CHMLINK_IP_LIMIT CHMLINK_IP_MTU
-#define CHMLINK_QUEUE_PACKETS 256u
+/* Per-adapter transmit queue (Windows -> user mode): a byte ring of
+ * CHMLINK_QUEUE_BYTES holding at most CHMLINK_QUEUE_PACKETS packets. Small
+ * packets are bounded by the count, large ones by the bytes (about 2900
+ * full-size Ethernet frames). QUERY reports the packet bound as capacity. */
+#define CHMLINK_QUEUE_PACKETS 16384u
+#define CHMLINK_QUEUE_BYTES (4u * 1024u * 1024u)
 #define CHMLINK_IOCTL_RECEIVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA)
 #define CHMLINK_IOCTL_INJECT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define CHMLINK_IOCTL_QUERY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA)

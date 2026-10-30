@@ -6,6 +6,11 @@ target_include_directories(chmlink_packet PUBLIC include)
 target_compile_features(chmlink_packet PUBLIC c_std_99)
 
 add_library(chmlink_protocol STATIC src/protocol/batch.c src/protocol/query.c)
+
+# Driver-internal transmit ring, built here only for its portable tests.
+add_library(chmlink_queue STATIC src/queue/ring.c)
+target_include_directories(chmlink_queue PUBLIC src/queue)
+target_compile_features(chmlink_queue PUBLIC c_std_99)
 target_link_libraries(chmlink_protocol PUBLIC chmlink_packet)
 target_compile_features(chmlink_protocol PUBLIC c_std_99)
 
@@ -57,6 +62,9 @@ if(BUILD_TESTING)
     add_executable(query_test tests/query_test.c)
     target_link_libraries(query_test PRIVATE chmlink_protocol)
     add_test(NAME query_test COMMAND query_test)
+    add_executable(ring_test tests/ring_test.c)
+    target_link_libraries(ring_test PRIVATE chmlink_queue)
+    add_test(NAME ring_test COMMAND ring_test)
     add_executable(version_test tests/version_test.c)
     target_include_directories(version_test PRIVATE include)
     add_test(NAME version_test COMMAND version_test ${CMAKE_CURRENT_SOURCE_DIR}/driver/chmlink.inf)

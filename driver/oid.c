@@ -54,7 +54,7 @@ static NDIS_STATUS query(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
     case OID_GEN_TRANSMIT_BLOCK_SIZE: value = ClPacketLimit(a); break;
     case OID_GEN_RECEIVE_BUFFER_SPACE:
     case OID_GEN_TRANSMIT_BUFFER_SPACE:
-        value = ClPacketLimit(a) * CHMLINK_QUEUE_PACKETS; break;
+        value = CHMLINK_QUEUE_BYTES; break;
     case OID_GEN_VENDOR_DESCRIPTION: source = "ChmLink"; size = 8; break;
     case OID_GEN_VENDOR_DRIVER_VERSION: value = CHMLINK_VENDOR_DRIVER_VERSION; break;
     case OID_GEN_VENDOR_ID: value = 0xffffff; break;
