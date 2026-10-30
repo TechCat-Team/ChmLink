@@ -3,7 +3,9 @@
 param(
     [Parameter(Mandatory)][string]$InfPath,
     [string]$BuildDirectory,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    # Seconds of IOCTL fuzzing on a running adapter, and again on one that is disabled and enabled meanwhile.
+    [int]$FuzzSeconds = 20
 )
 # Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path $PSScriptRoot '../build/verify/Release' }
@@ -32,25 +34,25 @@ function Get-TestAdapter($Device) {
     if ($adapter.Count -ne 1) { throw 'Cannot resolve test interface.' }
     return $adapter[0]
 }
-function Start-Test([string[]]$Arguments) {
+function Start-Test([string[]]$Arguments, [string]$Program = $test) {
     $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = $test; $start.Arguments = $Arguments -join ' '
+    $start.FileName = $Program; $start.Arguments = $Arguments -join ' '
     $start.UseShellExecute = $false; $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
     $child = [Diagnostics.Process]::new(); $child.StartInfo = $start
     if (!$child.Start()) { $child.Dispose(); throw 'Cannot start test process.' }
     return $child
 }
-function Wait-Test($Process, [string]$Label) {
-    $completed = $Process.WaitForExit(120000)
+function Wait-Test($Process, [string]$Label, [int]$Seconds = 120) {
+    $completed = $Process.WaitForExit($Seconds * 1000)
     if (!$completed) {
         $Process.Kill()
         if (!$Process.WaitForExit(10000)) { throw 'Test process did not terminate; inspect the VM.' }
     }
     $Process.StandardOutput.ReadToEnd() | Set-Content (Join-Path $output.FullName "$Label.out")
     $Process.StandardError.ReadToEnd() | Set-Content (Join-Path $output.FullName "$Label.err")
-    if (!$completed) { throw 'Lifecycle test exceeded its deadline.' }
-    if ($Process.ExitCode -ne 0) { throw "Lifecycle test exited $($Process.ExitCode); inspect its logs." }
+    if (!$completed) { throw "Test '$Label' exceeded its deadline." }
+    if ($Process.ExitCode -ne 0) { throw "Test '$Label' exited $($Process.ExitCode); inspect $Label.err." }
 }
 try {
     if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -59,6 +61,8 @@ try {
     $tool = Join-Path $BuildDirectory 'chmlink-device.exe'
     $test = Join-Path $BuildDirectory 'chmlink-lifecycle-test.exe'
     if (!(Test-Path -LiteralPath $test)) { throw 'Build chmlink-lifecycle-test first.' }
+    $fuzz = Join-Path $BuildDirectory 'chmlink-ioctl-fuzz.exe'
+    if ($FuzzSeconds -gt 0 -and !(Test-Path -LiteralPath $fuzz)) { throw 'Build chmlink-ioctl-fuzz first.' }
     if (Test-Path -LiteralPath $OutputDirectory) { throw 'Use a fresh output directory.' }
     $output = New-Item -ItemType Directory -Path $OutputDirectory
     $InfPath = (Resolve-Path -LiteralPath $InfPath).Path
@@ -80,6 +84,23 @@ try {
     New-NetIPAddress -InterfaceIndex $second.ifIndex -IPAddress '169.254.251.1' -PrefixLength 24 -PolicyStore ActiveStore | Out-Null
     $process = Start-Test @($first.ifIndex, $second.ifIndex)
     Wait-Test $process 'basic'; $process.Dispose(); $process = $null
+    if ($FuzzSeconds -gt 0) {
+        # Strict: every result must match the contract, and the adapter must keep working.
+        $process = Start-Test @($second.ifIndex, $FuzzSeconds) $fuzz
+        Wait-Test $process 'fuzz' ($FuzzSeconds + 120); $process.Dispose(); $process = $null
+        # Tolerant: the adapter pauses and halts under the requests; nothing invalid may succeed.
+        $first = Get-TestAdapter $devices[0]
+        $process = Start-Test @($first.ifIndex, $FuzzSeconds, '--tolerant') $fuzz
+        $cycleEnd = (Get-Date).AddSeconds([math]::Max(3, $FuzzSeconds - 3))
+        while ((Get-Date) -lt $cycleEnd -and !$process.HasExited) {
+            Start-Sleep -Milliseconds 700
+            Disable-NetAdapter -InputObject $first -Confirm:$false
+            Start-Sleep -Milliseconds 300
+            Enable-NetAdapter -InputObject $first -Confirm:$false
+            $first = Get-TestAdapter $devices[0]
+        }
+        Wait-Test $process 'fuzz-churn' ($FuzzSeconds + 120); $process.Dispose(); $process = $null
+    }
     foreach ($transition in @('disable', 'remove')) {
         $eventName = 'Local\ChmLinkTransition-' + [guid]::NewGuid().ToString('N')
         $ready = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $eventName)
