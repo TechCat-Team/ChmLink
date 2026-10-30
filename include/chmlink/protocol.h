@@ -26,7 +26,8 @@ typedef enum chmlink_result {
     CHMLINK_MODE_MISMATCH,
     CHMLINK_INVALID_BATCH,
     CHMLINK_INVALID_PACKET,
-    CHMLINK_BUFFER_TOO_SMALL
+    CHMLINK_BUFFER_TOO_SMALL,
+    CHMLINK_INVALID_QUERY
 } chmlink_result;
 
 typedef struct chmlink_batch_writer {

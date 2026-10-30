@@ -147,17 +147,6 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
     return status;
 }
 
-static void put32(UCHAR *p, ULONG value)
-{
-    p[0] = (UCHAR)value; p[1] = (UCHAR)(value >> 8);
-    p[2] = (UCHAR)(value >> 16); p[3] = (UCHAR)(value >> 24);
-}
-
-static void put64(UCHAR *p, ULONG64 value)
-{
-    put32(p, (ULONG)value); put32(p + 4, (ULONG)(value >> 32));
-}
-
 static NTSTATUS register_read_event(CL_ADAPTER *a, PIRP irp, ULONG size)
 {
     ULONG64 value = 0;
@@ -183,32 +172,48 @@ static NTSTATUS register_read_event(CL_ADAPTER *a, PIRP irp, ULONG size)
     return status;
 }
 
+static ULONG ClStateFlagsLocked(const CL_ADAPTER *a)
+{
+    ULONG state = 0;
+    switch (a->State) {
+    case ClAdapterRunning: state = CHMLINK_STATE_RUNNING; break;
+    case ClAdapterPaused: state = CHMLINK_STATE_PAUSED; break;
+    case ClAdapterPausing: state = CHMLINK_STATE_PAUSING; break;
+    case ClAdapterRemoving: state = CHMLINK_STATE_REMOVING; break;
+    default: break;
+    }
+    if (a->SessionState == ClSessionOpen) state |= CHMLINK_STATE_SESSION;
+    return state;
+}
+
 static NTSTATUS query(CL_ADAPTER *a, PIRP irp, ULONG size)
 {
-    UCHAR *p = irp->AssociatedIrp.SystemBuffer;
+    chmlink_query_info info;
     KIRQL irql;
     if (size < CHMLINK_INFO_SIZE) return STATUS_BUFFER_TOO_SMALL;
-    NdisZeroMemory(p, CHMLINK_INFO_SIZE);
-    put32(p, CHMLINK_DEVICE_VERSION); put32(p + 4, CHMLINK_INFO_SIZE);
-    put32(p + 8, (a->Mode == CHMLINK_MODE_IP ? CHMLINK_CAP_IP : CHMLINK_CAP_ETHERNET) |
-          CHMLINK_CAP_BATCH | CHMLINK_CAP_STATISTICS | CHMLINK_CAP_WAIT);
-    put32(p + 16, (ULONG)a->Mode);
-    put32(p + 20, a->InterfaceIndex); put32(p + 24, CHMLINK_ETHERNET_MTU);
-    put32(p + 28, a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT); put32(p + 32, CHMLINK_QUEUE_PACKETS);
-    if (a->Mode != CHMLINK_MODE_IP) NdisMoveMemory(p + 48, a->Mac, sizeof(a->Mac));
-    put64(p + 56, a->Luid.Value);
+    NdisZeroMemory(&info, sizeof(info));
+    info.capabilities = (a->Mode == CHMLINK_MODE_IP ? CHMLINK_CAP_IP : CHMLINK_CAP_ETHERNET) |
+        CHMLINK_CAP_BATCH | CHMLINK_CAP_STATISTICS | CHMLINK_CAP_WAIT;
+    info.mode = (uint32_t)a->Mode;
+    info.interface_index = a->InterfaceIndex;
+    info.mtu = CHMLINK_ETHERNET_MTU;
+    info.packet_limit = a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT;
+    info.queue_capacity = CHMLINK_QUEUE_PACKETS;
+    if (a->Mode != CHMLINK_MODE_IP) NdisMoveMemory(info.mac, a->Mac, sizeof(info.mac));
+    info.luid = a->Luid.Value;
     KeAcquireSpinLock(&a->Lock, &irql);
-    put32(p + 12, (a->State == ClAdapterRunning ? CHMLINK_STATE_RUNNING : 0) |
-        (a->State == ClAdapterPaused ? CHMLINK_STATE_PAUSED : 0) |
-        (a->State == ClAdapterPausing ? CHMLINK_STATE_PAUSING : 0) |
-        (a->State == ClAdapterRemoving ? CHMLINK_STATE_REMOVING : 0) |
-        (a->SessionState == ClSessionOpen ? CHMLINK_STATE_SESSION : 0));
-    put32(p + 36, a->Count); put32(p + 40, a->PacketFilter);
-    put64(p + 72, a->TxPackets); put64(p + 80, a->TxBytes);
-    put64(p + 88, a->TxErrors); put64(p + 96, a->RxPackets);
-    put64(p + 104, a->RxBytes); put64(p + 112, a->RxDiscards);
-    put64(p + 120, a->TxQueueDrops);
+    info.state = ClStateFlagsLocked(a);
+    info.queued_packets = a->Count;
+    info.packet_filter = a->PacketFilter;
+    info.tx_packets = a->TxPackets;
+    info.tx_bytes = a->TxBytes;
+    info.tx_errors = a->TxErrors;
+    info.rx_packets = a->RxPackets;
+    info.rx_bytes = a->RxBytes;
+    info.rx_discards = a->RxDiscards;
+    info.tx_queue_drops = a->TxQueueDrops;
     KeReleaseSpinLock(&a->Lock, irql);
+    chmlink_query_encode(irp->AssociatedIrp.SystemBuffer, &info);
     irp->IoStatus.Information = CHMLINK_INFO_SIZE;
     return STATUS_SUCCESS;
 }

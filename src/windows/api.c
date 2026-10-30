@@ -7,6 +7,7 @@
 #include "chmlink/api.h"
 #include "chmlink/device.h"
 #include "chmlink/protocol.h"
+#include "chmlink/query.h"
 
 struct chmlink_adapter {
     HANDLE device;
@@ -53,21 +54,12 @@ static HANDLE open_device(uint32_t index, DWORD access)
                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 }
 
-static uint32_t get32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static uint64_t get64(const uint8_t *p)
-{
-    return (uint64_t)get32(p) | ((uint64_t)get32(p + 4) << 32);
-}
-
 static int query_device(HANDLE device, chmlink_adapter_info *info)
 {
     uint8_t bytes[CHMLINK_INFO_SIZE];
+    chmlink_query_info wire;
     chmlink_adapter_info next;
+    chmlink_result decoded;
     DWORD received, error;
     NET_LUID luid;
     GUID guid;
@@ -81,43 +73,30 @@ static int query_device(HANDLE device, chmlink_adapter_info *info)
                      ERROR_REVISION_MISMATCH : error);
         return 0;
     }
-    if (received != sizeof(bytes) || get32(bytes) != CHMLINK_DEVICE_VERSION ||
-        get32(bytes + 4) != sizeof(bytes)) {
-        SetLastError(ERROR_REVISION_MISMATCH); return 0;
+    decoded = chmlink_query_decode(&wire, bytes, received);
+    if (decoded != CHMLINK_OK) {
+        SetLastError(decoded == CHMLINK_UNSUPPORTED_VERSION ?
+                     ERROR_REVISION_MISMATCH : ERROR_INVALID_DATA);
+        return 0;
     }
-    if ((get32(bytes + 8) & CHMLINK_CAP_BATCH) == 0 ||
-        (get32(bytes + 16) == CHMLINK_MODE_ETHERNET ?
-            (!(get32(bytes + 8) & CHMLINK_CAP_ETHERNET) || (get32(bytes + 8) & CHMLINK_CAP_IP) ||
-             get32(bytes + 28) < 14 ||
-             get32(bytes + 24) > get32(bytes + 28) - 14) :
-         get32(bytes + 16) == CHMLINK_MODE_IP ?
-            (!(get32(bytes + 8) & CHMLINK_CAP_IP) || (get32(bytes + 8) & CHMLINK_CAP_ETHERNET) ||
-             get32(bytes + 28) < 1280 || get32(bytes + 24) < 1280 ||
-             bytes[48] || bytes[49] || bytes[50] || bytes[51] || bytes[52] || bytes[53] ||
-             get32(bytes + 24) != get32(bytes + 28)) : 1) ||
-        get32(bytes + 28) > CHMLINK_PACKET_MAX_SIZE || get32(bytes + 24) == 0 ||
-        get32(bytes + 32) == 0 ||
-        get32(bytes + 36) > get32(bytes + 32)) {
-        SetLastError(ERROR_INVALID_DATA); return 0;
-    }
-    error = ConvertInterfaceIndexToLuid(get32(bytes + 20), &luid);
+    error = ConvertInterfaceIndexToLuid(wire.interface_index, &luid);
     if (error != NO_ERROR) { SetLastError(error); return 0; }
-    if (luid.Value != get64(bytes + 56)) { SetLastError(ERROR_NOT_FOUND); return 0; }
+    if (luid.Value != wire.luid) { SetLastError(ERROR_NOT_FOUND); return 0; }
     error = ConvertInterfaceLuidToGuid(&luid, &guid);
     if (error != NO_ERROR) { SetLastError(error); return 0; }
     if (StringFromGUID2(&guid, id, 39) != 39) { SetLastError(ERROR_INVALID_DATA); return 0; }
     memset(&next, 0, sizeof(next));
-    next.version = get32(bytes); next.capabilities = get32(bytes + 8);
-    next.state = get32(bytes + 12); next.mode = get32(bytes + 16);
-    next.interface_index = get32(bytes + 20); next.mtu = get32(bytes + 24);
-    next.packet_limit = get32(bytes + 28); next.queue_capacity = get32(bytes + 32);
-    next.queued_packets = get32(bytes + 36); next.packet_filter = get32(bytes + 40);
-    memcpy(next.mac, bytes + 48, sizeof(next.mac));
+    next.version = wire.version; next.capabilities = wire.capabilities;
+    next.state = wire.state; next.mode = wire.mode;
+    next.interface_index = wire.interface_index; next.mtu = wire.mtu;
+    next.packet_limit = wire.packet_limit; next.queue_capacity = wire.queue_capacity;
+    next.queued_packets = wire.queued_packets; next.packet_filter = wire.packet_filter;
+    memcpy(next.mac, wire.mac, sizeof(next.mac));
     for (i = 0; i < 39; ++i) next.interface_id[i] = (char)id[i];
-    next.tx_packets = get64(bytes + 72); next.tx_bytes = get64(bytes + 80);
-    next.tx_errors = get64(bytes + 88); next.rx_packets = get64(bytes + 96);
-    next.rx_bytes = get64(bytes + 104); next.rx_discards = get64(bytes + 112);
-    next.tx_queue_drops = get64(bytes + 120);
+    next.tx_packets = wire.tx_packets; next.tx_bytes = wire.tx_bytes;
+    next.tx_errors = wire.tx_errors; next.rx_packets = wire.rx_packets;
+    next.rx_bytes = wire.rx_bytes; next.rx_discards = wire.rx_discards;
+    next.tx_queue_drops = wire.tx_queue_drops;
     *info = next;
     return 1;
 }

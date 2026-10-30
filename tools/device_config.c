@@ -80,9 +80,9 @@ BOOL ClNewConfig(CL_DEVICE_CONFIG *config, const wchar_t *owner, const wchar_t *
     if (!valid_name(name)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     CopyMemory(config->Bytes, "CLCF", 4);
     config->Bytes[4] = CHMLINK_CONFIG_VERSION; config->Bytes[8] = CHMLINK_CONFIG_SIZE;
-    config->Bytes[12] = (BYTE)mode;
-    CopyMemory(config->Bytes + 16, &id, sizeof(id));
-    CopyMemory(config->Bytes + 32, &owner_id, sizeof(owner_id));
+    config->Bytes[CHMLINK_CONFIG_MODE] = (BYTE)mode;
+    CopyMemory(config->Bytes + CHMLINK_CONFIG_ADAPTER_ID, &id, sizeof(id));
+    CopyMemory(config->Bytes + CHMLINK_CONFIG_OWNER_ID, &owner_id, sizeof(owner_id));
     if (mac != NULL) {
         if (wcslen(mac) != 17) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
         for (i = 0; i < 6; ++i) {
@@ -97,13 +97,13 @@ BOOL ClNewConfig(CL_DEVICE_CONFIG *config, const wchar_t *owner, const wchar_t *
             if (i < 5 && ((mac[2] != L':' && mac[2] != L'-') || mac[i * 3 + 2] != mac[2])) {
                 SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
             }
-            config->Bytes[48 + i] = (BYTE)value;
+            config->Bytes[CHMLINK_CONFIG_MAC + i] = (BYTE)value;
         }
     } else if (mode == CHMLINK_CONFIG_MODE_ETHERNET) {
-        if (BCryptGenRandom(NULL, config->Bytes + 48, 6, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
+        if (BCryptGenRandom(NULL, config->Bytes + CHMLINK_CONFIG_MAC, CHMLINK_CONFIG_MAC_SIZE, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
             SetLastError(ERROR_GEN_FAILURE); return FALSE;
         }
-        config->Bytes[48] = (config->Bytes[48] & 0xfc) | 2;
+        config->Bytes[CHMLINK_CONFIG_MAC] = (config->Bytes[CHMLINK_CONFIG_MAC] & 0xfc) | 2;
     }
     if (!chmlink_config_valid(config->Bytes, sizeof(config->Bytes))) {
         SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
@@ -124,7 +124,7 @@ BOOL ClCheckUnique(const CL_DEVICE_CONFIG *config)
     for (i = 0; i < table->NumEntries; ++i) {
         MIB_IF_ROW2 *row = &table->Table[i];
         if (chmlink_config_mode(config->Bytes) == CHMLINK_CONFIG_MODE_ETHERNET &&
-            row->PhysicalAddressLength == 6 && memcmp(row->PhysicalAddress, config->Bytes + 48, 6) == 0) break;
+            row->PhysicalAddressLength == 6 && memcmp(row->PhysicalAddress, config->Bytes + CHMLINK_CONFIG_MAC, CHMLINK_CONFIG_MAC_SIZE) == 0) break;
         if (_wcsicmp(row->Alias, config->Name) == 0) break;
     }
     error = i == table->NumEntries ? ERROR_SUCCESS : ERROR_DUP_NAME;
@@ -139,10 +139,12 @@ BOOL ClCheckUnique(const CL_DEVICE_CONFIG *config)
             if (GetLastError() == ERROR_FILE_NOT_FOUND) continue;
             goto fail;
         }
-        if (memcmp(other.Bytes + 16, config->Bytes + 16, 16) == 0 ||
+        if (memcmp(other.Bytes + CHMLINK_CONFIG_ADAPTER_ID, config->Bytes + CHMLINK_CONFIG_ADAPTER_ID,
+                   CHMLINK_CONFIG_ID_SIZE) == 0 ||
             (chmlink_config_mode(other.Bytes) == CHMLINK_CONFIG_MODE_ETHERNET &&
              chmlink_config_mode(config->Bytes) == CHMLINK_CONFIG_MODE_ETHERNET &&
-             memcmp(other.Bytes + 48, config->Bytes + 48, 6) == 0) ||
+             memcmp(other.Bytes + CHMLINK_CONFIG_MAC, config->Bytes + CHMLINK_CONFIG_MAC,
+                    CHMLINK_CONFIG_MAC_SIZE) == 0) ||
             _wcsicmp(other.Name, config->Name) == 0) { SetLastError(ERROR_DUP_NAME); goto fail; }
     }
     error = GetLastError(); SetupDiDestroyDeviceInfoList(all);
@@ -177,7 +179,7 @@ BOOL ClCheckOwner(const CL_DEVICE_CONFIG *config, const wchar_t *owner)
 {
     GUID id;
     if (!parse_guid(owner, &id)) return FALSE;
-    if (memcmp(config->Bytes + 32, &id, 16) == 0) return TRUE;
+    if (memcmp(config->Bytes + CHMLINK_CONFIG_OWNER_ID, &id, CHMLINK_CONFIG_ID_SIZE) == 0) return TRUE;
     SetLastError(ERROR_ACCESS_DENIED); return FALSE;
 }
 
@@ -205,13 +207,15 @@ int ClShowConfig(const wchar_t *instance)
         wprintf(L"{\"Managed\":false,\"InstanceId\":"); json_string(instance); wprintf(L"}\n");
         SetupDiDestroyDeviceInfoList(set); return 0;
     }
-    CopyMemory(&id, config.Bytes + 16, 16); CopyMemory(&owner, config.Bytes + 32, 16);
+    CopyMemory(&id, config.Bytes + CHMLINK_CONFIG_ADAPTER_ID, CHMLINK_CONFIG_ID_SIZE);
+    CopyMemory(&owner, config.Bytes + CHMLINK_CONFIG_OWNER_ID, CHMLINK_CONFIG_ID_SIZE);
     StringFromGUID2(&id, id_text, 39); StringFromGUID2(&owner, owner_text, 39);
     wprintf(L"{\"Managed\":true,\"Version\":%u,\"Mode\":%u,\"AdapterId\":\"%ls\",\"OwnerId\":\"%ls\",\"Mac\":",
         (unsigned int)config.Bytes[4], chmlink_config_mode(config.Bytes), id_text, owner_text);
     if (chmlink_config_mode(config.Bytes) == CHMLINK_CONFIG_MODE_IP) wprintf(L"null");
-    else wprintf(L"\"%02X:%02X:%02X:%02X:%02X:%02X\"", config.Bytes[48], config.Bytes[49], config.Bytes[50],
-        config.Bytes[51], config.Bytes[52], config.Bytes[53]);
+    else wprintf(L"\"%02X:%02X:%02X:%02X:%02X:%02X\"", config.Bytes[CHMLINK_CONFIG_MAC], config.Bytes[CHMLINK_CONFIG_MAC + 1],
+        config.Bytes[CHMLINK_CONFIG_MAC + 2], config.Bytes[CHMLINK_CONFIG_MAC + 3],
+        config.Bytes[CHMLINK_CONFIG_MAC + 4], config.Bytes[CHMLINK_CONFIG_MAC + 5]);
     wprintf(L",\"Name\":");
     json_string(config.Name); wprintf(L",\"InstanceId\":"); json_string(instance); wprintf(L"}\n");
     SetupDiDestroyDeviceInfoList(set); return 0;

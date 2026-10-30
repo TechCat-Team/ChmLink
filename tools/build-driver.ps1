@@ -72,7 +72,7 @@ foreach ($package in @('microsoft.windows.wdk.x64', 'microsoft.windows.sdk.cpp')
 $wdk = "$KitRoot/microsoft.windows.wdk.x64/c"
 $sdk = "$KitRoot/microsoft.windows.sdk.cpp/c"
 $sources = @('driver/entry.c', 'driver/adapter.c', 'driver/config.c', 'driver/oid.c', 'driver/control.c',
-             'src/packet/packet.c', 'src/protocol/batch.c')
+             'src/packet/packet.c', 'src/protocol/batch.c', 'src/protocol/query.c')
 $objects = @()
 $compileFailed = $false
 foreach ($source in $sources) {
