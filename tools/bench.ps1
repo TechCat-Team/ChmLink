@@ -5,11 +5,13 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InfPath,
-    [string]$BuildDirectory = "$PSScriptRoot/../build/verify/Release",
+    [string]$BuildDirectory,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [double]$Seconds = 5,
     [string]$Filter = ''
 )
+# Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
+if (-not $BuildDirectory) { $BuildDirectory = Join-Path $PSScriptRoot '../build/verify/Release' }
 $ErrorActionPreference = 'Stop'
 $owner = [guid]'3F6B2D7E-91A4-4C58-B0E2-7A1D5C9E4B36'
 $local = '198.18.0.1'; $peer = '198.18.0.2'
@@ -52,7 +54,7 @@ try {
         DriverVersion = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName DEVPKEY_Device_DriverVersion).Data
         Verifier = ((verifier /querysettings 2>&1 | Select-Object -First 1) -join '')
         Started = (Get-Date).ToString('s')
-    } | ConvertTo-Json | Set-Content (Join-Path $output.FullName 'environment.json')
+    } | ConvertTo-Json | Set-Content (Join-Path $output.FullName 'environment.json') -Encoding UTF8
     Start-Sleep -Seconds 3   # let address registration and IPv6 neighbor chatter settle
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = $bench; $start.Arguments = "$index $local $peer $Seconds $Filter".Trim()
@@ -64,8 +66,8 @@ try {
     $deadline = [int](($Seconds * 20 + 60) * 1000)
     if (!$process.WaitForExit($deadline)) { $process.Kill(); throw 'Benchmark exceeded its deadline.' }
     $process.WaitForExit()
-    $stdout.Result | Set-Content (Join-Path $output.FullName 'bench.jsonl')
-    $stderr.Result | Set-Content (Join-Path $output.FullName 'bench.err')
+    $stdout.Result | Set-Content (Join-Path $output.FullName 'bench.jsonl') -Encoding UTF8
+    $stderr.Result | Set-Content (Join-Path $output.FullName 'bench.err') -Encoding UTF8
     if ($process.ExitCode -ne 0) { throw "Benchmark exited $($process.ExitCode); inspect bench.err." }
     'PASS benchmark complete'; $exitCode = 0
 } catch { Write-Warning $_.Exception.Message }

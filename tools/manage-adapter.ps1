@@ -10,8 +10,10 @@ param(
     [string]$Mac,
     [ValidateSet('ethernet', 'ip')][string]$Mode = 'ethernet',
     [guid]$OwnerId = '7C71F369-78C2-44F4-94CD-A2C14A29469B',
-    [string]$DeviceTool = "$PSScriptRoot/../build/Release/chmlink-device.exe"
+    [string]$DeviceTool
 )
+# Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
+if (-not $DeviceTool) { $DeviceTool = Join-Path $PSScriptRoot '../build/Release/chmlink-device.exe' }
 $ErrorActionPreference = 'Stop'
 $changed = $false; $locked = $false; $mutex = $null
 $nativeRestart = $false

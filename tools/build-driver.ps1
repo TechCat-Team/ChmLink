@@ -1,9 +1,12 @@
 [CmdletBinding()]
 param(
-    [string]$KitRoot = "$PSScriptRoot/../build/wdk",
-    [string]$Output = "$PSScriptRoot/../build/driver",
+    [string]$KitRoot,
+    [string]$Output,
     [switch]$Restore
 )
+# Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
+if (-not $KitRoot) { $KitRoot = Join-Path $PSScriptRoot '../build/wdk' }
+if (-not $Output) { $Output = Join-Path $PSScriptRoot '../build/driver' }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $repo = (Resolve-Path "$PSScriptRoot/..").Path

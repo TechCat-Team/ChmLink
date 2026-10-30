@@ -6,10 +6,12 @@ param(
     [string]$RecoveryDirectory,
     [string]$JournalPath,
     [string]$PublishedInf,
-    [string]$DeviceTool = "$PSScriptRoot/../build/Release/chmlink-device.exe",
+    [string]$DeviceTool,
     [switch]$MaintenanceWindow,
     [switch]$AllowDowngrade
 )
+# Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
+if (-not $DeviceTool) { $DeviceTool = Join-Path $PSScriptRoot '../build/Release/chmlink-device.exe' }
 $ErrorActionPreference = 'Stop'
 
 # Exit codes: 0 completed, 1 failed before device changes, 2 upgrade failed but
