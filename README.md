@@ -10,10 +10,11 @@ device provisioning utility. IP mode, Rust device I/O, production signing,
 and runtime qualification have not been completed. It cannot replace TAP or
 Wintun in production yet.
 
-An experimental raw-IP path now includes a separate device ID, NDIS attributes,
-packet queues, injection and SDK mode negotiation. This code has not yet been
-built or validated on Windows. IP protocol binding and packet behavior remain
-unproven; do not use this experimental package outside a disposable test VM.
+An experimental raw-IP path includes a separate device ID, NDIS attributes,
+packet queues, injection and SDK mode negotiation. Initial x64 builds and
+IPv4/IPv6 UDP roundtrips passed in a Windows 11 build 26200 test VM, including
+an Ethernet isolation check and a run with standard Driver Verifier. Broader
+qualification remains incomplete; use a disposable test VM.
 
 The compatibility target is Windows 10 version 1607 (build 14393) /
 Windows Server 2016 and later. These are development targets, not verified
@@ -23,19 +24,34 @@ support. The planned NDIS baseline is 6.60.
 
 - `include/chmlink/` — shared C interfaces.
 - `src/packet/` — packet validation, independent of Windows APIs.
-- `src/protocol/` — experimental batch framing and validation.
-- `driver/` — NDIS 6.60 Ethernet miniport and INF package.
+- `src/protocol/` — experimental batch framing, validation and the device query encoding.
+- `src/queue/` — the driver's transmit ring, portable so it can be tested off Windows.
+- `driver/` — NDIS 6.60 miniport (Ethernet and raw IP) and INF package.
 - `src/windows/` — user-mode C interface.
 - `examples/` — small programs using the C interface.
 - `tools/` — driver build, provisioning and package maintenance tools.
-- `tests/` — portable C tests.
+- `tools/ci/` — runtime CI for the Windows test VM; see [tools/ci/README.md](tools/ci/README.md).
+- `tests/` — portable C tests, Windows runtime tests and the benchmark.
 - `rust/chmlink/` — Rust types for the user-mode integration.
 
 ## Test
 
 Run `cmake -S . -B build`, `cmake --build build`, and
 `ctest --test-dir build --output-on-failure`. Run `cargo test --workspace` for
-the Rust crate.
+the Rust crate. `python3 -m unittest discover -s tools/ci` tests the CI scripts.
+
+Every push runs the portable tests on Linux and Windows, a fuzz pass, an x64
+driver build with `/W4 /WX`, and a rule that a changed driver needs a higher INF
+`DriverVer` (see Package maintenance). `tools/build-driver.ps1 -Analyze` adds a
+PREfast pass over the driver sources and fails on findings in them. The driver
+rule sets shipped with the WDK are not used: the analysis engine rejects them on
+the toolchain used here.
+
+Runtime tests need a disposable Windows VM. `tools/ci/vm-run.sh` builds a
+commit on the VM, signs it with the VM's test certificate, installs it over the
+baseline driver, runs the lifecycle and IP suites and optionally the benchmark,
+then restores the baseline. It works from a machine that can reach the VM; the
+VM does not need internet access.
 
 The protocol uses explicit little-endian fields and bounded batches. The
 receiver validates the complete batch before submitting packets. Driver code
@@ -72,7 +88,8 @@ examining its logs and environment.
 
 On Windows 11 build 26200 x64, initial runs of this suite and the ARP roundtrip
 passed with standard Driver Verifier enabled for the earlier 0.2.0.0 Ethernet
-driver. The current 0.3.0.0 development revision has not yet been tested. Broader
+driver. The 0.3.0.0 development revision also passed an initial Ethernet
+lifecycle run. Broader
 NDIS/WLAN verification, prolonged stress, power transitions, fault injection and
 minimum-version runtime coverage remain outstanding.
 
@@ -117,10 +134,16 @@ Store (DIRID 13). The build validates the complete INF with `/u` and applies
 
 The current adapter has an MTU of 1500 and accepts inline Ethernet frames up
 to 1522 bytes, including VLAN headers but excluding FCS. Offloads are not
-advertised. Each adapter has an independent 256-packet transmit queue and one
-exclusive administrator/SYSTEM session. Nonblocking receives on empty
-queues return `ERROR_NO_MORE_ITEMS`; callers can wait for readiness instead
-of polling. Packet injection honors the Windows
+advertised. Each adapter has an independent transmit queue (Windows to user
+mode) and one exclusive administrator/SYSTEM session. The queue is a 4 MiB byte
+ring holding at most 16384 packets: small packets are bounded by the count,
+full-size frames by the bytes (about 2700). A packet that does not fit is
+dropped and counted in `tx_queue_drops`. One `chmlink_receive` returns at most
+one batch, and the queue can hold more, so keep receiving until
+`ERROR_NO_MORE_ITEMS`; callers can wait for readiness instead of polling.
+The SDK issues its IOCTLs on an overlapped handle, so threads receiving and
+injecting on the same adapter do not serialize each other; each call still
+blocks until it completes. Packet injection honors the Windows
 packet filter and multicast list. Pausing drops queued frames and drains
 active I/O; removing the device invalidates existing sessions.
 
@@ -167,7 +190,7 @@ the intended creation command is:
 .\tools\manage-adapter.ps1 -Action Create -InfPath C:\packages\signed\chmlink.inf -Mode ip -Name 'ChmLink IP Test'
 ```
 
-Creation and binding have not yet been validated. With IPv4/IPv6 addresses and
+Initial creation and binding passed on Windows 11 build 26200 x64. With IPv4/IPv6 addresses and
 routes explicitly configured on the test adapter, `chmlink-ip-test <ifIndex>
 <local4> <peer4> <local6> <peer6>` is intended to exercise UDP in both
 directions using simulated peers. An optional final Ethernet interface index
@@ -180,7 +203,8 @@ an opt-in test runner for the disposable VM. It creates owned IP and Ethernet ad
 temporarily configures documentation-range IPv4/IPv6 addresses in ActiveStore,
 executes the two UDP roundtrips and an isolation check, then removes both. The addresses and
 peer routes must be isolated from the rest of the test VM. The runner and test
-are not automatically registered in CTest and have not yet been executed.
+are not automatically registered in CTest. Initial normal and standard Driver
+Verifier runs passed in the Windows 11 VM.
 
 Both modes share one service and package, so package upgrades affect all
 instances. Stop clients and use version 4 maintenance tooling for both modes.
@@ -191,7 +215,7 @@ rollback, minimum Windows versions, signing and Driver Verifier.
 
 ## Persistent adapter configuration
 
-Driver package 0.3.0.0 requires configuration version 2. Each device stores an
+Driver packages from 0.3.0.0 on require configuration version 2. Each device stores an
 immutable adapter GUID, owner GUID and mode in a 64-byte versioned registry
 value, together with its desired name. Ethernet also stores a locally
 administered unicast MAC; IP has no MAC address. The driver
@@ -244,13 +268,20 @@ It never removes a successfully created device to undo a naming failure.
 builds and VM checks have passed on Windows 11 build 26200 with PowerShell 5.1:
 legacy migration, invalid configuration rejection, ownership checks, naming
 retry, upgrades, rollback, ARP traffic and identity persistence across a reboot.
-Those results apply to the earlier 0.2.0.0 Ethernet package, not the new IP
-prototype or its changed configuration. The earlier driver also passed the
-build's INF and catalog checks. This is initial
+Those results apply to the earlier 0.2.0.0 Ethernet package. The 0.3.0.0
+prototype separately passed the x64 build, INF and catalog checks, initial
+dual-stack IP roundtrips and an Ethernet lifecycle run. This is initial
 coverage; minimum-version compatibility, Driver Verifier, stress, power and
 fault-injection qualification remain incomplete. Continue using a disposable
 test VM with a snapshot. The script targets Windows PowerShell 5.1 and the same
 Windows baseline as the driver.
+
+Windows keys a published driver package on its INF: a new binary with an
+unchanged `DriverVer` is silently not installed, and the upgrade fails its
+payload check. Raise `DriverVer` in `driver/chmlink.inf` together with
+`CHMLINK_VERSION_*` in `include/chmlink/version.h` whenever driver code changes;
+`version_test` keeps the two equal and CI rejects a changed driver that keeps the
+old version.
 
 Plan is read-only and reports every installed ChmLink instance, including
 disconnected devices, together with its package, identity and network settings:
@@ -320,10 +351,30 @@ INF and refuses packages still associated with devices. Windows also guards
 the final deletion through `SetupUninstallOEMInf` with no force flag. Package
 cleanup is explicit and separate from upgrade and rollback.
 
-Before any production use, the prototype still needs Windows runtime tests
-for bidirectional traffic, Driver Verifier, concurrent cleanup and removal,
-power transitions, repeated installation and upgrades, plus minimum-version
-and architecture testing. The C interface and device contract are experimental.
+## Performance
+
+`tests/windows_bench.c`, run through `tools/bench.ps1` on the test VM, measures an
+IP adapter in a VM on an AMD Ryzen 9 9950X host with 8 vCPUs, Windows 11 build
+26200. These are in-VM figures, not network figures: there is no encryption and
+no physical NIC. A single thread moves roughly 450k to 550k packets per second
+in each direction (about 5 Gbps with 1400-byte payloads), with 64-byte round
+trips at a median of about 60 microseconds and a 99th percentile of about 300.
+Both directions at once hold the same rates. A consumer stalled for 20 ms every
+100 ms loses well under 1% of 64-byte packets, about 7% of 512-byte ones and
+about 14% of 1400-byte ones, which is the limit of the 4 MiB queue. Run-to-run spread is up to about 14%.
+`tools/ci/vm-run.sh run full` compares a build with a recorded baseline.
+
+The data path uses one IOCTL per batch. A shared-memory ring would cut system
+calls and copies further; it would change the device contract and is not done.
+
+## Status
+
+Not production ready. Open work: signing and installation outside a test-signed
+VM, minimum-version and ARM64 testing, power transitions (the PnP and shutdown
+callbacks are empty), longer stress and fault injection, the Driver Verifier low
+resources options, and the Rust device I/O and agent integration. Lifecycle and
+IP suites last passed with standard Driver Verifier on package 0.3.1.0. The C
+interface and device contract are experimental.
 
 ## License
 
