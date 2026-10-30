@@ -5,7 +5,10 @@ param(
     [string]$BuildDirectory,
     [string]$OutputDirectory,
     # Seconds of IOCTL fuzzing on a running adapter, and again on one that is disabled and enabled meanwhile.
-    [int]$FuzzSeconds = 20
+    [int]$FuzzSeconds = 20,
+    # Suspend the system (standby, else hibernation) with a session open and resume it 30 s later.
+    # Off by default: it puts the whole machine to sleep. Skipped where the platform has no sleep state.
+    [switch]$PowerCycle
 )
 # Defaults are computed here, not in the param block: Windows PowerShell 5.1 evaluates $PSScriptRoot as empty there when the script is started with -File.
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path $PSScriptRoot '../build/verify/Release' }
@@ -117,6 +120,14 @@ try {
         $ready.Dispose(); $ready = $null
         if ($transition -eq 'disable') { Enable-NetAdapter -InputObject $first -Confirm:$false }
         $null = Get-TestAdapter $devices[1]
+    }
+    if ($PowerCycle) {
+        $power = Join-Path $BuildDirectory 'chmlink-power-test.exe'
+        if (!(Test-Path -LiteralPath $power)) { throw 'Build chmlink-power-test first.' }
+        $second = Get-TestAdapter $devices[1]
+        $process = Start-Test @($second.ifIndex) $power
+        Wait-Test $process 'power' 300; $process.Dispose(); $process = $null
+        Get-Content (Join-Path $output.FullName 'power.out') | Out-Host
     }
     'PASS lifecycle tests; results: ' + $output.FullName
     $exitCode = 0
