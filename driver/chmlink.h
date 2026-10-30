@@ -63,6 +63,19 @@ typedef struct CL_ADAPTER {
     ULONG64 TxQueueDrops;
 } CL_ADAPTER;
 
+/* Mode is fixed during ClInitialize and never changes afterwards, so these
+ * helpers are safe without holding the adapter lock. */
+static __inline ULONG ClPacketLimit(const CL_ADAPTER *a)
+{
+    return a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT;
+}
+
+/* Smallest frame Windows may hand us: an IPv4 header or an Ethernet header. */
+static __inline ULONG ClPacketMinimum(const CL_ADAPTER *a)
+{
+    return a->Mode == CHMLINK_MODE_IP ? 20u : 14u;
+}
+
 extern NDIS_HANDLE ClDriverHandle;
 extern LIST_ENTRY ClAdapters;
 extern KSPIN_LOCK ClAdaptersLock;

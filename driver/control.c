@@ -39,8 +39,7 @@ static NTSTATUS receive(CL_ADAPTER *a, PIRP irp, ULONG size)
     KIRQL irql;
     if (size > CHMLINK_BATCH_MAX_SIZE) return STATUS_INVALID_BUFFER_SIZE;
     result = chmlink_batch_begin(&writer, irp->AssociatedIrp.SystemBuffer, size,
-                                (chmlink_mode)a->Mode,
-                                a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT);
+                                (chmlink_mode)a->Mode, ClPacketLimit(a));
     if (result != CHMLINK_OK) return STATUS_BUFFER_TOO_SMALL;
     KeAcquireSpinLock(&a->Lock, &irql);
     while (a->Count != 0) {
@@ -88,8 +87,7 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
     NTSTATUS status = STATUS_SUCCESS;
 
     /* METHOD_BUFFERED provides the owned, nonpaged snapshot. */
-    if (chmlink_batch_validate(bytes, size, a->Mode,
-        a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT, &count) != CHMLINK_OK)
+    if (chmlink_batch_validate(bytes, size, a->Mode, ClPacketLimit(a), &count) != CHMLINK_OK)
         return STATUS_INVALID_PARAMETER;
     mdl = IoAllocateMdl((PVOID)bytes, size, FALSE, FALSE, NULL);
     if (mdl == NULL) return STATUS_INSUFFICIENT_RESOURCES;
@@ -197,7 +195,7 @@ static NTSTATUS query(CL_ADAPTER *a, PIRP irp, ULONG size)
     info.mode = (uint32_t)a->Mode;
     info.interface_index = a->InterfaceIndex;
     info.mtu = CHMLINK_ETHERNET_MTU;
-    info.packet_limit = a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT;
+    info.packet_limit = ClPacketLimit(a);
     info.queue_capacity = CHMLINK_QUEUE_PACKETS;
     if (a->Mode != CHMLINK_MODE_IP) NdisMoveMemory(info.mac, a->Mac, sizeof(info.mac));
     info.luid = a->Luid.Value;
@@ -218,24 +216,16 @@ static NTSTATUS query(CL_ADAPTER *a, PIRP irp, ULONG size)
     return STATUS_SUCCESS;
 }
 
-_Use_decl_annotations_
-NTSTATUS ClDispatch(PDEVICE_OBJECT device, PIRP irp)
+/* Resolve the adapter for an IRP under the global lock, which orders lookup
+ * against cleanup and halt. CREATE finds the adapter owning the control
+ * device. CLEANUP detaches the file context and inherits the file's own
+ * reference. Every other IRP takes a dispatch reference. ClDispatch releases
+ * the returned reference in all cases. */
+static CL_ADAPTER *ClReferenceIrpAdapter(PDEVICE_OBJECT device, PIO_STACK_LOCATION stack)
 {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
     CL_ADAPTER *a = NULL;
     PLIST_ENTRY entry;
     KIRQL irql;
-    NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
-    BOOLEAN rundown = FALSE;
-    BOOLEAN locked = FALSE;
-    irp->IoStatus.Information = 0;
-    if (stack->MajorFunction == IRP_MJ_CREATE && stack->FileObject != NULL) {
-        stack->FileObject->FsContext = NULL;
-        stack->FileObject->FsContext2 = NULL;
-    }
-
-    /* File contexts own a reference independently of the NDIS adapter. The
-     * global lock also protects acquiring a reference against cleanup/halt. */
     KeAcquireSpinLock(&ClAdaptersLock, &irql);
     if (stack->MajorFunction == IRP_MJ_CREATE) {
         for (entry = ClAdapters.Flink; entry != &ClAdapters; entry = entry->Flink) {
@@ -248,116 +238,177 @@ NTSTATUS ClDispatch(PDEVICE_OBJECT device, PIRP irp)
     }
     if (a != NULL && stack->MajorFunction != IRP_MJ_CLEANUP) InterlockedIncrement(&a->References);
     KeReleaseSpinLock(&ClAdaptersLock, irql);
+    return a;
+}
 
-    if (a != NULL) {
-        KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
-        locked = TRUE;
-    }
-
-    if (stack->MajorFunction == IRP_MJ_CLOSE || stack->MajorFunction == IRP_MJ_CLEANUP) {
-        status = STATUS_SUCCESS;
-        if (a != NULL && stack->MajorFunction == IRP_MJ_CLEANUP) {
-            if (stack->FileObject->FsContext2 != NULL) {
-                rundown = ExAcquireRundownProtection(&a->IoRundown);
-                KeAcquireSpinLock(&a->Lock, &irql);
-                a->SessionState = ClSessionClosing;
-                a->TxQueueDrops += a->Count;
-                a->Head = a->Count = 0;
-                ClUpdateReadEventLocked(a);
-                KeReleaseSpinLock(&a->Lock, irql);
-                ClDetachReadEvent(a);
-                if (rundown) ClIndicateLink(a);
-                KeAcquireSpinLock(&a->Lock, &irql);
-                a->SessionState = ClSessionClosed;
-                KeReleaseSpinLock(&a->Lock, irql);
-            }
-        }
-        goto complete;
-    }
-    if (a == NULL) { status = STATUS_DEVICE_REMOVED; goto complete; }
-    if (stack->MajorFunction != IRP_MJ_CREATE) {
-        BOOLEAN ownsSession;
-        KeAcquireSpinLock(&ClAdaptersLock, &irql);
-        ownsSession = stack->FileObject != NULL && stack->FileObject->FsContext == a;
-        KeReleaseSpinLock(&ClAdaptersLock, irql);
-        if (!ownsSession) { status = STATUS_FILE_CLOSED; goto complete; }
-    }
+static BOOLEAN ClIsRemoved(CL_ADAPTER *a)
+{
+    BOOLEAN removed;
+    KIRQL irql;
     KeAcquireSpinLock(&ClAdaptersLock, &irql);
-    if (a->Removed) status = STATUS_DEVICE_REMOVED;
+    removed = a->Removed;
     KeReleaseSpinLock(&ClAdaptersLock, irql);
-    if (status == STATUS_DEVICE_REMOVED) goto complete;
-    /* Metadata never touches NDIS handles or pools. The adapter reference
-     * keeps the snapshot storage alive even when the data path is paused. */
-    if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL &&
-        stack->Parameters.DeviceIoControl.IoControlCode == CHMLINK_IOCTL_QUERY) {
-        if (stack->Parameters.DeviceIoControl.InputBufferLength != 0)
-            status = STATUS_INVALID_PARAMETER;
-        else status = query(a, irp, stack->Parameters.DeviceIoControl.OutputBufferLength);
-        goto complete;
-    }
-    if (stack->MajorFunction == IRP_MJ_CREATE &&
-        !(stack->Parameters.Create.SecurityContext->DesiredAccess & FILE_WRITE_DATA)) {
-        if (stack->FileObject->FileName.Length != 0) {
-            status = STATUS_OBJECT_NAME_NOT_FOUND; goto complete;
-        }
-        KeAcquireSpinLock(&ClAdaptersLock, &irql);
-        stack->FileObject->FsContext = a;
-        stack->FileObject->FsContext2 = NULL;
-        InterlockedIncrement(&a->References);
-        KeReleaseSpinLock(&ClAdaptersLock, irql);
-        status = STATUS_SUCCESS;
-        goto complete;
-    }
-    if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL && stack->FileObject->FsContext2 == NULL) {
-        status = STATUS_ACCESS_DENIED; goto complete;
-    }
+    return removed;
+}
+
+/* The file context owns a reference independently of the NDIS adapter.
+ * FsContext2 marks the exclusive data session; NULL is inspection only. */
+static void ClAttachFile(CL_ADAPTER *a, PFILE_OBJECT file, BOOLEAN session)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&ClAdaptersLock, &irql);
+    file->FsContext = a;
+    file->FsContext2 = session ? (PVOID)1 : NULL;
+    InterlockedIncrement(&a->References);
+    KeReleaseSpinLock(&ClAdaptersLock, irql);
+}
+
+/* ControlMutex held. Ends the data session owned by this file, if any.
+ * After halt the rundown is complete and NDIS handles are gone, so the link
+ * indication is skipped; queue and event state are still reset. */
+static void ClCleanupFile(CL_ADAPTER *a, PFILE_OBJECT file)
+{
+    BOOLEAN rundown;
+    KIRQL irql;
+    if (file->FsContext2 == NULL) return;
     rundown = ExAcquireRundownProtection(&a->IoRundown);
-    if (!rundown) { status = STATUS_DEVICE_NOT_READY; goto complete; }
-    KeAcquireSpinLock(&ClAdaptersLock, &irql);
-    if (a->Removed) status = STATUS_DEVICE_REMOVED;
-    KeReleaseSpinLock(&ClAdaptersLock, irql);
-    if (status == STATUS_DEVICE_REMOVED) goto complete;
-    if (stack->MajorFunction == IRP_MJ_CREATE) {
-        if (stack->FileObject->FileName.Length != 0) {
-            status = STATUS_OBJECT_NAME_NOT_FOUND; goto complete;
-        }
+    KeAcquireSpinLock(&a->Lock, &irql);
+    a->SessionState = ClSessionClosing;
+    a->TxQueueDrops += a->Count;
+    a->Head = a->Count = 0;
+    ClUpdateReadEventLocked(a);
+    KeReleaseSpinLock(&a->Lock, irql);
+    ClDetachReadEvent(a);
+    if (rundown) ClIndicateLink(a);
+    KeAcquireSpinLock(&a->Lock, &irql);
+    a->SessionState = ClSessionClosed;
+    KeReleaseSpinLock(&a->Lock, irql);
+    if (rundown) ExReleaseRundownProtection(&a->IoRundown);
+}
+
+/* Checks shared by CREATE and DEVICE_CONTROL. A non-CREATE request must come
+ * from a file whose context still names this adapter. */
+static NTSTATUS ClCheckRequest(CL_ADAPTER *a, PIO_STACK_LOCATION stack)
+{
+    BOOLEAN owns;
+    KIRQL irql;
+    if (a == NULL) return STATUS_DEVICE_REMOVED;
+    if (stack->MajorFunction != IRP_MJ_CREATE) {
+        KeAcquireSpinLock(&ClAdaptersLock, &irql);
+        owns = stack->FileObject != NULL && stack->FileObject->FsContext == a;
+        KeReleaseSpinLock(&ClAdaptersLock, irql);
+        if (!owns) return STATUS_FILE_CLOSED;
+    }
+    return ClIsRemoved(a) ? STATUS_DEVICE_REMOVED : STATUS_SUCCESS;
+}
+
+/* ControlMutex held. Read-only opens are inspection handles. Read/write opens
+ * claim the single data session and connect the link. */
+static NTSTATUS ClCreate(CL_ADAPTER *a, PIO_STACK_LOCATION stack)
+{
+    PFILE_OBJECT file = stack->FileObject;
+    NTSTATUS status;
+    KIRQL irql;
+    if (!(stack->Parameters.Create.SecurityContext->DesiredAccess & FILE_WRITE_DATA)) {
+        if (file->FileName.Length != 0) return STATUS_OBJECT_NAME_NOT_FOUND;
+        ClAttachFile(a, file, FALSE);
+        return STATUS_SUCCESS;
+    }
+    if (!ExAcquireRundownProtection(&a->IoRundown)) return STATUS_DEVICE_NOT_READY;
+    if (ClIsRemoved(a)) status = STATUS_DEVICE_REMOVED;
+    else if (file->FileName.Length != 0) status = STATUS_OBJECT_NAME_NOT_FOUND;
+    else {
         KeAcquireSpinLock(&a->Lock, &irql);
         if (a->SessionState != ClSessionClosed) status = STATUS_SHARING_VIOLATION;
         else { a->SessionState = ClSessionOpen; status = STATUS_SUCCESS; }
         KeReleaseSpinLock(&a->Lock, irql);
         if (NT_SUCCESS(status)) {
-            KeAcquireSpinLock(&ClAdaptersLock, &irql);
-            stack->FileObject->FsContext = a;
-            stack->FileObject->FsContext2 = (PVOID)1;
-            InterlockedIncrement(&a->References);
-            KeReleaseSpinLock(&ClAdaptersLock, irql);
+            ClAttachFile(a, file, TRUE);
             ClIndicateLink(a);
         }
-    } else if (stack->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
-        BOOLEAN running;
-        KeAcquireSpinLock(&a->Lock, &irql);
-        running = a->State == ClAdapterRunning && a->SessionState == ClSessionOpen;
-        KeReleaseSpinLock(&a->Lock, irql);
-        if (!running) { status = STATUS_DEVICE_NOT_READY; goto complete; }
-        switch (stack->Parameters.DeviceIoControl.IoControlCode) {
-        case CHMLINK_IOCTL_REGISTER_READ_EVENT:
-            if (stack->Parameters.DeviceIoControl.OutputBufferLength != 0) status = STATUS_INVALID_PARAMETER;
-            else status = register_read_event(a, irp, stack->Parameters.DeviceIoControl.InputBufferLength);
-            break;
-        case CHMLINK_IOCTL_RECEIVE:
-            if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) status = STATUS_INVALID_PARAMETER;
-            else status = receive(a, irp, stack->Parameters.DeviceIoControl.OutputBufferLength);
-            break;
-        case CHMLINK_IOCTL_INJECT:
-            if (stack->Parameters.DeviceIoControl.OutputBufferLength != 0) status = STATUS_INVALID_PARAMETER;
-            else status = inject(a, irp, stack->Parameters.DeviceIoControl.InputBufferLength);
-            break;
-        }
     }
-complete:
-    if (rundown) ExReleaseRundownProtection(&a->IoRundown);
-    if (locked) KeReleaseMutex(&a->ControlMutex, FALSE);
-    if (a != NULL) ClRelease(a);
+    ExReleaseRundownProtection(&a->IoRundown);
+    return status;
+}
+
+/* Rundown held. Data-path requests require a running adapter and session. */
+static NTSTATUS ClDataControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
+{
+    ULONG input = stack->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG output = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    BOOLEAN running;
+    KIRQL irql;
+    KeAcquireSpinLock(&a->Lock, &irql);
+    running = a->State == ClAdapterRunning && a->SessionState == ClSessionOpen;
+    KeReleaseSpinLock(&a->Lock, irql);
+    if (!running) return STATUS_DEVICE_NOT_READY;
+    switch (stack->Parameters.DeviceIoControl.IoControlCode) {
+    case CHMLINK_IOCTL_REGISTER_READ_EVENT:
+        return output != 0 ? STATUS_INVALID_PARAMETER : register_read_event(a, irp, input);
+    case CHMLINK_IOCTL_RECEIVE:
+        return input != 0 ? STATUS_INVALID_PARAMETER : receive(a, irp, output);
+    case CHMLINK_IOCTL_INJECT:
+        return output != 0 ? STATUS_INVALID_PARAMETER : inject(a, irp, input);
+    default:
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+}
+
+/* ControlMutex held. Metadata never touches NDIS handles or pools; the
+ * adapter reference keeps the snapshot storage alive even when the data path
+ * is paused, so QUERY works on any handle without rundown protection. */
+static NTSTATUS ClControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
+{
+    NTSTATUS status;
+    if (stack->Parameters.DeviceIoControl.IoControlCode == CHMLINK_IOCTL_QUERY) {
+        if (stack->Parameters.DeviceIoControl.InputBufferLength != 0) return STATUS_INVALID_PARAMETER;
+        return query(a, irp, stack->Parameters.DeviceIoControl.OutputBufferLength);
+    }
+    if (stack->FileObject->FsContext2 == NULL) return STATUS_ACCESS_DENIED;
+    if (!ExAcquireRundownProtection(&a->IoRundown)) return STATUS_DEVICE_NOT_READY;
+    status = ClIsRemoved(a) ? STATUS_DEVICE_REMOVED : ClDataControl(a, irp, stack);
+    ExReleaseRundownProtection(&a->IoRundown);
+    return status;
+}
+
+_Use_decl_annotations_
+NTSTATUS ClDispatch(PDEVICE_OBJECT device, PIRP irp)
+{
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    CL_ADAPTER *a;
+    NTSTATUS status;
+    irp->IoStatus.Information = 0;
+    if (stack->MajorFunction == IRP_MJ_CREATE && stack->FileObject != NULL) {
+        stack->FileObject->FsContext = NULL;
+        stack->FileObject->FsContext2 = NULL;
+    }
+    a = ClReferenceIrpAdapter(device, stack);
+    /* Serializes session transitions and link indications per adapter. */
+    if (a != NULL) KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
+    switch (stack->MajorFunction) {
+    case IRP_MJ_CLEANUP:
+        if (a != NULL) ClCleanupFile(a, stack->FileObject);
+        status = STATUS_SUCCESS;
+        break;
+    case IRP_MJ_CLOSE:
+        status = STATUS_SUCCESS;
+        break;
+    case IRP_MJ_CREATE:
+        status = ClCheckRequest(a, stack);
+        if (NT_SUCCESS(status)) status = ClCreate(a, stack);
+        break;
+    case IRP_MJ_DEVICE_CONTROL:
+        status = ClCheckRequest(a, stack);
+        if (NT_SUCCESS(status)) status = ClControl(a, irp, stack);
+        break;
+    default:
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+    if (a != NULL) {
+        KeReleaseMutex(&a->ControlMutex, FALSE);
+        ClRelease(a);
+    }
     irp->IoStatus.Status = status;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return status;
