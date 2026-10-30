@@ -35,19 +35,20 @@ NDIS_STATUS ClRegisterControl(CL_ADAPTER *a, NET_IFINDEX index)
 static NTSTATUS receive(CL_ADAPTER *a, PIRP irp, ULONG size)
 {
     chmlink_batch_writer writer;
-    chmlink_result result;
+    chmlink_result result = CHMLINK_OK;
     KIRQL irql;
     if (size > CHMLINK_BATCH_MAX_SIZE) return STATUS_INVALID_BUFFER_SIZE;
     result = chmlink_batch_begin(&writer, irp->AssociatedIrp.SystemBuffer, size,
                                 (chmlink_mode)a->Mode, ClPacketLimit(a));
     if (result != CHMLINK_OK) return STATUS_BUFFER_TOO_SMALL;
     KeAcquireSpinLock(&a->Lock, &irql);
-    while (a->Count != 0) {
-        CL_PACKET *packet = &a->Queue[a->Head];
-        result = chmlink_batch_append(&writer, packet->Bytes, packet->Length);
+    for (;;) {
+        uint32_t length;
+        const UCHAR *packet = chmlink_ring_front(&a->Queue, &length);
+        if (packet == NULL) break;
+        result = chmlink_batch_append(&writer, packet, length);
         if (result != CHMLINK_OK) break;
-        a->Head = (a->Head + 1) % CHMLINK_QUEUE_PACKETS;
-        a->Count--;
+        chmlink_ring_pop(&a->Queue);
     }
     ClUpdateReadEventLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
@@ -220,7 +221,7 @@ static NTSTATUS query(CL_ADAPTER *a, PIRP irp, ULONG size)
     info.luid = a->Luid.Value;
     KeAcquireSpinLock(&a->Lock, &irql);
     info.state = ClStateFlagsLocked(a);
-    info.queued_packets = a->Count;
+    info.queued_packets = a->Queue.count;
     info.packet_filter = a->PacketFilter;
     info.tx_packets = a->TxPackets;
     info.tx_bytes = a->TxBytes;
@@ -293,8 +294,7 @@ static void ClCleanupFile(CL_ADAPTER *a, PFILE_OBJECT file)
     rundown = ExAcquireRundownProtection(&a->IoRundown);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->SessionState = ClSessionClosing;
-    a->TxQueueDrops += a->Count;
-    a->Head = a->Count = 0;
+    a->TxQueueDrops += chmlink_ring_clear(&a->Queue);
     ClUpdateReadEventLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     ClDetachReadEvent(a);

@@ -69,7 +69,8 @@ int chmlink_wait_readable(chmlink_adapter *adapter, uint32_t timeout_ms);
 int chmlink_cancel_wait(chmlink_adapter *adapter);
 
 /* Receive a protocol.h batch. ERROR_NO_MORE_ITEMS means the queue is empty.
- * A buffer of CHMLINK_BATCH_MAX_SIZE can hold the entire bounded queue.
+ * One call returns at most one batch (CHMLINK_BATCH_MAX_PACKETS packets); the
+ * queue can hold more, so keep receiving until ERROR_NO_MORE_ITEMS.
  * A smaller buffer may return a partial batch; an oversized first packet
  * returns ERROR_INSUFFICIENT_BUFFER and is left queued for a larger buffer.
  */

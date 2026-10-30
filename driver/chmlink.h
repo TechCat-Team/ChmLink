@@ -8,6 +8,7 @@
 #include "chmlink/device.h"
 #include "chmlink/protocol.h"
 #include "chmlink/config.h"
+#include "ring.h"
 
 typedef char CL_MODE_IP_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_IP == CHMLINK_MODE_IP) ? 1 : -1];
 typedef char CL_MODE_ETHERNET_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_ETHERNET == CHMLINK_MODE_ETHERNET) ? 1 : -1];
@@ -16,11 +17,6 @@ typedef char CL_MODE_ETHERNET_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_ETHERNET == CH
 #define CL_FILTERS (NDIS_PACKET_TYPE_DIRECTED | NDIS_PACKET_TYPE_MULTICAST | \
     NDIS_PACKET_TYPE_ALL_MULTICAST | NDIS_PACKET_TYPE_BROADCAST | NDIS_PACKET_TYPE_PROMISCUOUS)
 #define CL_MULTICAST_MAX 32
-
-typedef struct CL_PACKET {
-    ULONG Length;
-    UCHAR Bytes[CHMLINK_ETHERNET_LIMIT];
-} CL_PACKET;
 
 typedef enum CL_ADAPTER_STATE {
     ClAdapterInitializing, ClAdapterPaused, ClAdapterRunning,
@@ -55,9 +51,8 @@ typedef struct CL_ADAPTER {
     UCHAR Mac[6];
     chmlink_mode Mode;
     UCHAR Configuration[CHMLINK_CONFIG_SIZE];
-    CL_PACKET *Queue;
-    ULONG Head;
-    ULONG Count;
+    UCHAR *QueueStorage;
+    chmlink_ring Queue; /* protected by Lock */
     ULONG64 TxPackets, TxBytes, TxErrors;
     ULONG64 RxPackets, RxBytes, RxDiscards;
     ULONG64 TxQueueDrops;
