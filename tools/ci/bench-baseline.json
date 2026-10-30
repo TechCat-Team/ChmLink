@@ -1,0 +1,108 @@
+{
+  "_note": "Recorded from 3 repeats of 'vm-run.sh run full' on the VM. Re-record with compare_bench.py --update-baseline after an intended performance change, in the same commit as the change.",
+  "profiles": {
+    "AMD Ryzen 9 9950X 16-Core Processor|8": {
+      "commit": "e9d44d27",
+      "driver": "0.3.1.0",
+      "recorded": "2026-10-30T08:25:52Z",
+      "repeats": 3,
+      "scenarios": {
+        "duplex_64B": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 546697.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 459971.0
+        },
+        "latency": {
+          "lost": 0.0,
+          "max_us": 2022.4,
+          "p50_us": 58.8,
+          "p999_us": 552.9,
+          "p99_us": 299.0
+        },
+        "loopback_1400B": {
+          "loopback_pps": 267678.0
+        },
+        "loopback_512B": {
+          "loopback_pps": 254839.0
+        },
+        "loopback_64B": {
+          "loopback_pps": 253842.0
+        },
+        "rx_1400B_batch32": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 522435.0
+        },
+        "rx_512B_batch32": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 518703.0
+        },
+        "rx_64B_batch1": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 183998.0
+        },
+        "rx_64B_batch128": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 475431.0
+        },
+        "rx_64B_batch32": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 536310.0
+        },
+        "rx_64B_batch32_2injectors": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 1063735.0
+        },
+        "rx_64B_batch8": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 426178.0
+        },
+        "tx_1400B": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 450107.0
+        },
+        "tx_1400B_stall20ms": {
+          "errors": 0.0,
+          "tx_drop_pct": 13.9293,
+          "tx_pps": 402442.0
+        },
+        "tx_512B": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 467487.0
+        },
+        "tx_512B_stall20ms": {
+          "errors": 0.0,
+          "tx_drop_pct": 6.827,
+          "tx_pps": 454408.0
+        },
+        "tx_64B": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 459616.0
+        },
+        "tx_64B_4senders": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 1537067.0
+        },
+        "tx_64B_stall20ms": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0697,
+          "tx_pps": 486920.0
+        }
+      }
+    }
+  },
+  "tolerances": {},
+  "version": 1
+}
