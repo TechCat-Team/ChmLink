@@ -57,22 +57,43 @@ static NTSTATUS receive(CL_ADAPTER *a, PIRP irp, ULONG size)
     return STATUS_SUCCESS;
 }
 
-static BOOLEAN accepts(CL_ADAPTER *a, const UCHAR *frame)
+/* Receive filter state copied once per injected batch, so the per-packet
+ * check runs without the adapter lock. A filter change takes effect from the
+ * next batch. */
+typedef struct CL_FILTER {
+    ULONG PacketFilter;
+    ULONG MulticastCount;
+    UCHAR Multicast[CL_MULTICAST_MAX][6];
+    UCHAR Mac[6];
+} CL_FILTER;
+
+static void ClSnapshotFilter(CL_ADAPTER *a, CL_FILTER *f)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&a->Lock, &irql);
+    f->PacketFilter = a->PacketFilter;
+    f->MulticastCount = a->MulticastCount;
+    NdisMoveMemory(f->Multicast, a->Multicast, f->MulticastCount * 6);
+    NdisMoveMemory(f->Mac, a->Mac, sizeof(f->Mac));
+    KeReleaseSpinLock(&a->Lock, irql);
+}
+
+static BOOLEAN accepts(const CL_FILTER *f, const UCHAR *frame)
 {
     static const UCHAR broadcast[6] = {255, 255, 255, 255, 255, 255};
     ULONG i;
-    if (a->PacketFilter & NDIS_PACKET_TYPE_PROMISCUOUS) return TRUE;
+    if (f->PacketFilter & NDIS_PACKET_TYPE_PROMISCUOUS) return TRUE;
     if (RtlCompareMemory(frame, broadcast, 6) == 6)
-        return (a->PacketFilter & NDIS_PACKET_TYPE_BROADCAST) != 0;
+        return (f->PacketFilter & NDIS_PACKET_TYPE_BROADCAST) != 0;
     if (frame[0] & 1) {
-        if (a->PacketFilter & NDIS_PACKET_TYPE_ALL_MULTICAST) return TRUE;
-        if (!(a->PacketFilter & NDIS_PACKET_TYPE_MULTICAST)) return FALSE;
-        for (i = 0; i < a->MulticastCount; ++i)
-            if (RtlCompareMemory(frame, a->Multicast[i], 6) == 6) return TRUE;
+        if (f->PacketFilter & NDIS_PACKET_TYPE_ALL_MULTICAST) return TRUE;
+        if (!(f->PacketFilter & NDIS_PACKET_TYPE_MULTICAST)) return FALSE;
+        for (i = 0; i < f->MulticastCount; ++i)
+            if (RtlCompareMemory(frame, f->Multicast[i], 6) == 6) return TRUE;
         return FALSE;
     }
-    return (a->PacketFilter & NDIS_PACKET_TYPE_DIRECTED) &&
-           RtlCompareMemory(frame, a->Mac, 6) == 6;
+    return (f->PacketFilter & NDIS_PACKET_TYPE_DIRECTED) &&
+           RtlCompareMemory(frame, f->Mac, 6) == 6;
 }
 
 static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
@@ -83,6 +104,7 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
     ULONG64 acceptedBytes = 0;
     PMDL mdl;
     PNET_BUFFER_LIST first = NULL, last = NULL, nbl;
+    CL_FILTER filter;
     KIRQL irql;
     NTSTATUS status = STATUS_SUCCESS;
 
@@ -92,16 +114,13 @@ static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
     mdl = IoAllocateMdl((PVOID)bytes, size, FALSE, FALSE, NULL);
     if (mdl == NULL) return STATUS_INSUFFICIENT_RESOURCES;
     MmBuildMdlForNonPagedPool(mdl);
+    if (a->Mode != CHMLINK_MODE_IP) ClSnapshotFilter(a, &filter);
     for (i = 0; i < count; ++i) {
         ULONG length;
-        BOOLEAN accept;
         /* Windows targets are little endian; avoid unaligned structure casts. */
         NdisMoveMemory(&length, bytes + offset, sizeof(length));
         offset += 4;
-        KeAcquireSpinLock(&a->Lock, &irql);
-        accept = a->Mode == CHMLINK_MODE_IP ? TRUE : accepts(a, bytes + offset);
-        KeReleaseSpinLock(&a->Lock, irql);
-        if (accept) {
+        if (a->Mode == CHMLINK_MODE_IP || accepts(&filter, bytes + offset)) {
             nbl = NdisAllocateNetBufferAndNetBufferList(a->Pool, 0, 0, mdl, offset, length);
             if (nbl == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
             nbl->SourceHandle = a->Handle;
@@ -354,9 +373,10 @@ static NTSTATUS ClDataControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
     }
 }
 
-/* ControlMutex held. Metadata never touches NDIS handles or pools; the
- * adapter reference keeps the snapshot storage alive even when the data path
- * is paused, so QUERY works on any handle without rundown protection. */
+/* ControlMutex is held only for REGISTER_READ_EVENT (see ClNeedsControlMutex).
+ * Metadata never touches NDIS handles or pools; the adapter reference keeps
+ * the snapshot storage alive even when the data path is paused, so QUERY works
+ * on any handle without rundown protection. */
 static NTSTATUS ClControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
 {
     NTSTATUS status;
@@ -371,20 +391,36 @@ static NTSTATUS ClControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
     return status;
 }
 
+/* ControlMutex orders session open and close, read-event registration and
+ * link-state indications for one adapter. RECEIVE, INJECT and QUERY touch only
+ * state guarded by the adapter spin lock, and the data path additionally holds
+ * rundown protection against pause and halt, so they run concurrently instead
+ * of queueing behind each other. REGISTER_READ_EVENT stays serialized: it must
+ * not attach an event after cleanup has already detached the session's. */
+static BOOLEAN ClNeedsControlMutex(PIO_STACK_LOCATION stack)
+{
+    ULONG code;
+    if (stack->MajorFunction != IRP_MJ_DEVICE_CONTROL) return TRUE;
+    code = stack->Parameters.DeviceIoControl.IoControlCode;
+    return code != CHMLINK_IOCTL_RECEIVE && code != CHMLINK_IOCTL_INJECT &&
+           code != CHMLINK_IOCTL_QUERY;
+}
+
 _Use_decl_annotations_
 NTSTATUS ClDispatch(PDEVICE_OBJECT device, PIRP irp)
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
     CL_ADAPTER *a;
     NTSTATUS status;
+    BOOLEAN serialized;
     irp->IoStatus.Information = 0;
     if (stack->MajorFunction == IRP_MJ_CREATE && stack->FileObject != NULL) {
         stack->FileObject->FsContext = NULL;
         stack->FileObject->FsContext2 = NULL;
     }
     a = ClReferenceIrpAdapter(device, stack);
-    /* Serializes session transitions and link indications per adapter. */
-    if (a != NULL) KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
+    serialized = a != NULL && ClNeedsControlMutex(stack);
+    if (serialized) KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
     switch (stack->MajorFunction) {
     case IRP_MJ_CLEANUP:
         if (a != NULL) ClCleanupFile(a, stack->FileObject);
@@ -405,10 +441,8 @@ NTSTATUS ClDispatch(PDEVICE_OBJECT device, PIRP irp)
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }
-    if (a != NULL) {
-        KeReleaseMutex(&a->ControlMutex, FALSE);
-        ClRelease(a);
-    }
+    if (serialized) KeReleaseMutex(&a->ControlMutex, FALSE);
+    if (a != NULL) ClRelease(a);
     irp->IoStatus.Status = status;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return status;
