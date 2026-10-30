@@ -100,7 +100,7 @@ foreach ($source in $sources) {
     $object = Join-Path $Output (([IO.Path]::GetFileNameWithoutExtension($source)) + '.obj')
     $objects += $object
     try {
-        Invoke-Checked 'cl.exe' (@('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/W4', '/WX',
+        Invoke-Checked 'cl.exe' (@('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/Z7', '/W4', '/WX',
         '/wd4201', '/wd4324', '/wd4996', '/D_AMD64_', '/DNDIS660_MINIPORT=1',
         '/D_WIN32_WINNT=0x0A00', '/DNTDDI_VERSION=0x0A000002',
         "/I$repo/include", "/I$repo/driver", "/I$repo/src/queue", "/I$wdk/Include/$kitVersion/km",
@@ -114,6 +114,8 @@ foreach ($source in $sources) {
 if ($compileFailed) { throw 'Driver compilation failed; see compiler diagnostics above.' }
 Invoke-Checked 'link.exe' (@('/nologo', '/driver', '/subsystem:native,10.00',
     '/entry:GsDriverEntry', '/machine:x64', '/nodefaultlib', '/integritycheck',
+    # Symbols for crash and live-dump analysis. /DEBUG turns off /OPT:REF,ICF; keep them on.
+    '/debug', "/pdb:$Output/chmlink.pdb", '/opt:ref', '/opt:icf',
     "/out:$Output/chmlink.sys", "/libpath:$wdk/Lib/$kitVersion/km/x64",
     'ntoskrnl.lib', 'hal.lib', 'ndis.lib', 'ntstrsafe.lib', 'BufferOverflowK.lib') + $objects)
 Copy-Item "$repo/driver/chmlink.inf" $Output -Force

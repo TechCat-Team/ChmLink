@@ -19,6 +19,8 @@ param(
     [string]$RunId,
     [ValidateSet('smoke', 'full', 'nightly')][string]$Lane = 'smoke',
     [int]$StressMinutes = 0,
+    # Minutes under Driver Verifier fault injection in the nightly lane; -1 = config or 10, 0 = skip.
+    [int]$LowResMinutes = -1,
     [int]$Offset = 0,
     [string]$BaselineFrom,
     [string]$CertThumbprint,
@@ -234,6 +236,22 @@ function Get-VerifierState {
     [pscustomobject]@{ Listed = $listed; CurrentAllocations = (& $at 0); CurrentBytes = (& $at 1); PeakAllocations = (& $at 2) }
 }
 
+# The global "Verifier Statistics Summary" counters, in output order. The labels are localised, the
+# order is not: Raise IRQLs, Acquire Spin Locks, Synchronize Executions, Trims, Pool Allocations
+# Attempted, Succeeded, Succeeded SpecialPool, With No Tag, Not Tracked, Failed, Failed Deliberately.
+function Get-VerifierStatistics {
+    $values = @()
+    foreach ($line in ((& verifier.exe /query 2>&1 | Out-String) -split "`r?`n")) {
+        if ($line -match '\.sys\s*\(') { break }                       # the per-driver list starts
+        if ($line -match '^\s+[^:(]+:\s+(\d+)\s*$') { $values += [int64]$matches[1] }
+    }
+    [pscustomobject]@{
+        Raw = ($values -join ',')
+        Attempted = $(if ($values.Count -ge 11) { $values[4] } else { -1 })
+        FailedDeliberately = $(if ($values.Count -ge 11) { $values[10] } else { -1 })
+    }
+}
+
 # The persistent setting, as the registry has it. This is what survives a reboot.
 function Get-VerifierPersistent {
     $memory = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
@@ -246,9 +264,24 @@ function Set-VerifierPersistent {
     if ((Get-VerifierPersistent).Drivers -notmatch 'chmlink\.sys') { throw 'Could not set the persistent Driver Verifier configuration.' }
 }
 
+# Standard checks plus randomized low resources simulation (0x4) for the next boot. Verifier
+# fails a share of the driver's allocations (probability in 1/10000) from DelayMinutes after boot
+# on. 'verifier /faults' and '/flags' each reset the other's values, so the fault parameters are
+# written after the flags.
+function Set-VerifierLowResources([int]$Probability = 600, [int]$DelayMinutes = 1) {
+    & verifier.exe /flags 0x209BF /driver chmlink.sys 2>&1 | ForEach-Object { Write-Log "  verifier: $_" }
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+    Set-ItemProperty -LiteralPath $key -Name VerifierFaultProbability -Value $Probability -Type DWord
+    Set-ItemProperty -LiteralPath $key -Name VerifierFaultBootMinutes -Value $DelayMinutes -Type DWord
+    $now = Get-VerifierPersistent
+    if ($now.Drivers -notmatch 'chmlink\.sys' -or !($now.Level -band 4)) { throw 'Could not set the low resources Driver Verifier configuration.' }
+}
+
 # Clear for the next boot. The current boot keeps tracking until it reboots.
 function Clear-VerifierPersistent {
     & verifier.exe /reset 2>&1 | Out-Null
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+    Remove-ItemProperty -LiteralPath $key -Name VerifierFaultProbability, VerifierFaultBootMinutes -ErrorAction SilentlyContinue
     if ((Get-VerifierPersistent).Drivers) { throw 'Could not clear the persistent Driver Verifier configuration.' }
 }
 
@@ -335,6 +368,8 @@ function Invoke-Doctor {
 function Get-LockHolder {
     if (!(Test-Path -LiteralPath $lockPath)) { return $null }
     try { $holder = Get-Content -LiteralPath $lockPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+    # A lock from an earlier boot is stale even if its pid now names another process.
+    if ($holder.BootId -and $holder.BootId -ne (Get-BootId)) { return $null }
     if ($holder.Pid -and (Get-Process -Id $holder.Pid -ErrorAction SilentlyContinue)) { return $holder }
     return $null   # owner is gone: stale
 }
@@ -342,7 +377,7 @@ function Get-LockHolder {
 function Enter-Lock {
     $holder = Get-LockHolder
     if ($holder) { throw "VM busy with run $($holder.RunId) (pid $($holder.Pid))." }
-    Write-Json $lockPath ([ordered]@{ RunId = $RunId; Pid = $PID; Started = (Get-Date).ToUniversalTime().ToString('s') })
+    Write-Json $lockPath ([ordered]@{ RunId = $RunId; Pid = $PID; BootId = (Get-BootId); Started = (Get-Date).ToUniversalTime().ToString('s') })
 }
 
 # Only the owner releases the lock, so a run that failed to get it cannot free another run's.
@@ -360,7 +395,7 @@ function Invoke-Launch {
     if (!(Test-Path -LiteralPath $dir)) { throw "No such run directory: $dir" }
     $holder = Get-LockHolder
     if ($holder) { Write-Output "BUSY run=$($holder.RunId)"; exit 4 }
-    $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Run -RunId {1} -Lane {2} -StressMinutes {3}' -f $PSCommandPath, $RunId, $Lane, $StressMinutes
+    $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Run -RunId {1} -Lane {2} -StressMinutes {3} -LowResMinutes {4}' -f $PSCommandPath, $RunId, $Lane, $StressMinutes, $LowResMinutes
     $created = ([wmiclass]'Win32_Process').Create($command, $dir, $null)
     if ($created.ReturnValue -ne 0) { throw "Cannot start the run (WMI code $($created.ReturnValue))." }
     Write-Json (Join-Path $dir 'status.json') ([ordered]@{ State = 'queued'; Stage = ''; Pid = $created.ProcessId
@@ -501,10 +536,11 @@ function New-SuiteRunner([string]$InfPath, [string]$BuildDir) {
     $script:suiteInf = $InfPath; $script:suiteBuild = $BuildDir
     {
         param([string]$Kind, [string]$Directory, [int]$Timeout, [string]$Filter = '')
-        $script = switch ($Kind) { 'lifecycle' { 'test-lifecycle.ps1' } 'ip' { 'test-ip.ps1' } 'bench' { 'bench.ps1' } }
+        $script = switch ($Kind) { 'lifecycle' { 'test-lifecycle.ps1' } 'ip' { 'test-ip.ps1' } 'bench' { 'bench.ps1' } 'lowres' { 'test-lowres.ps1' } }
         $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -InfPath "{1}" -BuildDirectory "{2}" -OutputDirectory "{3}"' -f `
             (Join-Path $script:srcDir "tools\$script"), $script:suiteInf, $script:suiteBuild, $Directory
         if ($Kind -eq 'bench') { $arguments += ' -Seconds 3'; if ($Filter) { $arguments += " -Filter $Filter" } }
+        if ($Kind -eq 'lowres') { $arguments += " -Minutes $Filter" }
         Invoke-Process "$Kind suite" 'powershell.exe' $arguments $Timeout
     }
 }
@@ -513,7 +549,7 @@ function New-SuiteRunner([string]$InfPath, [string]$BuildDir) {
 function Enter-Lock-For([string]$Id) {
     $holder = Get-LockHolder
     if ($holder -and $holder.RunId -ne $Id) { throw "VM busy with run $($holder.RunId) (pid $($holder.Pid))." }
-    Write-Json $lockPath ([ordered]@{ RunId = $Id; Pid = $PID; Started = (Get-Date).ToUniversalTime().ToString('s') })
+    Write-Json $lockPath ([ordered]@{ RunId = $Id; Pid = $PID; BootId = (Get-BootId); Started = (Get-Date).ToUniversalTime().ToString('s') })
 }
 
 # After an unexpected reboot, keep what explains it: the bugcheck event and the newest dump.
@@ -740,6 +776,47 @@ function Invoke-Resume {
                 $result = 'failed'
             }
             $state.Result = $result; $state.Stages = @($script:stages)
+            if ($result -eq 'passed' -and [int]$state.LowResMinutes -gt 0) {
+                Set-VerifierLowResources
+                Request-Reboot $state 'L' 'turning on low resources simulation'
+            }
+            Clear-VerifierPersistent
+            Request-Reboot $state 'C' 'switching driver verifier off'
+        }
+        if ($state.Phase -eq 'L') {
+            try {
+                Invoke-Stage 'lowres-active' {
+                    $waitEnd = (Get-Date).AddSeconds(180)
+                    $now = Get-VerifierState
+                    while (!$now.Listed -and (Get-Date) -lt $waitEnd) { Start-Sleep -Seconds 5; $now = Get-VerifierState }
+                    if (!$now.Listed) { throw 'Driver Verifier is not tracking chmlink.sys after the reboot.' }
+                    $state.LowIdleAllocations = $now.CurrentAllocations; $state.LowIdleBytes = $now.CurrentBytes
+                    Write-Log ("low resources simulation armed. Idle driver: {0} live allocations, {1} bytes" -f $now.CurrentAllocations, $now.CurrentBytes)
+                    Save-RunState $state
+                    # Faults start one minute after boot; the suite must run inside that window.
+                    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+                    $armed = $boot.AddSeconds(75)
+                    if ((Get-Date) -lt $armed) { Start-Sleep -Seconds ([int][math]::Ceiling(($armed - (Get-Date)).TotalSeconds)) }
+                }
+                Invoke-Stage 'lowres-stress' { & $suite 'lowres' (Join-Path $out 'lowres') ([int]$state.LowResMinutes * 60 + 900) ([string][int]$state.LowResMinutes) }
+                Invoke-Stage 'lowres-leaks' {
+                    $stats = Get-VerifierStatistics
+                    Write-Log ("fault injection: {0} of {1} pool allocations failed deliberately (counters {2})" -f $stats.FailedDeliberately, $stats.Attempted, $stats.Raw)
+                    # A run in which nothing was failed proves nothing about the failure paths.
+                    if ($stats.FailedDeliberately -eq 0) { throw 'Driver Verifier injected no allocation failures; the low resources suite did not exercise any failure path.' }
+                    $after = Get-VerifierState
+                    Write-Log ("after fault injection: {0} live allocations, {1} bytes (idle at boot: {2}, {3} bytes)" -f `
+                        $after.CurrentAllocations, $after.CurrentBytes, $state.LowIdleAllocations, $state.LowIdleBytes)
+                    if ($after.CurrentAllocations -gt $state.LowIdleAllocations -or $after.CurrentBytes -gt $state.LowIdleBytes) {
+                        throw ("chmlink.sys holds {0} allocations / {1} bytes after the fault-injection suite, {2} / {3} when idle: a failure path leaks." -f `
+                            $after.CurrentAllocations, $after.CurrentBytes, $state.LowIdleAllocations, $state.LowIdleBytes)
+                    }
+                }
+            } catch {
+                Write-Log "phase L failed: $($_.Exception.Message)"
+                $result = 'failed'
+            }
+            $state.Result = $result; $state.Stages = @($script:stages)
             Clear-VerifierPersistent
             Request-Reboot $state 'C' 'switching driver verifier off'
         }
@@ -792,7 +869,8 @@ function Invoke-Run {
     $out = Join-Path $script:runDir 'out'
     New-Item -ItemType Directory -Force $out | Out-Null
     $stressMinutes = if ($StressMinutes -gt 0) { $StressMinutes } elseif ($config.NightlyStressMinutes) { [int]$config.NightlyStressMinutes } else { 20 }
-    $laneMinutes = switch ($Lane) { 'full' { 75 } 'nightly' { 40 + $stressMinutes } default { 30 } }
+    $lowResMinutes = if ($LowResMinutes -ge 0) { $LowResMinutes } elseif ($null -ne $config.NightlyLowResMinutes) { [int]$config.NightlyLowResMinutes } else { 10 }
+    $laneMinutes = switch ($Lane) { 'full' { 75 } 'nightly' { 40 + $stressMinutes + $(if ($lowResMinutes) { $lowResMinutes + 15 } else { 0 }) } default { 30 } }
     $script:deadline = (Get-Date).AddMinutes($laneMinutes)
     $started = Get-Date
     $result = 'failed'; $vmClean = $true; $handedOver = $false
@@ -834,6 +912,9 @@ function Invoke-Run {
         Invoke-Stage 'build-driver' {
             Invoke-Process 'build driver' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`" -KitRoot `"{1}`" -Output `"{2}`" -Analyze" -f `
                 (Join-Path $script:srcDir 'tools\build-driver.ps1'), $config.WdkRoot, (Join-Path $script:srcDir 'build\driver')) 900 $script:srcDir
+            # Kept with the results: a live dump or minidump of this run is only readable with it.
+            $pdb = Join-Path $script:srcDir 'build\driver\chmlink.pdb'
+            if (Test-Path -LiteralPath $pdb) { Copy-Item -LiteralPath $pdb (Join-Path $out 'chmlink.pdb') -Force }
         }
         Invoke-Stage 'sign' {
             New-Item -ItemType Directory -Force $signed | Out-Null
@@ -893,7 +974,8 @@ function Invoke-Run {
             # survives the reboot. Order matters (see Request-Reboot): state, task, verifier, reboot.
             $state = [pscustomobject]@{
                 Lane = $Lane; Phase = 'B'; ExpectedReboot = $false; BootIdBeforeReboot = ''; Result = ''
-                StressMinutes = $stressMinutes; StartedUtc = $started.ToUniversalTime().ToString('s')
+                StressMinutes = $stressMinutes; LowResMinutes = $lowResMinutes; LowIdleAllocations = -1; LowIdleBytes = -1
+                StartedUtc = $started.ToUniversalTime().ToString('s')
                 DeadlineUtc = $script:deadline.ToUniversalTime().ToString('o')
                 CandidateOem = $script:candidateOem; DriverVersion = $script:driverVersion
                 Stages = @($script:stages); Crashed = $false; ExtraRebootDone = $false

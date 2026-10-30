@@ -28,8 +28,10 @@ tools/ci/vm-run.sh init --baseline-dir 'C:\path\on\vm\to\signed'   # once; see "
 tools/ci/vm-run.sh doctor                    # is the VM ready?
 tools/ci/vm-run.sh run smoke                 # HEAD: build, ctest, install, lifecycle, IP   (~70 s)
 tools/ci/vm-run.sh run full                  # smoke + 3x benchmark gated on the baseline    (~6.5 min)
-tools/ci/vm-run.sh run nightly               # smoke + the driver under Driver Verifier, two reboots (~7 min with --stress-minutes 1)
-tools/ci/vm-run.sh run nightly --stress-minutes 20   # longer stress; default 20, or NightlyStressMinutes in C:\ci\config.json
+tools/ci/vm-run.sh run nightly               # smoke + Driver Verifier + fault injection, three reboots
+tools/ci/vm-run.sh run nightly --stress-minutes 1 --lowres-minutes 3   # quick version (~12 min)
+#   defaults: 20 stress minutes, 10 fault-injection minutes (0 skips it), or NightlyStressMinutes /
+#   NightlyLowResMinutes in C:\ci\config.json
 tools/ci/vm-run.sh renew-cert                # new test certificate; re-signs and re-installs the baseline
 tools/ci/vm-run.sh run smoke --commit abc123 # any commit; the CI scripts are always this checkout's
 tools/ci/vm-run.sh run smoke --worktree      # include uncommitted and untracked files
@@ -65,6 +67,14 @@ pool allocations and bytes with the idle values taken right after boot; any grow
 setting is then cleared and a second reboot lands in phase C, which restores the baseline driver and writes
 `summary.json`. Throughput is never compared with the baseline here, since Verifier slows the data path.
 
+When phase B passed and `--lowres-minutes` is not 0, it switches to the standard checks plus **randomized low
+resources simulation** (`0x4`, 6% of the driver's allocations failed from one minute after boot) and reboots
+into phase L instead. `tools/test-lowres.ps1` then repeats, until the time is up: create an adapter, fuzz it in
+tolerant mode while disabling and enabling it, remove it. Operations may fail; each PnP step runs with a
+deadline, so a hang fails the run, and every adapter must still be removable. Phase L passes only if Verifier
+reports deliberately failed allocations (otherwise no failure path ran) and the driver's live allocations are
+back at the boot-idle level. It then clears Verifier and reboots into phase C.
+
 - An unexpected reboot or bugcheck in phase B is recognised by the boot id; the run records the bugcheck
   events and the newest minidump in `crash.json`, fails, and goes to phase C.
 - After `abort` run `restore`: it also removes the startup task and the persistent setting, so that no later
@@ -73,8 +83,25 @@ setting is then cleared and a second reboot lands in phase C, which restores the
   off, stops tracking a driver that is reloaded, and misses `DriverEntry`. The persistent form needs the reboot.
 - The startup task starts seconds after boot, before PnP has loaded the adapter driver, so phase B waits up
   to 3 minutes for it to appear in `verifier /query`. `verifier /query` is localised; it is parsed by structure.
-- Not covered: low-resources simulation (`0x4`, `0x40000`) is off, as the driver is not written to survive
-  deliberate allocation failures yet.
+- `verifier /faults` and `verifier /flags` each reset the other's settings; the CI sets the flags and then
+  writes `VerifierFaultProbability` and `VerifierFaultBootMinutes` directly.
+- Not covered: systematic low resources simulation (`0x40000`) and NDIS/WiFi verification (`0x200000`).
+
+### IOCTL fuzzing
+
+`chmlink-ioctl-fuzz` (`tests/windows_ioctl_fuzz.c`) issues raw requests below the SDK: the four contract
+codes and foreign ones, edge lengths, mutated batches, wrong handle types for the read event, bad user
+buffers, read/write/cancel. Workers share one session's file object and close their handles at random, so
+`IRP_MJ_CLEANUP` races requests in flight; an inspection thread opens and closes read-only handles. In strict
+mode every result must be the one the dispatch code assigns, and an injected batch must be accepted exactly
+when `chmlink_batch_validate` accepts it. `--tolerant` (the adapter churns, or faults are injected) keeps only
+"nothing invalid succeeds". The lifecycle suite runs it for `-FuzzSeconds` (20) strictly on one adapter and
+tolerantly on another that is disabled and enabled meanwhile. A failure prints the seed; `--seed N` replays
+the request sequence (thread timing differs).
+
+The driver build writes `chmlink.pdb`; each run keeps it in its results, since a live dump or minidump of
+that run is only readable with it. `LiveKernelReports` dumps that NDIS writes for a stuck callback are
+deleted once Windows Error Reporting has processed them; copy them out early.
 
 ### Certificate renewal
 
@@ -153,6 +180,10 @@ suppression in `driver/adapter.c` (C28197, reference-counted release) is documen
   drive. Defaults are computed in the script body instead; `test_ci.py` enforces it.
 - PowerShell 5.1 reads files in the system code page unless told otherwise. JSON written by these scripts
   is UTF-8 and read as UTF-8; `compare_bench.py` also accepts an older GBK `environment.json`.
+- **A run lock records the boot.** After a reboot the pid in the lock file can name an unrelated process;
+  a lock from an earlier boot is stale.
+- `Start-Process -PassThru` in PowerShell 5.1 reports no `ExitCode` unless `.Handle` was read while the
+  process ran.
 - **PowerShell unwinds on shutdown.** Windows signals processes at shutdown and `catch`/`finally` blocks then
   run; a run that cleaned up there undid its own verifier handover. After a requested reboot those blocks
   only wait to be stopped.
