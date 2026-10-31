@@ -34,7 +34,7 @@ static void put16(uint8_t *p, uint16_t value)
 
 /* Echo only the test UDP datagram. The output is a complete raw-IP packet,
  * with endpoints reversed and IPv6's mandatory UDP checksum calculated. */
-static size_t make_reply(const uint8_t *packet, size_t length, uint8_t *out,
+static size_t make_reply(const uint8_t *packet, size_t length, uint8_t *out, uint32_t limit,
                          const uint8_t *local4, const uint8_t *peer4,
                          const uint8_t *local6, const uint8_t *peer6)
 {
@@ -43,7 +43,8 @@ static size_t make_reply(const uint8_t *packet, size_t length, uint8_t *out,
     uint16_t checksum;
     uint32_t sum;
     uint8_t saved[16];
-    if (!chmlink_ip_packet_valid(packet, length, 1500)) return 0;
+    /* Fragments are not echoed: a datagram up to the MTU must arrive whole. */
+    if (!chmlink_ip_packet_valid(packet, length, limit)) return 0;
     if (version == 4) {
         header = (packet[0] & 15u) * 4u;
         if (packet[9] != IPPROTO_UDP || (packet[6] & 0x3f) || packet[7] ||
@@ -120,6 +121,61 @@ static void check_ethernet_isolation(chmlink_adapter *ethernet, uint8_t *buffer)
     }
 }
 
+typedef struct exchange_args {
+    chmlink_adapter *adapter, *ethernet;
+    uint8_t *batch, *ethernet_batch;
+    SOCKET s4, s6;
+    struct sockaddr_in *local4, *peer4;
+    struct sockaddr_in6 *local6, *peer6;
+    uint32_t limit;
+} exchange_args;
+
+/* Send a UDP datagram of `size4` bytes over IPv4 and `size6` over IPv6
+ * (marker first), echo them back through the adapter, and require both to
+ * come back whole. */
+static void exchange(const exchange_args *x, size_t size4, size_t size6)
+{
+    static uint8_t reply[CHMLINK_PACKET_MAX_SIZE], encoded[CHMLINK_PACKET_MAX_SIZE + 64];
+    static uint8_t data[65536], incoming[65536];
+    chmlink_batch_writer writer;
+    ULONGLONG deadline;
+    int got4 = 0, got6 = 0;
+    size_t i;
+    for (i = 0; i < sizeof(data); ++i) data[i] = (uint8_t)(i * 13 + 5);
+    memcpy(data, marker, sizeof(marker));
+    REQUIRE(sendto(x->s4, (const char *)data, (int)size4, 0, (struct sockaddr *)x->peer4, sizeof(*x->peer4)) == (int)size4);
+    REQUIRE(sendto(x->s6, (const char *)data, (int)size6, 0, (struct sockaddr *)x->peer6, sizeof(*x->peer6)) == (int)size6);
+    deadline = GetTickCount64() + 10000;
+    while ((!got4 || !got6) && GetTickCount64() < deadline) {
+        uint32_t bytes, count, k, offset = CHMLINK_BATCH_HEADER_SIZE;
+        int n;
+        if (chmlink_receive(x->adapter, x->batch, CHMLINK_BATCH_MAX_SIZE, &bytes)) {
+            REQUIRE(chmlink_batch_validate(x->batch, bytes, CHMLINK_MODE_IP, x->limit, &count) == CHMLINK_OK);
+            for (k = 0; k < count; ++k) {
+                uint32_t length = get32(x->batch + offset); size_t reply_length;
+                offset += 4;
+                reply_length = make_reply(x->batch + offset, length, reply, x->limit,
+                    (const uint8_t *)&x->local4->sin_addr, (const uint8_t *)&x->peer4->sin_addr,
+                    (const uint8_t *)&x->local6->sin6_addr, (const uint8_t *)&x->peer6->sin6_addr);
+                offset += (length + 3u) & ~3u;
+                if (!reply_length) continue;
+                REQUIRE(chmlink_batch_begin(&writer, encoded, sizeof(encoded), CHMLINK_MODE_IP, x->limit) == CHMLINK_OK);
+                REQUIRE(chmlink_batch_append(&writer, reply, reply_length) == CHMLINK_OK);
+                REQUIRE(chmlink_inject(x->adapter, encoded, (uint32_t)writer.length));
+            }
+        } else REQUIRE(GetLastError() == ERROR_NO_MORE_ITEMS);
+        if (x->ethernet) check_ethernet_isolation(x->ethernet, x->ethernet_batch);
+        n = recvfrom(x->s4, (char *)incoming, sizeof(incoming), 0, NULL, NULL);
+        if (n >= 0) { REQUIRE((size_t)n == size4 && !memcmp(incoming, data, size4)); got4 = 1; }
+        else REQUIRE(WSAGetLastError() == WSAEWOULDBLOCK);
+        n = recvfrom(x->s6, (char *)incoming, sizeof(incoming), 0, NULL, NULL);
+        if (n >= 0) { REQUIRE((size_t)n == size6 && !memcmp(incoming, data, size6)); got6 = 1; }
+        else REQUIRE(WSAGetLastError() == WSAEWOULDBLOCK);
+        if (!got4 || !got6) Sleep(10);
+    }
+    REQUIRE(got4 && got6);
+}
+
 int main(int argc, char **argv)
 {
     WSADATA wsa;
@@ -128,13 +184,11 @@ int main(int argc, char **argv)
     struct sockaddr_in6 local6 = {0}, peer6 = {0};
     chmlink_adapter *adapter, *ethernet = NULL;
     chmlink_adapter_info info;
-    uint8_t *batch, *ethernetBatch = NULL, reply[1500], encoded[1532], incoming[64];
-    chmlink_batch_writer writer;
+    uint8_t *batch, *ethernetBatch = NULL;
+    exchange_args x;
     unsigned long index, nonblocking = 1;
     char *end;
     DWORD if4, if6;
-    ULONGLONG deadline;
-    int got4 = 0, got6 = 0;
     if (argc != 6 && argc != 7) {
         fprintf(stderr, "Usage: chmlink-ip-test <ifIndex> <local4> <peer4> <local6> <peer6> [ethernet-ifIndex]\n"); return 2;
     }
@@ -150,7 +204,13 @@ int main(int argc, char **argv)
     if (IN6_IS_ADDR_LINKLOCAL(&peer6.sin6_addr)) peer6.sin6_scope_id = (ULONG)index;
     peer4.sin_port = peer6.sin6_port = htons(49381);
     adapter = chmlink_open((uint32_t)index); REQUIRE(adapter != NULL);
-    REQUIRE(chmlink_query(adapter, &info) && info.mode == CHMLINK_MODE_IP && info.packet_limit <= sizeof(reply));
+    REQUIRE(chmlink_query(adapter, &info) && info.mode == CHMLINK_MODE_IP && info.packet_limit == info.mtu);
+    {
+        /* tools/test-ip.ps1 passes the MTU it configured. */
+        char expected[16];
+        if (GetEnvironmentVariableA("CHMLINK_TEST_MTU", expected, sizeof(expected)) != 0)
+            REQUIRE(info.mtu == (uint32_t)strtoul(expected, NULL, 10));
+    }
     if (argc == 7) {
         unsigned long ethernetIndex;
         errno = 0; ethernetIndex = strtoul(argv[6], &end, 10);
@@ -170,37 +230,16 @@ int main(int argc, char **argv)
     REQUIRE(setsockopt(s6, IPPROTO_IPV6, IPV6_UNICAST_IF, (const char *)&if6, sizeof(if6)) == 0);
     REQUIRE(bind(s4, (struct sockaddr *)&local4, sizeof(local4)) == 0 && bind(s6, (struct sockaddr *)&local6, sizeof(local6)) == 0);
     REQUIRE(ioctlsocket(s4, FIONBIO, &nonblocking) == 0 && ioctlsocket(s6, FIONBIO, &nonblocking) == 0);
-    REQUIRE(sendto(s4, (const char *)marker, sizeof(marker), 0, (struct sockaddr *)&peer4, sizeof(peer4)) == sizeof(marker));
-    REQUIRE(sendto(s6, (const char *)marker, sizeof(marker), 0, (struct sockaddr *)&peer6, sizeof(peer6)) == sizeof(marker));
-    deadline = GetTickCount64() + 10000;
-    while ((!got4 || !got6) && GetTickCount64() < deadline) {
-        uint32_t bytes, count, i, offset = CHMLINK_BATCH_HEADER_SIZE;
-        int n;
-        if (chmlink_receive(adapter, batch, CHMLINK_BATCH_MAX_SIZE, &bytes)) {
-            REQUIRE(chmlink_batch_validate(batch, bytes, CHMLINK_MODE_IP, info.packet_limit, &count) == CHMLINK_OK);
-            for (i = 0; i < count; ++i) {
-                uint32_t length = get32(batch + offset); size_t reply_length;
-                offset += 4;
-                reply_length = make_reply(batch + offset, length, reply,
-                    (const uint8_t *)&local4.sin_addr, (const uint8_t *)&peer4.sin_addr,
-                    (const uint8_t *)&local6.sin6_addr, (const uint8_t *)&peer6.sin6_addr);
-                offset += (length + 3u) & ~3u;
-                if (!reply_length) continue;
-                REQUIRE(chmlink_batch_begin(&writer, encoded, sizeof(encoded), CHMLINK_MODE_IP, info.packet_limit) == CHMLINK_OK);
-                REQUIRE(chmlink_batch_append(&writer, reply, reply_length) == CHMLINK_OK);
-                REQUIRE(chmlink_inject(adapter, encoded, (uint32_t)writer.length));
-            }
-        } else REQUIRE(GetLastError() == ERROR_NO_MORE_ITEMS);
-        if (ethernet) check_ethernet_isolation(ethernet, ethernetBatch);
-        n = recvfrom(s4, (char *)incoming, sizeof(incoming), 0, NULL, NULL);
-        if (n >= 0) { REQUIRE(n == sizeof(marker) && !memcmp(incoming, marker, sizeof(marker))); got4 = 1; }
-        else REQUIRE(WSAGetLastError() == WSAEWOULDBLOCK);
-        n = recvfrom(s6, (char *)incoming, sizeof(incoming), 0, NULL, NULL);
-        if (n >= 0) { REQUIRE(n == sizeof(marker) && !memcmp(incoming, marker, sizeof(marker))); got6 = 1; }
-        else REQUIRE(WSAGetLastError() == WSAEWOULDBLOCK);
-        if (!got4 || !got6) Sleep(10);
+    {
+        int big = 0;
+        x.adapter = adapter; x.ethernet = ethernet; x.ethernet_batch = ethernetBatch; x.batch = batch;
+        x.s4 = s4; x.s6 = s6; x.peer4 = &peer4; x.peer6 = &peer6; x.local4 = &local4; x.local6 = &local6;
+        x.limit = info.packet_limit;
+        exchange(&x, sizeof(marker), sizeof(marker));
+        /* A datagram that fills the MTU exactly crosses the adapter as one packet. */
+        if (info.mtu > 1500) { exchange(&x, info.mtu - 28, info.mtu - 48); big = 1; }
+        printf("mtu %u%s\n", info.mtu, big ? ": full-size IPv4 and IPv6 datagrams passed unfragmented" : "");
     }
-    REQUIRE(got4 && got6);
     if (ethernet) {
         ULONGLONG endIsolation = GetTickCount64() + 250;
         while (GetTickCount64() < endIsolation) { check_ethernet_isolation(ethernet, ethernetBatch); Sleep(10); }

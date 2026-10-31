@@ -21,6 +21,8 @@ $owner = [guid]'3F6B2D7E-91A4-4C58-B0E2-7A1D5C9E4B36'
 $local = '198.18.0.1'; $peer = '198.18.0.2'; $alias = '198.18.0.3'
 # The Ethernet-mode adapter for the offload TCP benchmark gets its own subnet.
 $ethLocal = '198.18.1.1'; $ethPeer = '198.18.1.2'; $ethAlias = '198.18.1.3'
+# An IP adapter with the largest MTU, on a third subnet.
+$bigLocal = '198.18.2.1'; $bigPeer = '198.18.2.2'; $bigAlias = '198.18.2.3'
 $devices = @(); $exitCode = 1
 function Run-Device([string[]]$Arguments) {
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -38,7 +40,7 @@ try {
     if (!(Test-Path -LiteralPath $tool) -or !(Test-Path -LiteralPath $bench)) { throw 'Build chmlink-bench and the device tool first.' }
     if (Test-Path -LiteralPath $OutputDirectory) { throw 'Use a fresh output directory.' }
     $output = New-Item -ItemType Directory -Path $OutputDirectory
-    foreach ($ip in @($local, $peer, $alias, $ethLocal, $ethPeer, $ethAlias)) {
+    foreach ($ip in @($local, $peer, $alias, $ethLocal, $ethPeer, $ethAlias, $bigLocal, $bigPeer, $bigAlias)) {
         if (Get-NetIPAddress -IPAddress $ip -ErrorAction SilentlyContinue) { throw "Benchmark address already assigned: $ip" }
     }
     $inf = (Resolve-Path -LiteralPath $InfPath).Path
@@ -85,6 +87,27 @@ try {
         if (!(Test-Path -LiteralPath $tcpBench)) { throw 'Build chmlink-tcp-bench first.' }
         # IP mode: Windows uses no task offloads there, so one plain run.
         Invoke-Bench $tcpBench "$index $local $peer $alias $Seconds 4" 'TCP benchmark (IP mode)' ([int]($Seconds * 4 + 60))
+
+        # IP mode at MTU 65535: the stack sends packets up to 64 KiB, and the
+        # reflector cuts them to 1500 bytes (chmlink_ip_split) before injecting,
+        # as an application tunnelling over a 1500-byte path would.
+        $big = Run-Device @('create', $inf, '--owner', $owner.ToString('B'), '--mode', 'ip', '--mtu', '65535', '--name', 'ChmLink Bench IP 64K') | ConvertFrom-Json
+        $devices += $big
+        if ($deviceRestart) { throw 'Device installation requires a restart; stopping before the benchmark.' }
+        $bigWindows = @(Get-CimInstance Win32_NetworkAdapter | Where-Object PNPDeviceID -eq $big.InstanceId)
+        if ($bigWindows.Count -ne 1 -or !$bigWindows[0].GUID) { throw 'Large-MTU test interface is not ready.' }
+        $bigAdapter = @(Get-NetAdapter -IncludeHidden | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$bigWindows[0].GUID })
+        if ($bigAdapter.Count -ne 1) { throw 'Cannot resolve the unique large-MTU test adapter.' }
+        $bigIndex = $bigAdapter[0].ifIndex
+        Set-NetIPInterface -InterfaceIndex $bigIndex -AddressFamily IPv4 -Dhcp Disabled -PolicyStore ActiveStore
+        New-NetIPAddress -InterfaceIndex $bigIndex -IPAddress $bigLocal -PrefixLength 24 -PolicyStore ActiveStore | Out-Null
+        Start-Sleep -Seconds 3
+        Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 4" 'TCP benchmark (IP mode, MTU 65535)' ([int]($Seconds * 4 + 60))
+        # The same packets injected whole: the bound for a tunnel that carries
+        # large packets end to end (tcp_mtu65535_whole_*).
+        $env:CHMLINK_BENCH_NO_SPLIT = '1'
+        try { Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 4" 'TCP benchmark (IP mode, MTU 65535, unsplit)' ([int]($Seconds * 4 + 60)) }
+        finally { Remove-Item Env:CHMLINK_BENCH_NO_SPLIT }
 
         # Ethernet mode: without and with offloads. The reflector answers ARP itself.
         $eth = Run-Device @('create', $inf, '--owner', $owner.ToString('B'), '--mode', 'ethernet', '--name', 'ChmLink Bench Ethernet') | ConvertFrom-Json

@@ -59,6 +59,16 @@ static const uint8_t g_peer_mac[6] = { 0x02, 0x00, 0x5e, 0x10, 0x00, 0x01 };
 static const uint8_t g_drop_mac[6] = { 0x02, 0x00, 0x5e, 0x10, 0x00, 0xff };
 static uint8_t arp_replies[8][42];
 static int arp_count;
+
+/* IP mode with an MTU above 1500: the stack hands over packets up to the MTU,
+ * and the reflector cuts them to 1500 bytes with chmlink_ip_split before it
+ * injects them, as a tunnel with a 1500-byte path would. With
+ * CHMLINK_BENCH_NO_SPLIT=1 it injects them whole instead, as a tunnel that
+ * carries large packets (a stream transport between two large-MTU adapters). */
+#define SPLIT_MTU 1500u
+static int g_split;
+static char g_prefix[32] = "";
+static volatile LONG64 injected_packets;
 static LARGE_INTEGER qpf;
 
 static uint16_t fold(uint32_t sum)
@@ -291,7 +301,45 @@ typedef struct reflector {
     chmlink_adapter *adapter;
     uint32_t limit;
     uint8_t *fallback, *scratch;
+    chmlink_batch_writer out;   /* split packets waiting to be injected */
+    uint32_t ipv6_id;
 } reflector;
+
+/* Inject a batch, waiting while the ring is full. */
+static void inject_all(reflector *r, const uint8_t *batch, uint32_t length)
+{
+    while (!chmlink_inject(r->adapter, batch, length) && GetLastError() == ERROR_BUFFER_OVERFLOW && !stop_reflector)
+        SwitchToThread();
+}
+
+static int append_split(const uint8_t *segment, size_t length, void *context)
+{
+    reflector *r = context;
+    if (chmlink_batch_append(&r->out, segment, length) != CHMLINK_OK) {
+        inject_all(r, r->fallback, (uint32_t)r->out.length);
+        REQUIRE(chmlink_batch_begin(&r->out, r->fallback, CHMLINK_BATCH_MAX_SIZE, CHMLINK_MODE_IP, r->limit) == CHMLINK_OK);
+        REQUIRE(chmlink_batch_append(&r->out, segment, length) == CHMLINK_OK);
+    }
+    InterlockedIncrement64(&injected_packets);
+    return 1;
+}
+
+/* The rewritten batch, cut to SPLIT_MTU and injected as one or more batches. */
+static void inject_split(reflector *r, const uint8_t *batch)
+{
+    chmlink_batch_reader reader;
+    const uint8_t *packet;
+    uint32_t size;
+    chmlink_offload descriptor;
+    REQUIRE(chmlink_batch_begin(&r->out, r->fallback, CHMLINK_BATCH_MAX_SIZE, CHMLINK_MODE_IP, r->limit) == CHMLINK_OK);
+    chmlink_batch_read_begin(&reader, batch);
+    while (chmlink_batch_read_next(&reader, &packet, &size, &descriptor)) {
+        chmlink_result result = chmlink_ip_split((uint8_t *)packet, size, SPLIT_MTU, r->ipv6_id++,
+                                                 r->scratch, 128 * 1024, append_split, r);
+        REQUIRE(result == CHMLINK_OK || result == CHMLINK_TOO_BIG);   /* too big: dropped, as a link would */
+    }
+    if (r->out.count != 0) inject_all(r, r->fallback, (uint32_t)r->out.length);
+}
 
 static DWORD WINAPI reflector_thread(void *arg)
 {
@@ -308,6 +356,14 @@ static DWORD WINAPI reflector_thread(void *arg)
         }
         idle = 0;
         if (!rewrite_batch(buffer, bytes, &count, &payload)) continue;
+        if (g_split) {
+            inject_split(r, buffer);
+            InterlockedAdd64(&reflected_packets, count);
+            InterlockedAdd64(&reflected_bytes, payload);
+            InterlockedIncrement64(&reflected_batches);
+            continue;
+        }
+        InterlockedAdd64(&injected_packets, count);
         /* Packets the rewrite did not recognise (IPv6 neighbour traffic, say) go back unchanged;
          * the stack drops them. Injection failing under load is a dropped batch, like a full link. */
         while (!chmlink_inject(r->adapter, buffer, bytes)) {
@@ -396,7 +452,7 @@ static void run(chmlink_adapter *a, const chmlink_adapter_info *info, int count,
     HANDLE threads[2 * MAX_STREAMS];
     LARGE_INTEGER t0, t1;
     FILETIME i0, k0, u0, i1, k1, u1;
-    LONG64 packets0, bytes0, batches0, gso0, csum0, verified0, segments0, received = 0;
+    LONG64 packets0, bytes0, batches0, gso0, csum0, verified0, segments0, injected0, received = 0;
     double wall;
     int i;
     (void)info;
@@ -435,7 +491,7 @@ static void run(chmlink_adapter *a, const chmlink_adapter_info *info, int count,
     Sleep(200);
     packets0 = reflected_packets; bytes0 = reflected_bytes; batches0 = reflected_batches;
     gso0 = gso_packets; csum0 = csum_partial; InterlockedExchange(&max_packet, 0);
-    verified0 = verified_packets; segments0 = verified_segments;
+    verified0 = verified_packets; segments0 = verified_segments; injected0 = injected_packets;
     REQUIRE(GetSystemTimes(&i0, &k0, &u0));
     QueryPerformanceCounter(&t0);
     InterlockedExchange(&stop_traffic, 0);
@@ -454,12 +510,13 @@ static void run(chmlink_adapter *a, const chmlink_adapter_info *info, int count,
         printf("{\"event\":\"result\",\"scenario\":\"tcp_%s%dstream%s%s\",\"seconds\":%.2f,\"goodput_mbps\":%.1f,"
                "\"adapter_pps\":%.0f,\"avg_packet_bytes\":%.0f,\"packets_per_batch\":%.1f,\"busy_cores\":%.2f,"
                "\"gso_packets\":%lld,\"csum_partial\":%lld,\"max_packet\":%ld,"
-               "\"verified_packets\":%lld,\"verified_segments\":%lld,\"errors\":%lld}\n",
-               g_eth ? "eth_" : "", count, count == 1 ? "" : "s", suffix, wall, (double)received * 8 / wall / 1e6,
+               "\"verified_packets\":%lld,\"verified_segments\":%lld,\"injected_pps\":%.0f,\"errors\":%lld}\n",
+               g_prefix, count, count == 1 ? "" : "s", suffix, wall, (double)received * 8 / wall / 1e6,
                (double)packets / wall, packets ? (double)bytes / (double)packets : 0.0,
                batches ? (double)packets / (double)batches : 0.0, busy_cores(i0, k0, u0, i1, k1, u1, wall),
                (long long)(gso_packets - gso0), (long long)(csum_partial - csum0), (long)max_packet,
                (long long)(verified_packets - verified0), (long long)(verified_segments - segments0),
+               (double)(injected_packets - injected0) / wall,
                (long long)verify_failures);
         fflush(stdout);
     }
@@ -494,6 +551,14 @@ int main(int argc, char **argv)
     a = chmlink_open((uint32_t)strtoul(argv[1], NULL, 10)); REQUIRE(a != NULL);
     REQUIRE(chmlink_query(a, &info));
     g_eth = info.mode == CHMLINK_MODE_ETHERNET;
+    g_split = !g_eth && info.mtu > SPLIT_MTU;
+    {
+        char text[8];
+        int whole = GetEnvironmentVariableA("CHMLINK_BENCH_NO_SPLIT", text, sizeof(text)) != 0 && text[0] == '1';
+        if (g_eth) strcpy(g_prefix, "eth_");
+        else if (g_split && whole) { g_split = 0; sprintf(g_prefix, "mtu%u_whole_", info.mtu); }
+        else if (g_split) sprintf(g_prefix, "mtu%u_", info.mtu);
+    }
     memcpy(g_mac, info.mac, 6);
     r.adapter = a; r.limit = info.packet_limit;
     r.fallback = malloc(CHMLINK_BATCH_MAX_SIZE);
