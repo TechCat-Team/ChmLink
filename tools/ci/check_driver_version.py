@@ -22,14 +22,17 @@ INF = "driver/chmlink.inf"
 # (include/chmlink/api.h, src/windows, tools, tests) do not change the driver.
 DRIVER_FILES = (
     "driver/",
-    "src/queue/",
+    "src/ring/",
     "src/protocol/",
     "src/packet/",
     "include/chmlink/config.h",
     "include/chmlink/device.h",
+    "include/chmlink/offload.h",
     "include/chmlink/packet.h",
     "include/chmlink/protocol.h",
     "include/chmlink/query.h",
+    "include/chmlink/ring.h",
+    "include/chmlink/session.h",
     "include/chmlink/version.h",
 )
 

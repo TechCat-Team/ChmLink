@@ -1,6 +1,137 @@
 {
   "_note": "Recorded from 3 repeats of 'vm-run.sh run full' on the VM. Re-record with compare_bench.py --update-baseline after an intended performance change, in the same commit as the change.",
   "profiles": {
+    "AMD Ryzen 9 9950X 16-Core Processor|4": {
+      "commit": "1966592",
+      "driver": "0.4.0.3",
+      "recorded": "2026-10-31T16:19:05Z",
+      "repeats": 3,
+      "scenarios": {
+        "duplex_64B": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 622959.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 454052.0
+        },
+        "latency": {
+          "lost": 0.0,
+          "max_us": 3247.6,
+          "p50_us": 35.7,
+          "p999_us": 463.8,
+          "p99_us": 187.4
+        },
+        "loopback_1400B": {
+          "loopback_pps": 278452.0
+        },
+        "loopback_512B": {
+          "loopback_pps": 281703.0
+        },
+        "loopback_64B": {
+          "loopback_pps": 268754.0
+        },
+        "rx_1400B_batch32": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 621674.0
+        },
+        "rx_512B_batch32": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 644608.0
+        },
+        "rx_64B_batch1": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 661401.0
+        },
+        "rx_64B_batch128": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 650023.0
+        },
+        "rx_64B_batch32": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 615984.0
+        },
+        "rx_64B_batch32_2injectors": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 647164.0
+        },
+        "rx_64B_batch8": {
+          "errors": 0.0,
+          "rx_loss_pct": 0.0,
+          "rx_pps": 654638.0
+        },
+        "tcp_1stream": {
+          "errors": 0.0,
+          "tcp_avg_packet": 1451.0,
+          "tcp_mbps": 20600.7
+        },
+        "tcp_4streams": {
+          "errors": 0.0,
+          "tcp_avg_packet": 1445.0,
+          "tcp_mbps": 16903.1
+        },
+        "tcp_eth_1stream": {
+          "errors": 0.0,
+          "tcp_avg_packet": 45005.0,
+          "tcp_mbps": 108239.9
+        },
+        "tcp_eth_1stream_nooffload": {
+          "errors": 0.0,
+          "tcp_avg_packet": 1466.0,
+          "tcp_mbps": 18704.2
+        },
+        "tcp_eth_4streams": {
+          "errors": 0.0,
+          "tcp_avg_packet": 46978.0,
+          "tcp_mbps": 64576.6
+        },
+        "tcp_eth_4streams_nooffload": {
+          "errors": 0.0,
+          "tcp_avg_packet": 1460.0,
+          "tcp_mbps": 16666.7
+        },
+        "tx_1400B": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 460019.0
+        },
+        "tx_1400B_stall20ms": {
+          "errors": 0.0,
+          "tx_drop_pct": 13.7964,
+          "tx_pps": 394248.0
+        },
+        "tx_512B": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 467969.0
+        },
+        "tx_512B_stall20ms": {
+          "errors": 0.0,
+          "tx_drop_pct": 7.2528,
+          "tx_pps": 435977.0
+        },
+        "tx_64B": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 468990.0
+        },
+        "tx_64B_4senders": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 1268632.0
+        },
+        "tx_64B_stall20ms": {
+          "errors": 0.0,
+          "tx_drop_pct": 0.0,
+          "tx_pps": 472673.0
+        }
+      }
+    },
     "AMD Ryzen 9 9950X 16-Core Processor|8": {
       "commit": "e9d44d27",
       "driver": "0.3.1.0",

@@ -25,7 +25,7 @@ support. The planned NDIS baseline is 6.60.
 - `include/chmlink/` — shared C interfaces.
 - `src/packet/` — packet validation, independent of Windows APIs.
 - `src/protocol/` — experimental batch framing, validation and the device query encoding.
-- `src/queue/` — the driver's transmit ring, portable so it can be tested off Windows.
+- `src/ring/` — the packet ring shared by the driver and the SDK, portable so it can be tested off Windows.
 - `driver/` — NDIS 6.60 miniport (Ethernet and raw IP) and INF package.
 - `src/windows/` — user-mode C interface.
 - `examples/` — small programs using the C interface.
@@ -100,9 +100,9 @@ minimum-version runtime coverage remain outstanding.
 
 ## Windows prototype
 
-The current SDK requires device interface version 3. It rejects older drivers
-without the metadata query instead of silently assuming compatible limits.
-Version 1 packet batches and the existing receive/inject IOCTL numbers are unchanged.
+The current SDK requires device interface version 4 (the shared-ring data path)
+and rejects other drivers instead of silently assuming compatible limits. The
+batch format is unchanged; batches are now an SDK convenience over the rings.
 `chmlink-list` enumerates accessible adapters and prints their GUID, state,
 capabilities and cumulative counters without connecting a data session.
 `chmlink_open_by_id` opens by interface GUID and checks the resolved identity;
@@ -115,6 +115,9 @@ kernel I/O request. Data arrival, pause, removal and session cleanup wake the
 waiter; state is rechecked after wakeup. One wait is allowed per session.
 Timeouts, cancellation and lifecycle errors are reported through GetLastError.
 Cancellation affects only the active wait. Readiness does not reserve packets.
+Before announcing that it sleeps, a wait polls the ring for a few tens of
+microseconds: at high packet rates the next packet usually arrives within that
+time, which spares the driver a wake-up per packet.
 The caller must prevent new SDK calls before closing and close exactly once;
 close wakes a waiter and drains in-progress calls before freeing resources.
 
@@ -138,18 +141,25 @@ Store (DIRID 13). The build validates the complete INF with `/u` and applies
 `/w` isolation checks from build 25319 onward.
 
 The current adapter has an MTU of 1500 and accepts inline Ethernet frames up
-to 1522 bytes, including VLAN headers but excluding FCS. Offloads are not
-advertised. Each adapter has an independent transmit queue (Windows to user
-mode) and one exclusive administrator/SYSTEM session. The queue is a 4 MiB byte
-ring holding at most 16384 packets: small packets are bounded by the count,
-full-size frames by the bytes (about 2700). A packet that does not fit is
-dropped and counted in `tx_queue_drops`. One `chmlink_receive` returns at most
-one batch, and the queue can hold more, so keep receiving until
-`ERROR_NO_MORE_ITEMS`; callers can wait for readiness instead of polling.
-The SDK issues its IOCTLs on an overlapped handle, so threads receiving and
-injecting on the same adapter do not serialize each other; each call still
-blocks until it completes. Packet injection honors the Windows
-packet filter and multicast list. Pausing drops queued frames and drains
+to 1522 bytes, including VLAN headers but excluding FCS. A session may ask for
+LSOv2, TCP/UDP checksum and RSC offloads; they stay off until it does. Offloads
+exist in Ethernet mode only: the Windows TCP/IP stack does not use task offloads
+on `NdisMediumIP` adapters (measured on build 26200 with the same configuration
+on both modes), so an IP adapter reports no `CHMLINK_CAP_OFFLOAD` and grants none.
+Coalesced segments injected with RSC must arrive as one TCP flow in order; the
+SDK's `chmlink_gso_segment` and `chmlink_offload_complete` turn offload records
+into plain packets for applications that want them. Each
+adapter has one exclusive administrator/SYSTEM session. The data path is a pair
+of shared-memory rings (`include/chmlink/ring.h`), 4 MiB per direction by
+default: the driver produces Windows traffic into one, and injects packets the
+application produces into the other, without a copy or a per-batch IOCTL. A
+packet that does not fit is dropped and counted in `tx_queue_drops`.
+`chmlink_receive` and `chmlink_inject` remain batch-shaped conveniences over the
+rings; `chmlink_inject` takes a whole batch or none of it (a full ring returns
+`ERROR_BUFFER_OVERFLOW` and the batch can be retried as is); `chmlink_receive_packet`, `chmlink_release_packet`,
+`chmlink_allocate_packet` and `chmlink_send_packet` are zero copy.
+Packet injection honors the Windows packet filter and multicast list. Pausing
+closes the rings, waits for every indicated packet to come back and drains
 active I/O; removing the device invalidates existing sessions.
 
 Install only a test-signed package in a disposable Windows test VM configured
@@ -358,19 +368,32 @@ cleanup is explicit and separate from upgrade and rollback.
 
 ## Performance
 
-`tests/windows_bench.c`, run through `tools/bench.ps1` on the test VM, measures an
-IP adapter in a VM on an AMD Ryzen 9 9950X host with 8 vCPUs, Windows 11 build
-26200. These are in-VM figures, not network figures: there is no encryption and
-no physical NIC. A single thread moves roughly 450k to 550k packets per second
-in each direction (about 5 Gbps with 1400-byte payloads), with 64-byte round
-trips at a median of about 60 microseconds and a 99th percentile of about 300.
-Both directions at once hold the same rates. A consumer stalled for 20 ms every
-100 ms loses well under 1% of 64-byte packets, about 7% of 512-byte ones and
-about 14% of 1400-byte ones, which is the limit of the 4 MiB queue. Run-to-run spread is up to about 14%.
-`tools/ci/vm-run.sh run full` compares a build with a recorded baseline.
+`tools/bench.ps1` runs `tests/windows_bench.c` and `tests/windows_tcp_bench.c` on
+the test VM (AMD Ryzen 9 9950X host, 4 vCPUs, Windows 11 build 26200, package
+0.4.0.3, medians of three runs). These are in-VM figures, not network figures:
+there is no encryption and no physical NIC.
 
-The data path uses one IOCTL per batch. A shared-memory ring would cut system
-calls and copies further; it would change the device contract and is not done.
+| scenario | shared rings (v2) | IOCTL batches (v1, 8 vCPUs) |
+|---|---|---|
+| UDP from Windows, one sender, 64 B | 469k pps | 460k pps |
+| UDP from Windows, four senders, 64 B | 1.27M pps (1.61M with 8 vCPUs) | 1.54M pps |
+| UDP to Windows, one injector, batches of 1 | 661k pps | 184k pps |
+| UDP to Windows, one injector, batches of 32 | 616k pps | 536k pps |
+| UDP to Windows, two injectors | 647k pps | 1.06M pps |
+| 64 B round trip, median / 99th percentile | 36 / 187 µs | 59 / 299 µs |
+| TCP through the stack, IP mode, one stream | 20.6 Gbps | about 1.6 Gbps (VM slow at the time) |
+| TCP, Ethernet mode, one stream, no offloads | 18.7 Gbps | — |
+| TCP, Ethernet mode, one stream, LSO + RSC | 108 Gbps (45 KB per packet) | — |
+| TCP, Ethernet mode, four streams, LSO + RSC | 64.6 Gbps | — |
+
+Packets to Windows are indicated by one driver thread per session, and the stack
+processes them on that thread, so that direction stops at about one core
+(650k pps) however many threads inject. v1 indicated from each injecting
+thread and reached 1.06M pps with two; spreading indications over several
+cores is the next piece of work. A consumer stalled for 20 ms every 100 ms
+still receives 86% to 100% of the offered rate, depending on packet size, with
+the default 4 MiB ring. `tools/ci/vm-run.sh run full` gates a build against the
+recorded baseline for the machine profile.
 
 ## Status
 
@@ -380,12 +403,14 @@ platform with sleep states, surprise-removal testing, and the Rust device I/O
 and agent integration. Sleep is reported to a session as
 `CHMLINK_STATE_LOW_POWER`, a system power-off as `CHMLINK_STATE_SHUTDOWN`
 (`ERROR_SHUTDOWN_IN_PROGRESS` from a wait), and a surprise removal as
-`CHMLINK_STATE_REMOVING`. Package 0.3.1.3 passed the nightly lane: lifecycle
-(with IOCTL fuzzing), IP and stress suites under standard Driver Verifier with
-NDIS verification, then adapter churn and fuzzing under randomized and under
+`CHMLINK_STATE_REMOVING`. Package 0.4.0.3 (shared rings and offloads) passed
+the smoke, full and nightly lanes: lifecycle (with IOCTL and ring-content
+fuzzing), IP and stress suites under standard Driver Verifier with NDIS
+verification, then adapter churn and fuzzing under randomized and under
 systematic low resources simulation (initialization failures included), with no
-leaked allocations, and reboots with a live session. The C interface and device
-contract are experimental.
+leaked allocations, and reboots with a live session. Packets to Windows are
+still limited to about one core per session (see Performance). The C interface
+and device contract are experimental.
 
 ## License
 

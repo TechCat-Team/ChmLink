@@ -110,7 +110,8 @@ make_run_id() {
 
 export_tree() {   # $1 = commit | worktree, $2 = output tar
     if [ "$1" = worktree ]; then
-        (cd "$REPO" && { git ls-files; git ls-files --others --exclude-standard; } | grep -v -E '^(docs|build|target)/' | sort -u > "$2.list" &&
+        (cd "$REPO" && { git ls-files; git ls-files --others --exclude-standard; } | grep -v -E '^(docs|build|target)/' | sort -u |
+            while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done > "$2.list" &&
             tar -cf "$2" -T "$2.list") || return 1
         rm -f "$2.list"
     else
@@ -231,6 +232,14 @@ finish() {
     rm -rf "$dest"
     if ! pull "$VM_ROOT_FWD/runs/$run_id/out" "$dest" 2>/dev/null; then
         mkdir -p "$dest"
+    fi
+    # attach may start before the summary exists and guess the lane; the pulled
+    # summary is authoritative, so a full run still gets its benchmark gate.
+    if [ -f "$dest/summary.json" ]; then
+        local recorded
+        recorded=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8-sig")).get("Lane", ""))' \
+            "$dest/summary.json" 2>/dev/null)
+        case $recorded in smoke|full|nightly) lane=$recorded ;; esac
     fi
     echo
     echo "results: $dest"

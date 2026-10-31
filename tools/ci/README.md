@@ -171,6 +171,17 @@ baseline by 0.5 points (receive loss: 0.1); errors must be zero. Measured run-to
 at most about 14% for throughput, so these are deliberately not tighter. If loopback UDP is more than 25%
 off its baseline the report warns that the machine itself is unusual; re-run before trusting a failure.
 
+The TCP benchmark (`chmlink-tcp-bench`) runs through the Windows stack on an IP adapter, then on an
+Ethernet adapter without and with task offloads (`tcp_eth_*_nooffload`, `tcp_eth_*`); IP mode has no
+offloads to compare. Goodput (`tcp_mbps`) may drop 20%; the average adapter packet size is reported. With
+offloads it also segments a sample of the stack's GSO packets and checks every segment independently
+(IPv4 and TCP checksums, sequence numbers, data); any failure counts as an error. `offload-state.txt` in
+each `bench-N` directory records what Windows reports for the Ethernet adapter's offloads in each half.
+A full ring when injecting is back-pressure, reported as `rx_inject_full_per_s`, not as an error.
+
+`vm-run.sh` takes the lane from the fetched `summary.json`, so `attach` to a `full` run also applies the
+gate (it used to guess `smoke` while the run was in progress and skip it).
+
 After an intended performance change, re-record in the same commit:
 
 ```sh

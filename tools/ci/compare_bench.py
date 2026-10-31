@@ -38,6 +38,8 @@ RULES = {
     "lost": ("zero", 0.0),
     "errors": ("zero", 0.0),
     "loopback_pps": ("info", 0.0),
+    "tcp_mbps": ("higher", 20.0),       # TCP through the stack varies more than raw packet rates
+    "tcp_avg_packet": ("info", 0.0),    # bytes per adapter packet: large with LSO/RSC
 }
 WORST = {"errors", "lost"}          # aggregated by max across repeats, not median
 DRIFT_WARN = 0.25                   # loopback speed differs from the baseline by more
@@ -76,6 +78,10 @@ def metrics_of(record):
             out["rx_pps"] = float(record["rx_received_pps"])
             out["rx_loss_pct"] = float(record["rx_loss_pct"])
             errors += record.get("rx_inject_errors", 0) + record.get("rx_last_error", 0)
+        if "goodput_mbps" in record:
+            out["tcp_mbps"] = float(record["goodput_mbps"])
+            out["tcp_avg_packet"] = float(record["avg_packet_bytes"])
+            errors += record.get("errors", 0)    # GSO segments failing the independent check
         out["errors"] = float(errors)
     return out
 
