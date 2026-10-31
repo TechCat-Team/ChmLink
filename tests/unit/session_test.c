@@ -1,5 +1,6 @@
 #include "chmlink/session.h"
 #include "chmlink/ring.h"
+#include "chmlink/version.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -11,7 +12,7 @@ int main(void)
     uint8_t bytes[CHMLINK_SESSION_SIZE], copy[CHMLINK_SESSION_SIZE];
     size_t i;
     memset(&r, 0, sizeof(r));
-    r.version = CHMLINK_SESSION_VERSION;
+    r.version = CHMLINK_DEVICE_VERSION;
     r.from_windows_ring = 0x10000040ull; r.from_windows_capacity = CHMLINK_RING_MIN_CAPACITY; r.from_windows_event = 0x1234;
     r.to_windows_ring = 0x7ff000000000ull; r.to_windows_capacity = CHMLINK_RING_MAX_CAPACITY; r.to_windows_event = 0x5678;
     chmlink_session_encode(bytes, &r);
@@ -28,6 +29,12 @@ int main(void)
             CHECK(memcmp(&got, &r, sizeof(r)) != 0);
         }
     }
+    /* The driver takes the contracts of its range only. */
+    r.version = CHMLINK_DEVICE_VERSION_MIN - 1; chmlink_session_encode(bytes, &r);
+    CHECK(chmlink_session_decode(&got, bytes, sizeof(bytes)) != CHMLINK_OK);
+    r.version = CHMLINK_DEVICE_VERSION + 1; chmlink_session_encode(bytes, &r);
+    CHECK(chmlink_session_decode(&got, bytes, sizeof(bytes)) != CHMLINK_OK);
+    r.version = CHMLINK_DEVICE_VERSION;
     r.flags = 1; chmlink_session_encode(bytes, &r); CHECK(chmlink_session_decode(&got, bytes, sizeof(bytes)) != CHMLINK_OK);
     r.flags = 0; r.to_windows_ring = 0x7ff000000020ull; chmlink_session_encode(bytes, &r);
     CHECK(chmlink_session_decode(&got, bytes, sizeof(bytes)) != CHMLINK_OK);

@@ -30,6 +30,7 @@ void chmlink_query_encode(uint8_t *out, const chmlink_query_info *info)
 {
     memset(out, 0, CHMLINK_INFO_SIZE);
     put32(out + CHMLINK_INFO_VERSION, CHMLINK_DEVICE_VERSION);
+    put32(out + CHMLINK_INFO_MIN_VERSION, CHMLINK_DEVICE_VERSION_MIN);
     put32(out + CHMLINK_INFO_LENGTH, CHMLINK_INFO_SIZE);
     put32(out + CHMLINK_INFO_CAPABILITIES, info->capabilities);
     put32(out + CHMLINK_INFO_STATE, info->state);
@@ -99,13 +100,12 @@ chmlink_result chmlink_query_decode(chmlink_query_info *out,
     int mode_ok;
 
     if (out == NULL || p == NULL) return CHMLINK_INVALID_ARGUMENT;
-    if (length != CHMLINK_INFO_SIZE ||
-        get32(p + CHMLINK_INFO_VERSION) != CHMLINK_DEVICE_VERSION ||
-        get32(p + CHMLINK_INFO_LENGTH) != CHMLINK_INFO_SIZE) {
-        return CHMLINK_UNSUPPORTED_VERSION;
-    }
+    if (length < CHMLINK_INFO_SIZE || get32(p + CHMLINK_INFO_LENGTH) != length) return CHMLINK_UNSUPPORTED_VERSION;
     memset(&next, 0, sizeof(next));
     next.version = get32(p + CHMLINK_INFO_VERSION);
+    next.min_version = get32(p + CHMLINK_INFO_MIN_VERSION);
+    if (next.min_version == 0 || next.min_version > CHMLINK_DEVICE_VERSION ||
+        next.version < CHMLINK_DEVICE_VERSION) return CHMLINK_UNSUPPORTED_VERSION;
     next.capabilities = get32(p + CHMLINK_INFO_CAPABILITIES);
     next.state = get32(p + CHMLINK_INFO_STATE);
     next.mode = get32(p + CHMLINK_INFO_MODE);

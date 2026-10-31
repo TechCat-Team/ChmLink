@@ -18,8 +18,14 @@ typedef struct CL_DEVICE_CONFIG {
  * version 3 (with the MTU), which creation writes. */
 #define CL_PACKAGE(a, b, c, d) (((unsigned long long)(a) << 48) | ((unsigned long long)(b) << 32) | \
                                 ((unsigned long long)(c) << 16) | (unsigned long long)(d))
+#define CL_PACKAGE_PARTS(p) (unsigned int)((p) >> 48), (unsigned int)((p) >> 32 & 0xffff), \
+                            (unsigned int)((p) >> 16 & 0xffff), (unsigned int)((p) & 0xffff)
 #define CL_PACKAGE_CONFIG_2 CL_PACKAGE(0, 3, 0, 0)
 #define CL_PACKAGE_CONFIG_3 CL_PACKAGE(0, 4, 2, 0)
+/* The oldest package whose contract range includes this SDK's contract
+ * (CHMLINK_DEVICE_VERSION): adapters this SDK creates need at least this one.
+ * Raise it together with CHMLINK_DEVICE_VERSION. */
+#define CL_PACKAGE_SDK CL_PACKAGE(0, 4, 3, 0)
 
 extern const wchar_t ClHardwareId[], ClIpHardwareId[];
 

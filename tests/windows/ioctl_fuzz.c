@@ -428,7 +428,7 @@ static int create_rings(void)
         InterlockedExchange(&g_extra_added, 0);
     }
     memset(&g_rings, 0, sizeof(g_rings));
-    g_rings.version = CHMLINK_SESSION_VERSION;
+    g_rings.version = CHMLINK_DEVICE_VERSION;
     g_rings.from_windows_ring = (uint64_t)(ULONG_PTR)g_from;
     g_rings.from_windows_capacity = RING_CAPACITY;
     g_rings.from_windows_event = (uint64_t)(ULONG_PTR)g_from_event;

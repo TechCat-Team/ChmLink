@@ -32,8 +32,9 @@ static void put32(uint8_t *p, uint32_t v)
  * 0 valid, 1 revision mismatch, 2 invalid data. */
 static int reference_check(const uint8_t *bytes, size_t received)
 {
-    if (received != 128 || ref32(bytes) != CHMLINK_DEVICE_VERSION ||
-        ref32(bytes + 4) != 128) return 1;
+    /* A driver qualifies when its contract range includes this build's. */
+    if (received < 128 || ref32(bytes + 4) != received || ref32(bytes) < CHMLINK_DEVICE_VERSION ||
+        ref32(bytes + 64) == 0 || ref32(bytes + 64) > CHMLINK_DEVICE_VERSION) return 1;
     if ((ref32(bytes + 8) & CHMLINK_CAP_BATCH) == 0 ||
         (ref32(bytes + 16) == CHMLINK_MODE_ETHERNET ?
             (!(ref32(bytes + 8) & CHMLINK_CAP_ETHERNET) || (ref32(bytes + 8) & CHMLINK_CAP_IP) ||
@@ -55,6 +56,7 @@ static chmlink_query_info ethernet_info(void)
     unsigned int i;
     memset(&info, 0, sizeof(info));
     info.version = CHMLINK_DEVICE_VERSION;
+    info.min_version = CHMLINK_DEVICE_VERSION_MIN;
     info.capabilities = CHMLINK_CAP_ETHERNET | CHMLINK_CAP_BATCH |
                         CHMLINK_CAP_STATISTICS | CHMLINK_CAP_WAIT;
     info.state = CHMLINK_STATE_RUNNING | CHMLINK_STATE_SESSION;
@@ -73,7 +75,7 @@ static chmlink_query_info ethernet_info(void)
 /* Field-wise: struct padding is not part of the value. */
 static int same_info(const chmlink_query_info *a, const chmlink_query_info *b)
 {
-    return a->version == b->version && a->capabilities == b->capabilities &&
+    return a->version == b->version && a->min_version == b->min_version && a->capabilities == b->capabilities &&
         a->state == b->state && a->mode == b->mode &&
         a->interface_index == b->interface_index && a->mtu == b->mtu &&
         a->packet_limit == b->packet_limit && a->ring_capacity == b->ring_capacity &&
@@ -110,7 +112,7 @@ int main(void)
     CHECK(ref32(bytes + 32) == in.ring_capacity && ref32(bytes + 36) == in.ring_pending_bytes);
     CHECK(ref32(bytes + 40) == in.packet_filter && ref32(bytes + 44) == in.offload);
     CHECK(memcmp(bytes + 48, in.mac, 6) == 0 && bytes[54] == 0 && bytes[55] == 0);
-    CHECK(ref64(bytes + 56) == in.luid && ref64(bytes + 64) == 0);
+    CHECK(ref64(bytes + 56) == in.luid && ref32(bytes + 64) == CHMLINK_DEVICE_VERSION_MIN && ref32(bytes + 68) == 0);
     CHECK(ref64(bytes + 72) == in.tx_packets && ref64(bytes + 80) == in.tx_bytes);
     CHECK(ref64(bytes + 88) == in.tx_errors && ref64(bytes + 96) == in.rx_packets);
     CHECK(ref64(bytes + 104) == in.rx_bytes && ref64(bytes + 112) == in.rx_discards);
@@ -149,6 +151,16 @@ int main(void)
     CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE + 1) == CHMLINK_UNSUPPORTED_VERSION);
     put32(bytes, 2);
     CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE) == CHMLINK_UNSUPPORTED_VERSION);
+    /* A newer driver that still speaks this contract is fine; one whose oldest
+     * contract is newer than this build's is not, nor is a missing range. */
+    put32(bytes, CHMLINK_DEVICE_VERSION + 3);
+    CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE) == CHMLINK_OK && out.version == CHMLINK_DEVICE_VERSION + 3);
+    out = sentinel;
+    put32(bytes + 64, CHMLINK_DEVICE_VERSION + 1);
+    CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE) == CHMLINK_UNSUPPORTED_VERSION);
+    put32(bytes + 64, 0);
+    CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE) == CHMLINK_UNSUPPORTED_VERSION);
+    put32(bytes + 64, CHMLINK_DEVICE_VERSION_MIN);
     put32(bytes, CHMLINK_DEVICE_VERSION); put32(bytes + 4, 127);
     CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE) == CHMLINK_UNSUPPORTED_VERSION);
     put32(bytes + 4, 128); put32(bytes + 16, 3);
@@ -160,9 +172,10 @@ int main(void)
     /* Differential check against the pre-refactor validation on mutations of
      * valid Ethernet and IP responses, focusing on validated fields. */
     {
-        static const unsigned int fields[] = {0, 4, 8, 16, 24, 28, 32, 36, 48, 52};
+        static const unsigned int fields[] = {0, 4, 8, 16, 24, 28, 32, 36, 48, 52, 64};
         static const uint32_t values[] = {0, 1, 2, 3, 13, 14, 15, 255, 256, 257, 1279,
-            1280, 1281, 1500, 1508, 1522, 1523, 65557, 65558, 0xffffffffu, 0x1fu, 0x12u, 0x11u};
+            1280, 1281, 1500, 1508, 1522, 1523, 65557, 65558, 0xffffffffu, 0x1fu, 0x12u, 0x11u,
+            CHMLINK_DEVICE_VERSION - 1, CHMLINK_DEVICE_VERSION, CHMLINK_DEVICE_VERSION + 1};
         unsigned long accepted = 0, rejected = 0;
         for (n = 0; n < 400000; ++n) {
             chmlink_query_info base = ethernet_info();

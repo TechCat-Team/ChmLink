@@ -5,15 +5,27 @@
  * must match CHMLINK_VERSION_STRING; the version_test CTest enforces this. */
 #define CHMLINK_VERSION_MAJOR 0u
 #define CHMLINK_VERSION_MINOR 4u
-#define CHMLINK_VERSION_PATCH 2u
+#define CHMLINK_VERSION_PATCH 3u
 #define CHMLINK_VERSION_BUILD 0u
-#define CHMLINK_VERSION_STRING "0.4.2.0"
+#define CHMLINK_VERSION_STRING "0.4.3.0"
 /* OID_GEN_VENDOR_DRIVER_VERSION: major in the high word, minor in the low. */
 #define CHMLINK_VENDOR_DRIVER_VERSION \
     ((CHMLINK_VERSION_MAJOR << 16) | CHMLINK_VERSION_MINOR)
 
-/* Device interface contract version, independent of the package version. */
-#define CHMLINK_DEVICE_VERSION 5u
+/* Device interface contract, independent of the package version. A driver
+ * speaks every contract from CHMLINK_DEVICE_VERSION_MIN to
+ * CHMLINK_DEVICE_VERSION and reports both in QUERY; an SDK speaks the
+ * CHMLINK_DEVICE_VERSION of its headers and names it when it registers a
+ * session, so it works with every driver whose range includes it.
+ * Rules, so that an application's chmlink.dll keeps working when another
+ * application installs a newer driver:
+ *  - a new contract only adds: new IOCTLs, new CHMLINK_CAP_ bits, fields in
+ *    reserved bytes or appended to responses. Readers ignore what they do not
+ *    know; new behavior is opt-in per session.
+ *  - a driver raises CHMLINK_DEVICE_VERSION_MIN only with a new major package
+ *    version, as that drops the SDKs of older contracts. */
+#define CHMLINK_DEVICE_VERSION 6u
+#define CHMLINK_DEVICE_VERSION_MIN 6u
 #define CHMLINK_CAP_ETHERNET 0x01u
 #define CHMLINK_CAP_BATCH 0x02u
 #define CHMLINK_CAP_STATISTICS 0x04u

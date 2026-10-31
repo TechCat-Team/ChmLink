@@ -13,12 +13,15 @@ extern "C" {
 /* Wire layout of the 128-byte QUERY response. All fields are explicitly
  * little-endian; native structures never cross the device boundary. Both the
  * driver (encode) and the SDK (decode) use these definitions exclusively.
- * Gaps between fields are reserved and must be zero when encoded.
+ * Gaps between fields are reserved and must be zero when encoded; decoders
+ * ignore them, so later contracts can use them. A later driver may also append
+ * fields; it never writes more than the caller's buffer, and LENGTH says how
+ * much it wrote.
  */
 #define CHMLINK_INFO_SIZE 128u
 
 #define CHMLINK_INFO_VERSION          0u   /* uint32 */
-#define CHMLINK_INFO_LENGTH           4u   /* uint32, always CHMLINK_INFO_SIZE */
+#define CHMLINK_INFO_LENGTH           4u   /* uint32, bytes of this response */
 #define CHMLINK_INFO_CAPABILITIES     8u   /* uint32 */
 #define CHMLINK_INFO_STATE           12u   /* uint32 */
 #define CHMLINK_INFO_MODE            16u   /* uint32 */
@@ -31,7 +34,8 @@ extern "C" {
 #define CHMLINK_INFO_OFFLOAD         44u   /* uint32, CHMLINK_OFFLOAD_* in effect */
 #define CHMLINK_INFO_MAC             48u   /* uint8[6]; 54..55 reserved */
 #define CHMLINK_INFO_MAC_SIZE         6u
-#define CHMLINK_INFO_LUID            56u   /* uint64; 64..71 reserved */
+#define CHMLINK_INFO_LUID            56u   /* uint64 */
+#define CHMLINK_INFO_MIN_VERSION     64u   /* uint32, oldest contract spoken; 68..71 reserved */
 #define CHMLINK_INFO_TX_PACKETS      72u   /* uint64 counters from here on */
 #define CHMLINK_INFO_TX_BYTES        80u
 #define CHMLINK_INFO_TX_ERRORS       88u
@@ -42,7 +46,7 @@ extern "C" {
 
 /* Decoded QUERY fields, independent of any Windows type. */
 typedef struct chmlink_query_info {
-    uint32_t version, capabilities, state, mode;
+    uint32_t version, min_version, capabilities, state, mode;
     uint32_t interface_index, mtu, packet_limit, ring_capacity, ring_pending_bytes;
     uint32_t packet_filter;
     uint32_t offload;
@@ -53,11 +57,12 @@ typedef struct chmlink_query_info {
 } chmlink_query_info;
 
 /* Writes exactly CHMLINK_INFO_SIZE bytes, including zeroed reserved fields.
- * The version and length fields are always the current contract values. */
+ * The version fields are always this build's contract range. */
 void chmlink_query_encode(uint8_t *out, const chmlink_query_info *info);
 
 /* Decode and validate a response. Returns CHMLINK_UNSUPPORTED_VERSION for a
- * wrong length/version (an incompatible driver), CHMLINK_INVALID_QUERY for an
+ * short response or a driver whose contract range does not include
+ * CHMLINK_DEVICE_VERSION, CHMLINK_INVALID_QUERY for an
  * internally inconsistent response, and leaves out untouched on failure. */
 chmlink_result chmlink_query_decode(chmlink_query_info *out,
                                     const void *bytes, size_t length);

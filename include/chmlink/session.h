@@ -9,7 +9,9 @@ extern "C" {
 #endif
 
 /* CHMLINK_IOCTL_REGISTER_RINGS input: CHMLINK_SESSION_SIZE little-endian
- * bytes, no output. Sent once on a data-session handle. The rings are memory
+ * bytes, no output. version is the device contract the client speaks
+ * (CHMLINK_DEVICE_VERSION of its headers); the driver accepts its range
+ * CHMLINK_DEVICE_VERSION_MIN to CHMLINK_DEVICE_VERSION. Sent once on a data-session handle. The rings are memory
  * of the calling process (chmlink/ring.h layout); the events are handles of
  * the calling process with EVENT_MODIFY_STATE access.
  *   from_windows: the driver produces packets Windows sends; it sets the
@@ -18,7 +20,6 @@ extern "C" {
  *     event when the ring's wait field is set (the driver is idle).
  * The driver keeps the memory locked and the events referenced until the
  * handle is closed. */
-#define CHMLINK_SESSION_VERSION 1u
 #define CHMLINK_SESSION_SIZE 56u
 
 typedef struct chmlink_session_rings {
@@ -34,7 +35,8 @@ typedef struct chmlink_session_rings {
 
 void chmlink_session_encode(uint8_t *out, const chmlink_session_rings *rings);
 
-/* Fails (CHMLINK_INVALID_ARGUMENT) for a wrong size or version, non-zero
+/* Fails (CHMLINK_INVALID_ARGUMENT) for a wrong size, a contract version
+ * outside this build's range, non-zero
  * flags or reserved bytes, a capacity chmlink_ring_capacity_valid rejects, a
  * null or misaligned ring address, or a null event. Leaves out untouched. */
 chmlink_result chmlink_session_decode(chmlink_session_rings *out, const void *bytes, size_t length);

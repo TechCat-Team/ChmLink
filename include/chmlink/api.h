@@ -2,6 +2,7 @@
 #define CHMLINK_API_H
 
 #include <stdint.h>
+#include <wchar.h>
 #include "version.h"
 #include "packet.h"
 #include "protocol.h"
@@ -30,13 +31,38 @@ extern "C" {
  */
 typedef struct chmlink_adapter chmlink_adapter;
 
+/* Versions as CHMLINK_MAKE_VERSION(major, minor, patch, build), 16 bits each,
+ * so they compare as numbers. */
+#define CHMLINK_MAKE_VERSION(a, b, c, d) \
+    (((uint64_t)(a) << 48) | ((uint64_t)(b) << 32) | ((uint64_t)(c) << 16) | (uint64_t)(d))
+/* The release this chmlink.dll belongs to (CHMLINK_VERSION_* of version.h). */
+uint64_t chmlink_get_sdk_version(void);
+/* The newest driver package installed on a ChmLink adapter;
+ * ERROR_FILE_NOT_FOUND when there is no adapter. The driver's contract range
+ * is in chmlink_adapter_info. */
+int chmlink_get_driver_version(uint64_t *version);
+
+/* Diagnostics. Without a logger the SDK is silent; errors are always also
+ * returned through GetLastError(). The callback may run on any thread, also
+ * concurrently; message is valid during the call only. Do not call
+ * chmlink_set_logger from the callback. NULL removes the logger. */
+typedef enum chmlink_log_level {
+    CHMLINK_LOG_INFO = 0,
+    CHMLINK_LOG_WARNING = 1,
+    CHMLINK_LOG_ERROR = 2
+} chmlink_log_level;
+typedef void (*chmlink_logger)(chmlink_log_level level, const wchar_t *message, void *context);
+void chmlink_set_logger(chmlink_logger logger, void *context);
+
 /* SDK-local structure, never copied across the kernel boundary. interface_id
  * is a brace-delimited Windows interface GUID, stable for that installed
  * adapter. Interface indices and LUIDs can change across system restarts.
  * Removing/recreating a device can assign a new GUID.
  */
 typedef struct chmlink_adapter_info {
-    uint32_t version, capabilities, state, mode;
+    /* The driver's contract range (version.h); it includes this SDK's. */
+    uint32_t version, min_version;
+    uint32_t capabilities, state, mode;
     uint32_t interface_index, mtu, packet_limit, ring_capacity, ring_pending_bytes;
     uint32_t packet_filter;
     uint32_t offload; /* CHMLINK_OFFLOAD_* bits in effect for this session */

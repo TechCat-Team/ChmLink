@@ -136,9 +136,31 @@ each other's adapters.
 
 ## Windows driver and SDK
 
-The current SDK requires device interface version 5 (the shared-ring data path)
-and rejects other drivers instead of silently assuming compatible limits. The
-batch format is unchanged; batches are now an SDK convenience over the rings.
+### Compatibility between chmlink.dll and the driver
+
+Several applications may each ship their own `chmlink.dll`, of different
+releases, while all adapters share one driver. The driver and the SDK
+therefore agree on a device contract (`CHMLINK_DEVICE_VERSION` in
+`include/chmlink/version.h`, 6 at present): a driver speaks a range of
+contracts, from `CHMLINK_DEVICE_VERSION_MIN` up, and reports it in QUERY; the
+SDK names its contract when it opens a session and refuses a driver whose
+range does not include it, rather than guess. A new contract only adds (new
+IOCTLs, capability bits, fields in reserved or appended bytes, behavior a
+session opts into), and the oldest contract a driver speaks rises only with a
+new major version. So a `chmlink.dll` keeps working when a newer driver of the
+same major version is installed, and creation never replaces a driver with an
+older one. `chmlink_get_sdk_version`, `chmlink_get_driver_version` and the
+`version`/`min_version` fields of `chmlink_adapter_info` report what is in use;
+the DLL also carries a Windows version resource.
+
+`chmlink_set_logger` receives what the SDK does (driver installed or upgraded,
+adapters created and deleted) and why something failed, with the Windows error
+text; without a logger the SDK is silent and errors come only from
+`GetLastError()`.
+
+### Sessions
+
+Batches are an SDK convenience over the rings.
 `chmlink-list` enumerates accessible adapters and prints their GUID, state,
 capabilities and cumulative counters without connecting a data session.
 `chmlink_open_by_id` opens by interface GUID and checks the resolved identity;

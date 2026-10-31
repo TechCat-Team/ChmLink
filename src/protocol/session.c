@@ -1,4 +1,5 @@
 #include "chmlink/session.h"
+#include "chmlink/version.h"
 #include "chmlink/ring.h"
 #include <string.h>
 
@@ -35,7 +36,7 @@ chmlink_result chmlink_session_decode(chmlink_session_rings *out, const void *by
     r.to_windows_ring = get64(p + 32);
     r.to_windows_capacity = get32(p + 40);
     r.to_windows_event = get64(p + 48);
-    if (r.version != CHMLINK_SESSION_VERSION || r.flags != 0 || get32(p + 20) != 0 || get32(p + 44) != 0 ||
+    if (r.version < CHMLINK_DEVICE_VERSION_MIN || r.version > CHMLINK_DEVICE_VERSION || r.flags != 0 || get32(p + 20) != 0 || get32(p + 44) != 0 ||
         !chmlink_ring_capacity_valid(r.from_windows_capacity) || !chmlink_ring_capacity_valid(r.to_windows_capacity) ||
         r.from_windows_ring == 0 || r.to_windows_ring == 0 || (r.from_windows_ring % 64) != 0 ||
         (r.to_windows_ring % 64) != 0 || r.from_windows_event == 0 || r.to_windows_event == 0) {

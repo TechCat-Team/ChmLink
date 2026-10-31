@@ -21,7 +21,7 @@ if(WIN32)
     # applications, and the same code as a static library for chmlink-device,
     # which must run on its own.
     set(CHMLINK_SDK_SOURCES src/windows/adapter.c src/windows/receive.c src/windows/send.c
-        src/windows/wait.c src/windows/manage.c src/windows/device_config.c src/windows/package.c)
+        src/windows/wait.c src/windows/manage.c src/windows/device_config.c src/windows/package.c src/windows/log.c)
     set(CHMLINK_SDK_LIBRARIES iphlpapi ole32 setupapi newdev uuid advapi32 bcrypt)
     add_library(chmlink_static STATIC ${CHMLINK_SDK_SOURCES})
     target_link_libraries(chmlink_static PUBLIC chmlink_protocol ${CHMLINK_SDK_LIBRARIES})
@@ -31,11 +31,19 @@ if(WIN32)
     target_link_libraries(chmlink PRIVATE chmlink_protocol ${CHMLINK_SDK_LIBRARIES})
     target_include_directories(chmlink PUBLIC include)
     target_compile_definitions(chmlink PRIVATE _WIN32_WINNT=0x0A00)
+    # Version resource from version.h, the single source of the release.
+    enable_language(RC)
+    file(READ include/chmlink/version.h CHMLINK_VERSION_HEADER)
+    string(REGEX MATCH "CHMLINK_VERSION_STRING \"([0-9.]+)\"" _ "${CHMLINK_VERSION_HEADER}")
+    set(CHMLINK_VERSION "${CMAKE_MATCH_1}")
+    string(REPLACE "." "," CHMLINK_VERSION_COMMAS "${CHMLINK_VERSION}")
+    configure_file(src/windows/version.rc.in version.rc @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS include/chmlink/version.h)
+    target_sources(chmlink PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/version.rc)
     # A directory with the signed chmlink.inf, .sys and .cat embeds that
     # package, so applications ship chmlink.dll alone.
     set(CHMLINK_DRIVER_DIR "" CACHE PATH "Signed driver package to embed in chmlink.dll")
     if(CHMLINK_DRIVER_DIR)
-        enable_language(RC)
         file(TO_CMAKE_PATH "${CHMLINK_DRIVER_DIR}" CHMLINK_DRIVER_DIR)
         set(CHMLINK_DRIVER_FILES)
         foreach(name chmlink.inf chmlink.sys chmlink.cat)

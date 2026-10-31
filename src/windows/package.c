@@ -19,6 +19,7 @@
 #include <wchar.h>
 #include "chmlink/manage.h"
 #include "device_config.h"
+#include "log.h"
 
 static const wchar_t *const package_files[] = {L"chmlink.inf", L"chmlink.sys", L"chmlink.cat"};
 
@@ -142,7 +143,7 @@ BOOL ClSelectPackage(const wchar_t *embedded, wchar_t chosen[MAX_PATH], BOOL *re
     BOOL busy = FALSE, outdated = FALSE;
     DWORD i, error;
     if (!ClPackageVersion(embedded, &embedded_version)) return FALSE;
-    if (embedded_version < CL_PACKAGE_CONFIG_3) { SetLastError(ERROR_REVISION_MISMATCH); return FALSE; }
+    if (embedded_version < CL_PACKAGE_SDK) { SetLastError(ERROR_REVISION_MISMATCH); return FALSE; }
     all = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, NULL, NULL, 0);
     if (all == INVALID_HANDLE_VALUE) return FALSE;
     for (i = 0; SetupDiEnumDeviceInfo(all, i, &device); ++i) {
@@ -160,7 +161,15 @@ BOOL ClSelectPackage(const wchar_t *embedded, wchar_t chosen[MAX_PATH], BOOL *re
         wcscpy_s(chosen, MAX_PATH, embedded);
     } else if (newest >= embedded_version || busy) {
         /* Keep what runs; creation checks that every adapter runs it. */
-        if (newest < CL_PACKAGE_CONFIG_3) { SetLastError(busy ? ERROR_BUSY : ERROR_REVISION_MISMATCH); goto fail; }
+        if (newest < CL_PACKAGE_SDK) {
+            sdk_log(CHMLINK_LOG_ERROR, L"Adapters run driver %u.%u.%u.%u, too old for this SDK, and one has a data session "
+                    L"open, so it cannot be upgraded to %u.%u.%u.%u now.", CL_PACKAGE_PARTS(newest),
+                    CL_PACKAGE_PARTS(embedded_version));
+            SetLastError(busy ? ERROR_BUSY : ERROR_REVISION_MISMATCH); goto fail;
+        }
+        if (newest < embedded_version)
+            sdk_log(CHMLINK_LOG_WARNING, L"Keeping driver %u.%u.%u.%u instead of the embedded %u.%u.%u.%u: an adapter "
+                    L"has a data session open.", CL_PACKAGE_PARTS(newest), CL_PACKAGE_PARTS(embedded_version));
         wcscpy_s(chosen, MAX_PATH, newest_inf);
     } else {
         for (i = 0; SetupDiEnumDeviceInfo(all, i, &device); ++i) {
@@ -168,7 +177,12 @@ BOOL ClSelectPackage(const wchar_t *embedded, wchar_t chosen[MAX_PATH], BOOL *re
             if (!ClIsDevice(all, &device)) continue;
             if (!device_package(all, &device, store)) goto fail;
             if (same_package(store, embedded)) continue;
-            if (!ClInstallOnDevice(all, &device, embedded, &restart)) goto fail;
+            sdk_log(CHMLINK_LOG_INFO, L"Upgrading driver %u.%u.%u.%u to the embedded %u.%u.%u.%u on an existing adapter.",
+                    CL_PACKAGE_PARTS(newest), CL_PACKAGE_PARTS(embedded_version));
+            if (!ClInstallOnDevice(all, &device, embedded, &restart)) {
+                sdk_log_error(L"Upgrading an existing adapter failed");
+                goto fail;
+            }
             if (restart) *reboot = TRUE;
         }
         if (GetLastError() != ERROR_NO_MORE_ITEMS) goto fail;
@@ -285,6 +299,7 @@ int chmlink_delete_driver(void)
             !ClIsOwnPackage(path)) continue;
         /* Flags zero: Windows refuses packages of present or phantom devices. */
         if (!SetupUninstallOEMInfW(found.cFileName, 0, NULL)) error = GetLastError();
+        else sdk_log(CHMLINK_LOG_INFO, L"Removed driver package %ls.", found.cFileName);
     } while (FindNextFileW(search, &found));
     FindClose(search);
     ClUnlock(lock);

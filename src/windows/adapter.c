@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include "chmlink/query.h"
 #include "internal.h"
+#include "log.h"
 
 HANDLE sdk_new_event(void)
 {
@@ -103,6 +104,13 @@ static int query_device(HANDLE device, HANDLE event, chmlink_adapter_info *info)
         return 0;
     }
     decoded = chmlink_query_decode(&wire, bytes, received);
+    if (decoded == CHMLINK_UNSUPPORTED_VERSION && received >= CHMLINK_INFO_SIZE) {
+        uint32_t newest = bytes[0] | bytes[1] << 8 | bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+        uint32_t oldest = bytes[64] | bytes[65] << 8 | bytes[66] << 16 | (uint32_t)bytes[67] << 24;
+        sdk_log(CHMLINK_LOG_ERROR, L"The driver speaks device contracts %u to %u; this SDK needs %u. "
+                L"Install a driver package that includes it.", oldest ? oldest : newest, newest,
+                (unsigned int)CHMLINK_DEVICE_VERSION);
+    }
     if (decoded != CHMLINK_OK) {
         SetLastError(decoded == CHMLINK_UNSUPPORTED_VERSION ?
                      ERROR_REVISION_MISMATCH : ERROR_INVALID_DATA);
@@ -115,7 +123,7 @@ static int query_device(HANDLE device, HANDLE event, chmlink_adapter_info *info)
     if (error != NO_ERROR) { SetLastError(error); return 0; }
     if (StringFromGUID2(&guid, id, 39) != 39) { SetLastError(ERROR_INVALID_DATA); return 0; }
     memset(&next, 0, sizeof(next));
-    next.version = wire.version; next.capabilities = wire.capabilities;
+    next.version = wire.version; next.min_version = wire.min_version; next.capabilities = wire.capabilities;
     next.state = wire.state; next.mode = wire.mode;
     next.interface_index = wire.interface_index; next.mtu = wire.mtu;
     next.packet_limit = wire.packet_limit; next.ring_capacity = wire.ring_capacity;
@@ -187,7 +195,7 @@ static int register_rings(chmlink_adapter *adapter, HANDLE event)
     chmlink_session_rings rings;
     DWORD received;
     memset(&rings, 0, sizeof(rings));
-    rings.version = CHMLINK_SESSION_VERSION;
+    rings.version = CHMLINK_DEVICE_VERSION;
     rings.from_windows_ring = (uint64_t)(ULONG_PTR)adapter->from_memory;
     rings.from_windows_capacity = adapter->from_capacity;
     rings.from_windows_event = (uint64_t)(ULONG_PTR)adapter->from_event;
@@ -233,7 +241,10 @@ chmlink_adapter *chmlink_open_ex(uint32_t index, const chmlink_open_options *opt
     if (event == NULL) return NULL;
     device = open_device(index, GENERIC_READ | GENERIC_WRITE);
     if (device == INVALID_HANDLE_VALUE) {
-        error = GetLastError(); CloseHandle(event); SetLastError(error); return NULL;
+        error = GetLastError();
+        sdk_log_error(L"Cannot open the ChmLink adapter of interface %u (another session open, not an "
+                      L"administrator, or no such adapter)", index);
+        CloseHandle(event); SetLastError(error); return NULL;
     }
     if (!query_device(device, event, &info)) {
         error = GetLastError(); CloseHandle(device); CloseHandle(event); SetLastError(error);
@@ -288,6 +299,7 @@ chmlink_adapter *chmlink_open_ex(uint32_t index, const chmlink_open_options *opt
     adapter->txq_count = 1;
     if (!register_rings(adapter, event)) {
         error = GetLastError();
+        sdk_log_error(L"Starting the data session on interface %u failed", index);
         /* release_resources closes the device, which is what unlocks the
          * pages, and only then frees the ring memory. */
         release_resources(adapter);

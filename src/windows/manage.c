@@ -18,7 +18,9 @@
 #include <wchar.h>
 #include "chmlink/manage.h"
 #include "chmlink/packet.h"
+#include "chmlink/version.h"
 #include "device_config.h"
+#include "log.h"
 
 static const GUID default_owner = CHMLINK_DEFAULT_OWNER_ID;
 
@@ -88,24 +90,42 @@ int chmlink_create_adapter(const chmlink_create_options *o, chmlink_device *crea
     BOOL reboot = FALSE, upgraded, registered = FALSE, driver_list = FALSE, locked = FALSE;
     DWORD error = ERROR_SUCCESS, path_length;
     wchar_t path[MAX_PATH], extracted[MAX_PATH] = L"", embedded[MAX_PATH];
+    const wchar_t *step = L"preparing";
     uint32_t mode;
     if (o == NULL || o->size != sizeof(*o)) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
     mode = o->mode ? o->mode : CHMLINK_MODE_ETHERNET;
-    if (!ClNewConfig(&config, owner_or_default(o->owner), o->name, o->mac, mode, o->mtu)) return 0;
+    if (!ClNewConfig(&config, owner_or_default(o->owner), o->name, o->mac, mode, o->mtu)) {
+        sdk_log_error(L"Invalid adapter options (mode, name, MAC or MTU)");
+        return 0;
+    }
     if (o->driver_inf != NULL) {
         path_length = GetFullPathNameW(o->driver_inf, MAX_PATH, path, NULL);
         if (!path_length || path_length >= MAX_PATH) { SetLastError(ERROR_FILENAME_EXCED_RANGE); return 0; }
         if (!ClPackageVersion(path, &package)) return 0;
-        if (package < CL_PACKAGE_CONFIG_3) { SetLastError(ERROR_REVISION_MISMATCH); return 0; }
+        if (package < CL_PACKAGE_SDK) {
+            sdk_log(CHMLINK_LOG_ERROR, L"Driver package %ls is %u.%u.%u.%u; this SDK needs %u.%u.%u.%u or later.",
+                    path, CL_PACKAGE_PARTS(package), CL_PACKAGE_PARTS(CL_PACKAGE_SDK));
+            SetLastError(ERROR_REVISION_MISMATCH); return 0;
+        }
     } else if (!ClExtractDriver(extracted, embedded)) {
+        sdk_log_error(L"No driver package to install: none was given and chmlink.dll embeds none");
         return 0;
     }
-    if (!ClLock(&lock)) { error = GetLastError(); goto cleanup; }
+    if (!ClLock(&lock)) {
+        error = GetLastError();
+        sdk_log_error(L"Another adapter change is in progress or was interrupted");
+        goto cleanup;
+    }
     locked = TRUE;
     /* With an explicit package, adapters must already run it: that path never
      * changes the driver of other adapters. */
+    step = L"choosing the driver package";
     if (o->driver_inf == NULL && !ClSelectPackage(embedded, path, &reboot)) goto fail;
-    if (!ClCheckPackage(path) || !ClCheckUnique(&config)) goto fail;
+    step = L"checking that existing adapters run the same driver package";
+    if (!ClCheckPackage(path)) goto fail;
+    step = L"checking that the name, MAC and identity are unused";
+    if (!ClCheckUnique(&config)) goto fail;
+    step = L"registering the device";
     set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
     if (set == INVALID_HANDLE_VALUE) goto fail;
     ZeroMemory(&device, sizeof(device));
@@ -139,13 +159,17 @@ int chmlink_create_adapter(const chmlink_create_options *o, chmlink_device *crea
             (const BYTE *)config.Name, (DWORD)((wcslen(config.Name) + 1) * sizeof(wchar_t)))) goto fail;
     /* Install only the selected package on this newly registered device.
      * Do not update every instance matching the hardware ID. */
+    step = L"installing the driver";
     upgraded = reboot;
     if (!DiInstallDevice(NULL, set, &device, &selected, 0, &reboot)) goto fail;
     reboot = reboot || upgraded;
     SetupDiDestroyDriverInfoList(set, &device, SPDIT_COMPATDRIVER);
     driver_list = FALSE;
     /* After a restart request the interface only appears with the restart. */
+    step = L"waiting for the network interface and naming it";
     if (!reboot && !name_interface(set, &device, config.Name)) goto fail;
+    sdk_log(CHMLINK_LOG_INFO, L"Created adapter '%ls'%ls.", config.Name,
+            reboot ? L"; Windows asks for a restart before it works" : L"");
     if (created != NULL) {
         fill_device(set, &device, &config, created);
         created->flags = reboot ? CHMLINK_DEVICE_REBOOT_REQUIRED : 0;
@@ -155,7 +179,12 @@ int chmlink_create_adapter(const chmlink_create_options *o, chmlink_device *crea
     goto cleanup;
 fail:
     error = GetLastError();
-    if (registered && !SetupDiCallClassInstaller(DIF_REMOVE, set, &device)) error = ERROR_INSTALL_FAILURE;
+    SetLastError(error);
+    sdk_log_error(L"Creating adapter '%ls' failed while %ls", config.Name, step);
+    if (registered && !SetupDiCallClassInstaller(DIF_REMOVE, set, &device)) {
+        sdk_log_error(L"Removing the half-created adapter failed; inspect it");
+        error = ERROR_INSTALL_FAILURE;
+    }
     if (driver_list) SetupDiDestroyDriverInfoList(set, &device, SPDIT_COMPATDRIVER);
     if (set != INVALID_HANDLE_VALUE) SetupDiDestroyDeviceInfoList(set);
 cleanup:
@@ -194,7 +223,10 @@ int chmlink_delete_adapter(const wchar_t *instance, const GUID *owner)
     DWORD error;
     if (!ClLock(&lock)) return 0;
     set = open_device(instance, &device, &config);
-    if (set == INVALID_HANDLE_VALUE) { ClUnlock(lock); return 0; }
+    if (set == INVALID_HANDLE_VALUE) {
+        sdk_log_error(L"Cannot open adapter %ls", instance != NULL ? instance : L"(null)");
+        ClUnlock(lock); return 0;
+    }
     ZeroMemory(&parameters, sizeof(parameters));
     parameters.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
     parameters.ClassInstallHeader.InstallFunction = DIF_REMOVE;
@@ -203,6 +235,8 @@ int chmlink_delete_adapter(const wchar_t *instance, const GUID *owner)
          SetupDiSetClassInstallParamsW(set, &device, &parameters.ClassInstallHeader, sizeof(parameters)) &&
          SetupDiCallClassInstaller(DIF_REMOVE, set, &device);
     error = GetLastError();
+    if (ok) sdk_log(CHMLINK_LOG_INFO, L"Deleted adapter '%ls'.", config.Name);
+    else sdk_log_error(L"Deleting adapter '%ls' failed", config.Name);
     SetupDiDestroyDeviceInfoList(set);
     ClUnlock(lock);
     SetLastError(error);
@@ -221,7 +255,10 @@ int chmlink_set_adapter_mtu(const wchar_t *instance, const GUID *owner, uint32_t
     if (flags != NULL) *flags = 0;
     if (!ClLock(&lock)) return 0;
     set = open_device(instance, &device, &config);
-    if (set == INVALID_HANDLE_VALUE) { ClUnlock(lock); return 0; }
+    if (set == INVALID_HANDLE_VALUE) {
+        sdk_log_error(L"Cannot open adapter %ls", instance != NULL ? instance : L"(null)");
+        ClUnlock(lock); return 0;
+    }
     if (!ClCheckOwner(&config, owner_or_default(owner))) { error = GetLastError(); goto done; }
     if (!chmlink_config_mtu_allowed(chmlink_config_mode(config.Bytes), mtu)) { error = ERROR_INVALID_PARAMETER; goto done; }
     /* A driver that predates configuration version 3 would not read it. */
@@ -238,6 +275,9 @@ int chmlink_set_adapter_mtu(const wchar_t *instance, const GUID *owner, uint32_t
     if (flags != NULL && SetupDiGetDeviceInstallParamsW(set, &device, &parameters) &&
         (parameters.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART))) *flags = CHMLINK_DEVICE_REBOOT_REQUIRED;
 done:
+    SetLastError(error);
+    if (error == ERROR_SUCCESS) sdk_log(CHMLINK_LOG_INFO, L"Adapter '%ls' now has MTU %u.", config.Name, mtu);
+    else sdk_log_error(L"Setting MTU %u on adapter '%ls' failed", mtu, config.Name);
     SetupDiDestroyDeviceInfoList(set);
     ClUnlock(lock);
     SetLastError(error);
@@ -275,5 +315,32 @@ int chmlink_enumerate_devices(const GUID *owner, chmlink_device_callback callbac
     }
     error = GetLastError(); SetupDiDestroyDeviceInfoList(all);
     if (error != ERROR_NO_MORE_ITEMS) { SetLastError(error); return 0; }
+    return 1;
+}
+
+uint64_t chmlink_get_sdk_version(void)
+{
+    return CHMLINK_MAKE_VERSION(CHMLINK_VERSION_MAJOR, CHMLINK_VERSION_MINOR, CHMLINK_VERSION_PATCH,
+                                CHMLINK_VERSION_BUILD);
+}
+
+int chmlink_get_driver_version(uint64_t *version)
+{
+    HDEVINFO all;
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    unsigned long long newest = 0, bound;
+    DWORD i, error;
+    if (version == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    all = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, NULL, NULL, DIGCF_PRESENT);
+    if (all == INVALID_HANDLE_VALUE) return 0;
+    for (i = 0; SetupDiEnumDeviceInfo(all, i, &device); ++i) {
+        if (!ClIsDevice(all, &device)) continue;
+        bound = ClBoundPackage(all, &device);
+        if (bound > newest) newest = bound;
+    }
+    error = GetLastError(); SetupDiDestroyDeviceInfoList(all);
+    if (error != ERROR_NO_MORE_ITEMS) { SetLastError(error); return 0; }
+    if (newest == 0) { SetLastError(ERROR_FILE_NOT_FOUND); return 0; }
+    *version = newest;
     return 1;
 }

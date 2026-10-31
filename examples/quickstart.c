@@ -17,7 +17,22 @@
 #include <string.h>
 #include "chmlink/api.h"
 
-static volatile LONG stopping;
+static volatile LONG stopping, logged;
+
+/* The SDK says what it does and why something failed. */
+static void print_log(chmlink_log_level level, const wchar_t *message, void *context)
+{
+    static const wchar_t *const names[] = {L"info", L"warning", L"error"};
+    (void)context;
+    fwprintf(stderr, L"[chmlink %ls] %ls\n", names[level], message);
+    InterlockedIncrement(&logged);
+}
+
+static void print_version(const char *what, uint64_t v)
+{
+    printf("%s %u.%u.%u.%u\n", what, (unsigned int)(v >> 48), (unsigned int)(v >> 32 & 0xffff),
+           (unsigned int)(v >> 16 & 0xffff), (unsigned int)(v & 0xffff));
+}
 static uint8_t scratch[65535];
 
 static BOOL WINAPI on_console(DWORD event)
@@ -97,6 +112,8 @@ int main(int argc, char **argv)
     chmlink_create_options options;
     chmlink_device device;
     chmlink_adapter *adapter;
+    chmlink_adapter_info info;
+    uint64_t driver = 0;
     HANDLE tester = NULL;
     ULONGLONG deadline;
     unsigned long seconds = 60, replies = 0;
@@ -104,6 +121,9 @@ int main(int argc, char **argv)
     int test = argc == 2 && strcmp(argv[1], "--self-test") == 0;
     if (argc == 2 && !test) seconds = strtoul(argv[1], NULL, 10);
     if (argc > 2 || seconds == 0) { fprintf(stderr, "Usage: chmlink-quickstart [seconds | --self-test]\n"); return 2; }
+
+    chmlink_set_logger(print_log, NULL);
+    print_version("chmlink.dll", chmlink_get_sdk_version());
 
     /* 1. Create the adapter. Defaults: random identity, MTU 1500, the
      *    embedded driver, CHMLINK_DEFAULT_OWNER_ID as owner. */
@@ -115,6 +135,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Creating the adapter failed: %lu\n", GetLastError()); return 1;
     }
     printf("created %ls, interface %u\n", device.name, device.interface_index);
+    if (chmlink_get_driver_version(&driver)) print_version("driver", driver);
 
     /* 2. Open the data session, then address the interface. */
     adapter = chmlink_open(device.interface_index);
@@ -124,6 +145,9 @@ int main(int argc, char **argv)
         chmlink_delete_adapter(device.instance_id, NULL);
         return 1;
     }
+    if (chmlink_query(adapter, &info))
+        printf("driver contracts %u to %u, this SDK speaks %u\n", info.min_version, info.version,
+               (unsigned int)CHMLINK_DEVICE_VERSION);
     SetConsoleCtrlHandler(on_console, TRUE);
     if (test) tester = CreateThread(NULL, 0, self_test, NULL, 0, NULL);
     else printf("try: ping 192.0.2.2   (%lu s, Ctrl+C stops)\n", seconds);
@@ -158,6 +182,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "Deleting the adapter failed: %lu\n", GetLastError()); return 1;
     }
     printf("answered %lu pings; adapter deleted\n", replies);
-    if (test) puts(tested == 0 ? "PASS quickstart self-test" : "FAIL quickstart self-test");
+    if (test) {
+        /* CI builds the DLL and the driver from one tree: the versions match,
+         * and creating and deleting were logged. */
+        if (driver != chmlink_get_sdk_version() || logged < 2) tested = 1;
+        puts(tested == 0 ? "PASS quickstart self-test" : "FAIL quickstart self-test");
+    }
     return (int)tested;
 }
