@@ -12,7 +12,9 @@ const NDIS_OID ClOids[] = {
     OID_802_3_PERMANENT_ADDRESS, OID_802_3_CURRENT_ADDRESS,
     OID_802_3_MULTICAST_LIST, OID_802_3_MAXIMUM_LIST_SIZE,
     OID_802_3_RCV_ERROR_ALIGNMENT, OID_802_3_XMIT_ONE_COLLISION,
-    OID_802_3_XMIT_MORE_COLLISIONS, OID_PNP_QUERY_POWER, OID_PNP_SET_POWER
+    OID_802_3_XMIT_MORE_COLLISIONS, OID_PNP_QUERY_POWER, OID_PNP_SET_POWER,
+    OID_TCP_OFFLOAD_PARAMETERS, OID_OFFLOAD_ENCAPSULATION, OID_TCP_RSC_STATISTICS,
+    OID_TCP_OFFLOAD_CURRENT_CONFIG, OID_TCP_OFFLOAD_HARDWARE_CAPABILITIES
 };
 const ULONG ClOidBytes = sizeof(ClOids);
 const NDIS_OID ClIpOids[] = {
@@ -23,7 +25,9 @@ const NDIS_OID ClIpOids[] = {
     OID_GEN_TRANSMIT_BUFFER_SPACE, OID_GEN_VENDOR_DESCRIPTION,
     OID_GEN_VENDOR_DRIVER_VERSION, OID_GEN_VENDOR_ID,
     OID_GEN_XMIT_OK, OID_GEN_RCV_OK, OID_GEN_XMIT_ERROR, OID_GEN_RCV_ERROR,
-    OID_GEN_RCV_NO_BUFFER, OID_GEN_STATISTICS, OID_PNP_QUERY_POWER, OID_PNP_SET_POWER
+    OID_GEN_RCV_NO_BUFFER, OID_GEN_STATISTICS, OID_PNP_QUERY_POWER, OID_PNP_SET_POWER,
+    OID_TCP_OFFLOAD_PARAMETERS, OID_OFFLOAD_ENCAPSULATION, OID_TCP_RSC_STATISTICS,
+    OID_TCP_OFFLOAD_CURRENT_CONFIG, OID_TCP_OFFLOAD_HARDWARE_CAPABILITIES
 };
 const ULONG ClIpOidBytes = sizeof(ClIpOids);
 
@@ -54,7 +58,7 @@ static NDIS_STATUS query(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
     case OID_GEN_TRANSMIT_BLOCK_SIZE: value = ClPacketLimit(a); break;
     case OID_GEN_RECEIVE_BUFFER_SPACE:
     case OID_GEN_TRANSMIT_BUFFER_SPACE:
-        value = CHMLINK_QUEUE_BYTES; break;
+        value = 4u * 1024u * 1024u; break;   /* the SDK's default ring capacity */
     case OID_GEN_VENDOR_DESCRIPTION: source = "ChmLink"; size = 8; break;
     case OID_GEN_VENDOR_DRIVER_VERSION: value = CHMLINK_VENDOR_DRIVER_VERSION; break;
     case OID_GEN_VENDOR_ID: value = 0xffffff; break;
@@ -97,6 +101,26 @@ counter_value:
         statistics.ifOutErrors = a->TxErrors;
         statistics.ifInDiscards = a->RxDiscards;
         source = &statistics; size = sizeof(statistics); break;
+    case OID_TCP_RSC_STATISTICS: {
+        NDIS_RSC_STATISTICS_INFO rsc;
+        NdisZeroMemory(&rsc, sizeof(rsc));
+        rsc.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
+        rsc.Header.Revision = NDIS_RSC_STATISTICS_REVISION_1;
+        rsc.Header.Size = NDIS_SIZEOF_RSC_STATISTICS_REVISION_1;
+        rsc.CoalescedPkts = a->RscPackets;
+        rsc.CoalescedOctets = a->RscOctets;
+        rsc.CoalesceEvents = a->RscEvents;
+        rsc.Aborts = 0;
+        source = &rsc; size = sizeof(rsc); break;
+    }
+    case OID_TCP_OFFLOAD_CURRENT_CONFIG:
+    case OID_TCP_OFFLOAD_HARDWARE_CAPABILITIES: {
+        NDIS_OFFLOAD offload;
+        ULONG fine = r->DATA.QUERY_INFORMATION.Oid == OID_TCP_OFFLOAD_CURRENT_CONFIG ?
+            ClOffloadEffectiveLocked(a) : ClOffloadHardware(a);
+        ClOffloadFill(a, &offload, fine);
+        source = &offload; size = sizeof(offload); break;
+    }
     case OID_PNP_QUERY_POWER: size = 0; break;
     default: status = NDIS_STATUS_NOT_SUPPORTED; break;
     }
@@ -113,12 +137,108 @@ counter_value:
     return status;
 }
 
+/* NDIS requires a new current configuration after OID_TCP_OFFLOAD_PARAMETERS
+ * changes anything. The indication needs PASSIVE and ControlMutex, so a
+ * request that arrives at DISPATCH hands the work to an I/O work item. */
+typedef struct CL_INDICATE_WORK {
+    NDIS_HANDLE Item;
+    CL_ADAPTER *Adapter;
+} CL_INDICATE_WORK;
+
+static NDIS_IO_WORKITEM_FUNCTION indicate_offload_work;
+
+_Use_decl_annotations_
+static VOID indicate_offload_work(PVOID context, NDIS_HANDLE item)
+{
+    CL_INDICATE_WORK *work = context;
+    CL_ADAPTER *a;
+    if (work == NULL) { NdisFreeIoWorkItem(item); return; }   /* never: queued with a context */
+    a = work->Adapter;
+    if (ExAcquireRundownProtection(&a->IoRundown)) {
+        KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
+        ClIndicateOffload(a);
+        KeReleaseMutex(&a->ControlMutex, FALSE);
+        ExReleaseRundownProtection(&a->IoRundown);
+    }
+    NdisFreeIoWorkItem(item);
+    ExFreePoolWithTag(work, CL_TAG);
+    ClRelease(a);
+}
+
+/* The work item owns `work` and frees it; PREfast does not follow that hand-over (C6014). */
+#pragma warning(push)
+#pragma warning(disable: 6014)
+static void queue_offload_indication(CL_ADAPTER *a)
+{
+    NDIS_HANDLE item;
+    CL_INDICATE_WORK *work;
+    item = NdisAllocateIoWorkItem(a->Handle);
+    if (item == NULL) return;
+    work = ExAllocatePoolWithTag(NonPagedPoolNx, sizeof(*work), CL_TAG);
+    if (work == NULL) { NdisFreeIoWorkItem(item); return; }
+    work->Item = item;
+    work->Adapter = a;
+    InterlockedIncrement(&a->References);
+    NdisQueueIoWorkItem(item, indicate_offload_work, work);
+}
+#pragma warning(pop)
+
+static NDIS_STATUS offload_parameters(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
+{
+    ULONG length = r->DATA.SET_INFORMATION.InformationBufferLength;
+    BOOLEAN changed = FALSE;
+    NDIS_STATUS status;
+    KIRQL irql;
+    r->DATA.SET_INFORMATION.BytesRead = 0;
+    r->DATA.SET_INFORMATION.BytesNeeded = 0;
+    KeAcquireSpinLock(&a->Lock, &irql);
+    status = ClOffloadParametersLocked(a, r->DATA.SET_INFORMATION.InformationBuffer, length, &changed);
+    KeReleaseSpinLock(&a->Lock, irql);
+    if (status != NDIS_STATUS_SUCCESS) return status;
+    r->DATA.SET_INFORMATION.BytesRead = length;
+    if (!changed) return NDIS_STATUS_SUCCESS;
+    if (KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
+        ClIndicateOffload(a);
+        KeReleaseMutex(&a->ControlMutex, FALSE);
+    } else {
+        queue_offload_indication(a);
+    }
+    return NDIS_STATUS_SUCCESS;
+}
+
+static NDIS_STATUS offload_encapsulation(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
+{
+    NDIS_OFFLOAD_ENCAPSULATION *e = r->DATA.SET_INFORMATION.InformationBuffer;
+    ULONG length = r->DATA.SET_INFORMATION.InformationBufferLength;
+    ULONG expected = a->Mode == CHMLINK_MODE_IP ? NDIS_ENCAPSULATION_NULL : NDIS_ENCAPSULATION_IEEE_802_3;
+    r->DATA.SET_INFORMATION.BytesRead = 0;
+    r->DATA.SET_INFORMATION.BytesNeeded = 0;
+    if (e == NULL || length < NDIS_SIZEOF_OFFLOAD_ENCAPSULATION_REVISION_1) {
+        r->DATA.SET_INFORMATION.BytesNeeded = NDIS_SIZEOF_OFFLOAD_ENCAPSULATION_REVISION_1;
+        return NDIS_STATUS_INVALID_LENGTH;
+    }
+    if (e->Header.Type != NDIS_OBJECT_TYPE_OFFLOAD_ENCAPSULATION ||
+        e->Header.Revision != NDIS_OFFLOAD_ENCAPSULATION_REVISION_1 ||
+        e->Header.Size < NDIS_SIZEOF_OFFLOAD_ENCAPSULATION_REVISION_1)
+        return NDIS_STATUS_INVALID_PARAMETER;
+    if ((e->IPv4.Enabled == NDIS_OFFLOAD_SET_ON && e->IPv4.EncapsulationType != expected) ||
+        (e->IPv6.Enabled == NDIS_OFFLOAD_SET_ON && e->IPv6.EncapsulationType != expected))
+        return NDIS_STATUS_INVALID_PARAMETER;
+    r->DATA.SET_INFORMATION.BytesRead = length;
+    return NDIS_STATUS_SUCCESS;
+}
+
 static NDIS_STATUS set(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
 {
     ULONG value, length = r->DATA.SET_INFORMATION.InformationBufferLength;
     PVOID input = r->DATA.SET_INFORMATION.InformationBuffer;
     KIRQL irql;
     NDIS_STATUS status = NDIS_STATUS_SUCCESS;
+    if (r->DATA.SET_INFORMATION.Oid == OID_TCP_OFFLOAD_PARAMETERS)
+        return offload_parameters(a, r);
+    if (r->DATA.SET_INFORMATION.Oid == OID_OFFLOAD_ENCAPSULATION)
+        return offload_encapsulation(a, r);
     r->DATA.SET_INFORMATION.BytesRead = 0;
     r->DATA.SET_INFORMATION.BytesNeeded = 0;
     if (r->DATA.SET_INFORMATION.Oid == OID_GEN_LINK_PARAMETERS ||
@@ -155,7 +275,7 @@ static NDIS_STATUS set(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
                 /* A system that resumes after a shutdown notification (fast
                  * startup hibernates the kernel session) is running again. */
                 if (value == NdisDeviceStateD0) a->ShuttingDown = FALSE;
-                ClUpdateReadEventLocked(a);
+                ClSessionStateLocked(a);
             }
         }
     } else status = NDIS_STATUS_NOT_SUPPORTED;

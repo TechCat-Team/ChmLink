@@ -32,163 +32,36 @@ NDIS_STATUS ClRegisterControl(CL_ADAPTER *a, NET_IFINDEX index)
     return status;
 }
 
-static NTSTATUS receive(CL_ADAPTER *a, PIRP irp, ULONG size)
+static uint32_t get_le32(const UCHAR *p)
 {
-    chmlink_batch_writer writer;
-    chmlink_result result = CHMLINK_OK;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void put_le32(UCHAR *p, uint32_t value)
+{
+    p[0] = (UCHAR)value;
+    p[1] = (UCHAR)(value >> 8);
+    p[2] = (UCHAR)(value >> 16);
+    p[3] = (UCHAR)(value >> 24);
+}
+
+/* SET_OFFLOAD, ControlMutex held and IoRundown held (indication needs valid
+ * NDIS handles). */
+static NTSTATUS set_offload(CL_ADAPTER *a, PIRP irp, ULONG input, ULONG output)
+{
+    UCHAR *bytes = irp->AssociatedIrp.SystemBuffer;
+    ULONG granted;
     KIRQL irql;
-    if (size > CHMLINK_BATCH_MAX_SIZE) return STATUS_INVALID_BUFFER_SIZE;
-    result = chmlink_batch_begin(&writer, irp->AssociatedIrp.SystemBuffer, size,
-                                (chmlink_mode)a->Mode, ClPacketLimit(a));
-    if (result != CHMLINK_OK) return STATUS_BUFFER_TOO_SMALL;
+    if (input != 4 || output != 4) return STATUS_INVALID_PARAMETER;
+    if (get_le32(bytes) & ~(uint32_t)CHMLINK_OFFLOAD_ALL) return STATUS_INVALID_PARAMETER;
     KeAcquireSpinLock(&a->Lock, &irql);
-    for (;;) {
-        uint32_t length;
-        const UCHAR *packet = chmlink_ring_front(&a->Queue, &length);
-        if (packet == NULL) break;
-        result = chmlink_batch_append(&writer, packet, length);
-        if (result != CHMLINK_OK) break;
-        chmlink_ring_pop(&a->Queue);
-    }
-    ClUpdateReadEventLocked(a);
+    a->OffloadSession = get_le32(bytes);
+    granted = ClOffloadGrantedLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
-    if (writer.count == 0) return result == CHMLINK_BUFFER_TOO_SMALL ?
-        STATUS_BUFFER_TOO_SMALL : STATUS_NO_MORE_ENTRIES;
-    irp->IoStatus.Information = writer.length;
+    ClIndicateOffload(a);
+    put_le32(bytes, granted);
+    irp->IoStatus.Information = 4;
     return STATUS_SUCCESS;
-}
-
-/* Receive filter state copied once per injected batch, so the per-packet
- * check runs without the adapter lock. A filter change takes effect from the
- * next batch. */
-typedef struct CL_FILTER {
-    ULONG PacketFilter;
-    ULONG MulticastCount;
-    UCHAR Multicast[CL_MULTICAST_MAX][6];
-    UCHAR Mac[6];
-} CL_FILTER;
-
-static void ClSnapshotFilter(CL_ADAPTER *a, CL_FILTER *f)
-{
-    KIRQL irql;
-    KeAcquireSpinLock(&a->Lock, &irql);
-    f->PacketFilter = a->PacketFilter;
-    /* The OID path already limits the list; clamp again where the length is used. */
-    f->MulticastCount = min(a->MulticastCount, (ULONG)CL_MULTICAST_MAX);
-    NdisMoveMemory(f->Multicast, a->Multicast, (SIZE_T)f->MulticastCount * sizeof(f->Multicast[0]));
-    NdisMoveMemory(f->Mac, a->Mac, sizeof(f->Mac));
-    KeReleaseSpinLock(&a->Lock, irql);
-}
-
-static BOOLEAN accepts(const CL_FILTER *f, const UCHAR *frame)
-{
-    static const UCHAR broadcast[6] = {255, 255, 255, 255, 255, 255};
-    ULONG i;
-    if (f->PacketFilter & NDIS_PACKET_TYPE_PROMISCUOUS) return TRUE;
-    if (RtlCompareMemory(frame, broadcast, 6) == 6)
-        return (f->PacketFilter & NDIS_PACKET_TYPE_BROADCAST) != 0;
-    if (frame[0] & 1) {
-        if (f->PacketFilter & NDIS_PACKET_TYPE_ALL_MULTICAST) return TRUE;
-        if (!(f->PacketFilter & NDIS_PACKET_TYPE_MULTICAST)) return FALSE;
-        for (i = 0; i < f->MulticastCount; ++i)
-            if (RtlCompareMemory(frame, f->Multicast[i], 6) == 6) return TRUE;
-        return FALSE;
-    }
-    return (f->PacketFilter & NDIS_PACKET_TYPE_DIRECTED) &&
-           RtlCompareMemory(frame, f->Mac, 6) == 6;
-}
-
-static NTSTATUS inject(CL_ADAPTER *a, PIRP irp, ULONG size)
-{
-    const UCHAR *bytes = irp->AssociatedIrp.SystemBuffer;
-    uint32_t count;
-    ULONG i, offset = CHMLINK_BATCH_HEADER_SIZE, accepted = 0;
-    ULONG64 acceptedBytes = 0;
-    PMDL mdl;
-    PNET_BUFFER_LIST first = NULL, last = NULL, nbl;
-    CL_FILTER filter;
-    KIRQL irql;
-    NTSTATUS status = STATUS_SUCCESS;
-
-    /* METHOD_BUFFERED provides the owned, nonpaged snapshot. */
-    if (chmlink_batch_validate(bytes, size, a->Mode, ClPacketLimit(a), &count) != CHMLINK_OK)
-        return STATUS_INVALID_PARAMETER;
-    mdl = IoAllocateMdl((PVOID)bytes, size, FALSE, FALSE, NULL);
-    if (mdl == NULL) return STATUS_INSUFFICIENT_RESOURCES;
-    MmBuildMdlForNonPagedPool(mdl);
-    if (a->Mode != CHMLINK_MODE_IP) ClSnapshotFilter(a, &filter);
-    for (i = 0; i < count; ++i) {
-        ULONG length;
-        /* Windows targets are little endian; avoid unaligned structure casts. */
-        NdisMoveMemory(&length, bytes + offset, sizeof(length));
-        offset += 4;
-        if (a->Mode == CHMLINK_MODE_IP || accepts(&filter, bytes + offset)) {
-            nbl = NdisAllocateNetBufferAndNetBufferList(a->Pool, 0, 0, mdl, offset, length);
-            if (nbl == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; break; }
-            nbl->SourceHandle = a->Handle;
-            if (a->Mode == CHMLINK_MODE_IP) {
-                BOOLEAN ipv4 = (bytes[offset] >> 4) == 4;
-                NdisClearNblFlag(nbl, NDIS_NBL_FLAGS_IS_IPV4 | NDIS_NBL_FLAGS_IS_IPV6);
-                NdisSetNblFlag(nbl, ipv4 ? NDIS_NBL_FLAGS_IS_IPV4 : NDIS_NBL_FLAGS_IS_IPV6);
-                /* NetBufferListFrameType stores the network-order EtherType;
-                 * all supported Windows targets use little-endian byte order. */
-                NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) = (PVOID)(ULONG_PTR)(ipv4 ? 0x0008u : 0xdd86u);
-            }
-            NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
-            if (last != NULL) NET_BUFFER_LIST_NEXT_NBL(last) = nbl;
-            else first = nbl;
-            last = nbl;
-            accepted++;
-            acceptedBytes += length;
-        }
-        offset += (length + 3) & ~3u;
-    }
-    /* Allocate everything before indicating any packet to prevent partial
-     * injection on allocation failure. NDIS returns RESOURCES indications
-     * synchronously; no MDL or NBL is retained by an upper protocol driver. */
-    if (NT_SUCCESS(status) && first != NULL) {
-        NdisMIndicateReceiveNetBufferLists(a->Handle, first, NDIS_DEFAULT_PORT_NUMBER,
-                                         accepted, NDIS_RECEIVE_FLAGS_RESOURCES);
-    }
-    while (first != NULL) {
-        nbl = NET_BUFFER_LIST_NEXT_NBL(first);
-        NdisFreeNetBufferList(first);
-        first = nbl;
-    }
-    IoFreeMdl(mdl);
-    KeAcquireSpinLock(&a->Lock, &irql);
-    if (NT_SUCCESS(status)) {
-        a->RxPackets += accepted;
-        a->RxBytes += acceptedBytes;
-        a->RxDiscards += count - accepted;
-    } else a->RxDiscards += count;
-    KeReleaseSpinLock(&a->Lock, irql);
-    return status;
-}
-
-static NTSTATUS register_read_event(CL_ADAPTER *a, PIRP irp, ULONG size)
-{
-    ULONG64 value = 0;
-    const UCHAR *p = irp->AssociatedIrp.SystemBuffer;
-    PKEVENT event;
-    NTSTATUS status;
-    ULONG i;
-    KIRQL irql;
-    if (size != 8 || irp->RequestorMode != UserMode) return STATUS_INVALID_PARAMETER;
-    for (i = 0; i < 8; ++i) value |= (ULONG64)p[i] << (i * 8);
-    status = ObReferenceObjectByHandle((HANDLE)(ULONG_PTR)value, EVENT_MODIFY_STATE,
-                                      *ExEventObjectType, UserMode, (PVOID *)&event, NULL);
-    if (!NT_SUCCESS(status)) return status;
-    KeAcquireSpinLock(&a->Lock, &irql);
-    if (a->ReadEvent != NULL) status = STATUS_INVALID_DEVICE_STATE;
-    else {
-        a->ReadEvent = event;
-        ClUpdateReadEventLocked(a);
-        status = STATUS_SUCCESS;
-    }
-    KeReleaseSpinLock(&a->Lock, irql);
-    if (!NT_SUCCESS(status)) ObDereferenceObject(event);
-    return status;
 }
 
 static ULONG ClStateFlagsLocked(const CL_ADAPTER *a)
@@ -215,17 +88,26 @@ static NTSTATUS query(CL_ADAPTER *a, PIRP irp, ULONG size)
     if (size < CHMLINK_INFO_SIZE) return STATUS_BUFFER_TOO_SMALL;
     NdisZeroMemory(&info, sizeof(info));
     info.capabilities = (a->Mode == CHMLINK_MODE_IP ? CHMLINK_CAP_IP : CHMLINK_CAP_ETHERNET) |
-        CHMLINK_CAP_BATCH | CHMLINK_CAP_STATISTICS | CHMLINK_CAP_WAIT;
+        CHMLINK_CAP_BATCH | CHMLINK_CAP_STATISTICS | CHMLINK_CAP_WAIT |
+        (a->Mode == CHMLINK_MODE_IP ? 0 : CHMLINK_CAP_OFFLOAD);
     info.mode = (uint32_t)a->Mode;
     info.interface_index = a->InterfaceIndex;
     info.mtu = CHMLINK_ETHERNET_MTU;
     info.packet_limit = ClPacketLimit(a);
-    info.queue_capacity = CHMLINK_QUEUE_PACKETS;
     if (a->Mode != CHMLINK_MODE_IP) NdisMoveMemory(info.mac, a->Mac, sizeof(info.mac));
     info.luid = a->Luid.Value;
     KeAcquireSpinLock(&a->Lock, &irql);
     info.state = ClStateFlagsLocked(a);
-    info.queued_packets = a->Queue.count;
+    info.offload = ClOffloadGrantedLocked(a);
+    if (a->Session != NULL) {
+        uint32_t head = chmlink_ring_load(&a->Session->From.View, CHMLINK_RING_HEAD_OFFSET);
+        uint32_t tail = chmlink_ring_load(&a->Session->From.View, CHMLINK_RING_TAIL_OFFSET);
+        uint32_t capacity = a->Session->From.Capacity;
+        info.ring_capacity = capacity;
+        /* head is written by the application; an invalid value reports nothing pending. */
+        if (head < capacity && tail < capacity)
+            info.ring_pending_bytes = tail >= head ? tail - head : capacity - head + tail;
+    }
     info.packet_filter = a->PacketFilter;
     info.tx_packets = a->TxPackets;
     info.tx_bytes = a->TxBytes;
@@ -289,24 +171,29 @@ static void ClAttachFile(CL_ADAPTER *a, PFILE_OBJECT file, BOOLEAN session)
 
 /* ControlMutex held. Ends the data session owned by this file, if any.
  * After halt the rundown is complete and NDIS handles are gone, so the link
- * indication is skipped; queue and event state are still reset. */
+ * indication is skipped. */
 static void ClCleanupFile(CL_ADAPTER *a, PFILE_OBJECT file)
 {
-    BOOLEAN rundown;
+    CL_SESSION *session;
+    BOOLEAN rundown, offload_changed = FALSE;
     KIRQL irql;
     if (file->FsContext2 == NULL) return;
     rundown = ExAcquireRundownProtection(&a->IoRundown);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->SessionState = ClSessionClosing;
-    a->TxQueueDrops += chmlink_ring_clear(&a->Queue);
-    ClUpdateReadEventLocked(a);
+    session = a->Session;
+    ClSessionStateLocked(a);
+    if (a->OffloadSession != 0) { a->OffloadSession = 0; offload_changed = TRUE; }
     KeReleaseSpinLock(&a->Lock, irql);
-    ClDetachReadEvent(a);
-    if (rundown) ClIndicateLink(a);
+    if (session != NULL) ClSessionTeardown(a, session);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->SessionState = ClSessionClosed;
     KeReleaseSpinLock(&a->Lock, irql);
-    if (rundown) ExReleaseRundownProtection(&a->IoRundown);
+    if (rundown) {
+        ClIndicateLink(a);
+        if (offload_changed) ClIndicateOffload(a);
+        ExReleaseRundownProtection(&a->IoRundown);
+    }
 }
 
 /* Checks shared by CREATE and DEVICE_CONTROL. A non-CREATE request must come
@@ -354,32 +241,24 @@ static NTSTATUS ClCreate(CL_ADAPTER *a, PIO_STACK_LOCATION stack)
     return status;
 }
 
-/* Rundown held. Data-path requests require a running adapter and session. */
+/* Rundown held. Only REGISTER_RINGS and SET_OFFLOAD remain; both need the
+ * caller's process context and NDIS handles, and must not race session
+ * cleanup, so ClNeedsControlMutex serializes them. */
 static NTSTATUS ClDataControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
 {
     ULONG input = stack->Parameters.DeviceIoControl.InputBufferLength;
     ULONG output = stack->Parameters.DeviceIoControl.OutputBufferLength;
-    BOOLEAN running;
-    KIRQL irql;
-    KeAcquireSpinLock(&a->Lock, &irql);
-    running = a->State == ClAdapterRunning && a->SessionState == ClSessionOpen &&
-              a->PowerState == NdisDeviceStateD0 && !a->ShuttingDown;
-    KeReleaseSpinLock(&a->Lock, irql);
-    if (!running) return STATUS_DEVICE_NOT_READY;
     switch (stack->Parameters.DeviceIoControl.IoControlCode) {
-    case CHMLINK_IOCTL_REGISTER_READ_EVENT:
-        return output != 0 ? STATUS_INVALID_PARAMETER : register_read_event(a, irp, input);
-    case CHMLINK_IOCTL_RECEIVE:
-        return input != 0 ? STATUS_INVALID_PARAMETER : receive(a, irp, output);
-    case CHMLINK_IOCTL_INJECT:
-        return output != 0 ? STATUS_INVALID_PARAMETER : inject(a, irp, input);
+    case CHMLINK_IOCTL_REGISTER_RINGS:
+        return output != 0 ? STATUS_INVALID_PARAMETER : ClSessionRegister(a, irp, input);
+    case CHMLINK_IOCTL_SET_OFFLOAD:
+        return set_offload(a, irp, input, output);
     default:
         return STATUS_INVALID_DEVICE_REQUEST;
     }
 }
 
-/* ControlMutex is held only for REGISTER_READ_EVENT (see ClNeedsControlMutex).
- * Metadata never touches NDIS handles or pools; the adapter reference keeps
+/* Metadata never touches NDIS handles or pools; the adapter reference keeps
  * the snapshot storage alive even when the data path is paused, so QUERY works
  * on any handle without rundown protection. */
 static NTSTATUS ClControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
@@ -396,19 +275,13 @@ static NTSTATUS ClControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
     return status;
 }
 
-/* ControlMutex orders session open and close, read-event registration and
- * link-state indications for one adapter. RECEIVE, INJECT and QUERY touch only
- * state guarded by the adapter spin lock, and the data path additionally holds
- * rundown protection against pause and halt, so they run concurrently instead
- * of queueing behind each other. REGISTER_READ_EVENT stays serialized: it must
- * not attach an event after cleanup has already detached the session's. */
+/* ControlMutex orders session open and close, ring registration, offload
+ * configuration and link-state indications for one adapter. QUERY touches
+ * only state guarded by the adapter spin lock and runs concurrently. */
 static BOOLEAN ClNeedsControlMutex(PIO_STACK_LOCATION stack)
 {
-    ULONG code;
     if (stack->MajorFunction != IRP_MJ_DEVICE_CONTROL) return TRUE;
-    code = stack->Parameters.DeviceIoControl.IoControlCode;
-    return code != CHMLINK_IOCTL_RECEIVE && code != CHMLINK_IOCTL_INJECT &&
-           code != CHMLINK_IOCTL_QUERY;
+    return stack->Parameters.DeviceIoControl.IoControlCode != CHMLINK_IOCTL_QUERY;
 }
 
 _Use_decl_annotations_

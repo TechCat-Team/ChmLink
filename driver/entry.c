@@ -54,7 +54,7 @@ void ClPnp(NDIS_HANDLE context, PNET_DEVICE_PNP_EVENT event)
     if (event->DevicePnPEvent != NdisDevicePnPEventSurpriseRemoved) return;   /* power profile: nothing to adapt */
     KeAcquireSpinLock(&a->Lock, &irql);
     a->SurpriseRemoved = TRUE;
-    ClUpdateReadEventLocked(a);
+    ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
 }
 
@@ -69,7 +69,7 @@ void ClShutdown(NDIS_HANDLE context, NDIS_SHUTDOWN_ACTION action)
     if (action != NdisShutdownPowerOff) return;
     KeAcquireSpinLock(&a->Lock, &irql);
     a->ShuttingDown = TRUE;
-    ClUpdateReadEventLocked(a);
+    ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
 }
 
@@ -92,9 +92,7 @@ void ClCancelSend(NDIS_HANDLE context, PVOID id)
 _Use_decl_annotations_
 void ClReturn(NDIS_HANDLE context, PNET_BUFFER_LIST lists, ULONG flags)
 {
-    UNREFERENCED_PARAMETER(context);
-    UNREFERENCED_PARAMETER(lists);
+    CL_ADAPTER *a = context;
     UNREFERENCED_PARAMETER(flags);
-    /* All indications carry RESOURCES; NDIS must not return these NBLs. */
-    NT_ASSERT(FALSE);
+    ClSessionReturnLists(a, lists);
 }

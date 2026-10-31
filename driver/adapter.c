@@ -1,32 +1,9 @@
 #include "chmlink.h"
 
-void ClUpdateReadEventLocked(CL_ADAPTER *a)
-{
-    if (a->ReadEvent != NULL) {
-        if (a->Queue.count != 0 || a->State != ClAdapterRunning || a->SessionState != ClSessionOpen ||
-            a->PowerState != NdisDeviceStateD0 || a->ShuttingDown || a->SurpriseRemoved)
-            KeSetEvent(a->ReadEvent, IO_NO_INCREMENT, FALSE);
-        else KeClearEvent(a->ReadEvent);
-    }
-}
-
-void ClDetachReadEvent(CL_ADAPTER *a)
-{
-    PKEVENT event;
-    KIRQL irql;
-    KeAcquireSpinLock(&a->Lock, &irql);
-    event = a->ReadEvent;
-    a->ReadEvent = NULL;
-    if (event != NULL) KeSetEvent(event, IO_NO_INCREMENT, FALSE);
-    KeReleaseSpinLock(&a->Lock, irql);
-    if (event != NULL) ObDereferenceObject(event);
-}
-
 void ClRelease(CL_ADAPTER *a)
 {
     if (InterlockedDecrement(&a->References) == 0) {
-        NT_ASSERT(a->ReadEvent == NULL);
-        if (a->QueueStorage != NULL) ExFreePoolWithTag(a->QueueStorage, CL_TAG);
+        NT_ASSERT(a->Session == NULL);
         ExFreePoolWithTag(a, CL_TAG);
     }
 }
@@ -58,8 +35,8 @@ void ClIndicateLink(CL_ADAPTER *a)
 }
 
 /* PREfast cannot see through the reference count that frees the adapter in ClRelease, so every
- * early return below is reported as a leak of the adapter and its queue (C28197). Each failure path
- * does release both: References starts at 1 and ClRelease frees them at zero. */
+ * early return below is reported as a leak of the adapter. Each failure path does release it:
+ * References starts at 1 and ClRelease frees at zero. */
 #pragma warning(disable: 28197)
 
 _Use_decl_annotations_
@@ -86,14 +63,11 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     a->Luid = parameters->NetLuid;
     a->Lookahead = CHMLINK_ETHERNET_MTU;
     a->PowerState = NdisDeviceStateD0;
+    a->OffloadAllowed = CL_OFFLOAD_FINE_ALL;
     KeInitializeSpinLock(&a->Lock);
     KeInitializeMutex(&a->ControlMutex, 0);
+    KeInitializeEvent(&a->RxDrained, NotificationEvent, TRUE);
     ExInitializeRundownProtection(&a->IoRundown);
-    a->QueueStorage = ExAllocatePoolWithTag(NonPagedPoolNx, CHMLINK_QUEUE_BYTES, CL_TAG);
-    if (a->QueueStorage == NULL ||
-        !chmlink_ring_init(&a->Queue, a->QueueStorage, CHMLINK_QUEUE_BYTES, CHMLINK_QUEUE_PACKETS)) {
-        ClRelease(a); return NDIS_STATUS_RESOURCES;
-    }
     status = ClReadConfiguration(handle, a->Configuration);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
     a->Mode = (chmlink_mode)chmlink_config_mode(a->Configuration);
@@ -147,6 +121,8 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
         NDIS_STATISTICS_FLAGS_VALID_RCV_DISCARDS;
     status = NdisMSetMiniportAttributes(handle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&general);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
+    status = ClSetOffloadAttributes(a);
+    if (status != NDIS_STATUS_SUCCESS) goto fail;
     NdisZeroMemory(&pool, sizeof(pool));
     pool.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
     pool.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
@@ -192,14 +168,16 @@ NDIS_STATUS ClPause(NDIS_HANDLE context, PNDIS_MINIPORT_PAUSE_PARAMETERS paramet
     UNREFERENCED_PARAMETER(parameters);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->State = ClAdapterPausing;
-    a->TxQueueDrops += chmlink_ring_clear(&a->Queue);
-    ClUpdateReadEventLocked(a);
+    ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     ExWaitForRundownProtectionRelease(&a->IoRundown);
     a->IoDrained = TRUE;
+    /* NDIS requires every indicated NBL back before the pause completes. */
+    if (InterlockedCompareExchange(&a->RxOutstanding, 0, 0) != 0)
+        KeWaitForSingleObject(&a->RxDrained, Executive, KernelMode, FALSE, NULL);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->State = ClAdapterPaused;
-    ClUpdateReadEventLocked(a);
+    ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     return NDIS_STATUS_SUCCESS;
 }
@@ -209,6 +187,7 @@ NDIS_STATUS ClRestart(NDIS_HANDLE context, PNDIS_MINIPORT_RESTART_PARAMETERS par
 {
     CL_ADAPTER *a = context;
     KIRQL irql;
+    BOOLEAN offload;
     UNREFERENCED_PARAMETER(parameters);
     if (a->IoDrained) {
         ExReInitializeRundownProtection(&a->IoRundown);
@@ -216,10 +195,13 @@ NDIS_STATUS ClRestart(NDIS_HANDLE context, PNDIS_MINIPORT_RESTART_PARAMETERS par
     }
     KeAcquireSpinLock(&a->Lock, &irql);
     a->State = ClAdapterRunning;
-    ClUpdateReadEventLocked(a);
+    offload = a->OffloadSession != 0;
+    ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     KeWaitForSingleObject(&a->ControlMutex, Executive, KernelMode, FALSE, NULL);
     ClIndicateLink(a);
+    /* NDIS may forget the configuration across a pause; say it again. */
+    if (offload) ClIndicateOffload(a);
     KeReleaseMutex(&a->ControlMutex, FALSE);
     return NDIS_STATUS_SUCCESS;
 }
@@ -236,8 +218,7 @@ void ClHalt(NDIS_HANDLE context, NDIS_HALT_ACTION action)
     KeReleaseSpinLock(&ClAdaptersLock, irql);
     KeAcquireSpinLock(&a->Lock, &irql);
     a->State = ClAdapterRemoving;
-    a->TxQueueDrops += chmlink_ring_clear(&a->Queue);
-    ClUpdateReadEventLocked(a);
+    ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
     /* Pause has normally run the rundown down already. A second wait on a
      * run-down reference is not a no-op: if the first wait had to block, the
@@ -248,73 +229,144 @@ void ClHalt(NDIS_HANDLE context, NDIS_HALT_ACTION action)
         ExWaitForRundownProtectionRelease(&a->IoRundown);
         a->IoDrained = TRUE;
     }
-    ClDetachReadEvent(a);
     NdisDeregisterDeviceEx(a->ControlHandle);
     NdisFreeNetBufferListPool(a->Pool);
     ClRelease(a);
+}
+
+static void complete_large_send(PNET_BUFFER_LIST nbl)
+{
+    NDIS_TCP_LARGE_SEND_OFFLOAD_NET_BUFFER_LIST_INFO info;
+    info.Value = NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo);
+    if (info.Transmit.Type != NDIS_TCP_LARGE_SEND_OFFLOAD_V2_TYPE) return;
+    NdisZeroMemory(&info, sizeof(info));
+    info.LsoV2TransmitComplete.Type = NDIS_TCP_LARGE_SEND_OFFLOAD_V2_TYPE;
+    info.LsoV2TransmitComplete.Reserved = 0;
+    NET_BUFFER_LIST_INFO(nbl, TcpLargeSendNetBufferListInfo) = info.Value;
 }
 
 _Use_decl_annotations_
 void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, ULONG flags)
 {
     CL_ADAPTER *a = context;
+    CL_SESSION *session = NULL;
     PNET_BUFFER_LIST nbl;
-    KIRQL irql;
-    BOOLEAN acquired = ExAcquireRundownProtection(&a->IoRundown);
+    KIRQL irql, sendIrql;
+    ULONG fine = 0;
+    ULONG64 txPackets = 0, txBytes = 0, txErrors = 0, txDrops = 0;
+    BOOLEAN acquired, wake = FALSE, broken = FALSE;
+    uint32_t cursor, published;
     UNREFERENCED_PARAMETER(port);
+
+    acquired = ExAcquireRundownProtection(&a->IoRundown);
+    if (acquired) {
+        KeAcquireSpinLock(&a->Lock, &irql);
+        if (a->State == ClAdapterRunning && a->Session != NULL) {
+            /* Take the send reference before releasing the lock: cleanup
+             * clears a->Session under it and then drains this reference. */
+            if (ExAcquireRundownProtection(&a->Session->SendRundown)) session = a->Session;
+            if (session != NULL) fine = ClOffloadEffectiveLocked(a);
+        }
+        KeReleaseSpinLock(&a->Lock, irql);
+    }
+    if (session == NULL) {
+        NDIS_STATUS status = acquired ? NDIS_STATUS_MEDIA_DISCONNECTED : NDIS_STATUS_PAUSED;
+        for (nbl = lists; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
+            NET_BUFFER_LIST_STATUS(nbl) = status;
+            complete_large_send(nbl);
+        }
+        if (acquired) ExReleaseRundownProtection(&a->IoRundown);
+        NdisMSendNetBufferListsComplete(a->Handle, lists,
+            (flags & NDIS_SEND_FLAGS_DISPATCH_LEVEL) ? NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL : 0);
+        return;
+    }
+
+    KeAcquireSpinLock(&session->SendLock, &sendIrql);
+    cursor = session->SendCursor;
+    published = cursor;
     for (nbl = lists; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
         PNET_BUFFER nb;
-        chmlink_ring_txn txn;
-        ULONG added = 0;
-        ULONG64 bytes = 0;
-        BOOLEAN queue_full = FALSE;
         NDIS_STATUS status = NDIS_STATUS_SUCCESS;
-        KeAcquireSpinLock(&a->Lock, &irql);
-        if (!acquired || a->State != ClAdapterRunning) status = NDIS_STATUS_PAUSED;
-        else if (a->SessionState != ClSessionOpen) status = NDIS_STATUS_MEDIA_DISCONNECTED;
-        /* All packets of one NBL are staged and published together. */
-        chmlink_ring_begin(&a->Queue, &txn);
+        BOOLEAN full = FALSE;
+        ULONG64 segments = 0, bytes = 0;
+        uint32_t start = cursor;
         for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL && status == NDIS_STATUS_SUCCESS;
              nb = NET_BUFFER_NEXT_NB(nb)) {
             ULONG length = NET_BUFFER_DATA_LENGTH(nb);
+            chmlink_offload descriptor;
+            chmlink_ring_status reserved;
             UCHAR *slot;
             PVOID source;
-            if (length < ClPacketMinimum(a) || length > ClPacketLimit(a)) {
-                status = NDIS_STATUS_INVALID_LENGTH; break;
+            if (length < ClPacketMinimum(a) || length > CHMLINK_PACKET_MAX_SIZE) {
+                status = NDIS_STATUS_INVALID_LENGTH;
+                break;
             }
-            slot = chmlink_ring_reserve(&a->Queue, &txn, length);
-            if (slot == NULL) {
-                queue_full = TRUE;
-                status = NDIS_STATUS_RESOURCES; break;
+            reserved = chmlink_ring_reserve(&session->From.View, &cursor, length, NULL, &slot);
+            if (reserved != CHMLINK_RING_OK) {
+                status = reserved == CHMLINK_RING_FULL ? NDIS_STATUS_RESOURCES : NDIS_STATUS_INVALID_DATA;
+                full = reserved == CHMLINK_RING_FULL;
+                if (reserved == CHMLINK_RING_CORRUPT) broken = TRUE;
+                break;
             }
             source = NdisGetDataBuffer(nb, length, slot, 1, 0);
             if (source == NULL) { status = NDIS_STATUS_RESOURCES; break; }
             if (source != slot) NdisMoveMemory(slot, source, length);
+            if (!ClDescribeSend(a, nbl, slot, length, fine, &descriptor)) {
+                status = NDIS_STATUS_INVALID_DATA;
+                break;
+            }
+            chmlink_ring_describe(slot, &descriptor);
             if (a->Mode == CHMLINK_MODE_IP &&
-                !chmlink_ip_packet_valid(slot, length, CHMLINK_IP_LIMIT)) {
-                status = NDIS_STATUS_INVALID_DATA; break;
+                !chmlink_ip_packet_valid(slot, length,
+                    descriptor.gso_type != CHMLINK_GSO_NONE ? CHMLINK_PACKET_MAX_SIZE : ClPacketLimit(a))) {
+                status = NDIS_STATUS_INVALID_DATA;
+                break;
             }
-            added++;
             bytes += length;
+            segments += descriptor.gso_type != CHMLINK_GSO_NONE ?
+                (length - descriptor.hdr_len + descriptor.gso_size - 1) / descriptor.gso_size : 1;
         }
-        if (status == NDIS_STATUS_SUCCESS) {
-            chmlink_ring_commit(&a->Queue, &txn);
-            a->TxPackets += added;
-            a->TxBytes += bytes;
-        } else {
-            a->TxErrors++;
-            if (queue_full) {
-                /* Nothing from this NBL was published; account for the whole
-                 * rejected chain, not just its first overflowing packet. */
-                for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL; nb = NET_BUFFER_NEXT_NB(nb))
-                    a->TxQueueDrops++;
+        if (status != NDIS_STATUS_SUCCESS) {
+            /* Unpublished records are simply abandoned by moving the cursor back. */
+            cursor = start;
+            txErrors++;
+            if (full) {
+                PNET_BUFFER nb2;
+                for (nb2 = NET_BUFFER_LIST_FIRST_NB(nbl); nb2 != NULL; nb2 = NET_BUFFER_NEXT_NB(nb2))
+                    txDrops++;
             }
+        } else {
+            txPackets += segments;
+            txBytes += bytes;
         }
-        ClUpdateReadEventLocked(a);
-        KeReleaseSpinLock(&a->Lock, irql);
         NET_BUFFER_LIST_STATUS(nbl) = status;
+        complete_large_send(nbl);
     }
+    if (cursor != published) {
+        session->SendCursor = cursor;
+        wake = chmlink_ring_publish(&session->From.View, cursor) != 0;
+    }
+    KeReleaseSpinLock(&session->SendLock, sendIrql);
+    if (wake) KeSetEvent(session->From.Event, IO_NO_INCREMENT, FALSE);
+    if (broken) {
+        /* The application broke the ring's head; stop using this session and
+         * let it see CLOSED instead of failing every send silently. */
+        session->Broken = TRUE;
+        KeAcquireSpinLock(&a->Lock, &irql);
+        ClSessionStateLocked(a);
+        KeReleaseSpinLock(&a->Lock, irql);
+    }
+    ExReleaseRundownProtection(&session->SendRundown);
+
+    if (txPackets != 0 || txBytes != 0 || txErrors != 0 || txDrops != 0) {
+        KeAcquireSpinLock(&a->Lock, &irql);
+        a->TxPackets += txPackets;
+        a->TxBytes += txBytes;
+        a->TxErrors += txErrors;
+        a->TxQueueDrops += txDrops;
+        KeReleaseSpinLock(&a->Lock, irql);
+    }
+    ExReleaseRundownProtection(&a->IoRundown);
     NdisMSendNetBufferListsComplete(a->Handle, lists,
         (flags & NDIS_SEND_FLAGS_DISPATCH_LEVEL) ? NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL : 0);
-    if (acquired) ExReleaseRundownProtection(&a->IoRundown);
 }
