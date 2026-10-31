@@ -4,9 +4,12 @@
 /* Exported by ntoskrnl; not declared in the headers this driver includes. */
 NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 
-/* A session owns two shared-memory rings (chmlink/ring.h) and the kernel
- * thread that turns records in the application's ring into receive
- * indications. The driver produces into the other ring from ClSend.
+/* A session owns shared-memory rings (chmlink/ring.h): one the driver
+ * produces into from ClSend, and one to CHMLINK_INJECT_RINGS_MAX the
+ * application produces into. Each of those has a kernel thread that turns its
+ * records into receive indications, so producers on several application
+ * threads are indicated on several cores, as the stack processes an
+ * indication on the indicating thread. Order holds within one ring.
  *
  * NBLs point straight into the locked application pages. The ring's head may
  * only move past packets the stack has returned, so indications are recorded
@@ -50,88 +53,85 @@ static BOOLEAN accepts(const CL_FILTER *f, const UCHAR *frame)
 }
 
 /* Pop every fully returned batch from the head and publish the last end. */
-static void pop_batches(CL_SESSION *s)
+static void pop_batches(CL_RXQ *q)
 {
     KIRQL irql;
     BOOLEAN advanced = FALSE;
     uint32_t head = 0;
-    KeAcquireSpinLock(&s->BatchLock, &irql);
-    while (s->BatchCount != 0 && s->Batches[s->BatchHead].Pending == 0) {
-        head = s->Batches[s->BatchHead].End;
+    KeAcquireSpinLock(&q->BatchLock, &irql);
+    while (q->BatchCount != 0 && q->Batches[q->BatchHead].Pending == 0) {
+        head = q->Batches[q->BatchHead].End;
         advanced = TRUE;
-        s->BatchHead = (s->BatchHead + 1) % CL_BATCH_QUEUE_SIZE;
-        s->BatchCount--;
-        KeSetEvent(&s->ReturnEvent, IO_NO_INCREMENT, FALSE);
+        q->BatchHead = (q->BatchHead + 1) % CL_BATCH_QUEUE_SIZE;
+        q->BatchCount--;
     }
-    KeReleaseSpinLock(&s->BatchLock, irql);
-    if (advanced) chmlink_ring_release(&s->To.View, head);
+    KeReleaseSpinLock(&q->BatchLock, irql);
+    if (advanced) chmlink_ring_release(&q->Ring.View, head);
+}
+
+/* `count` NBLs of batch `id` came back: account for them, free ring space
+ * and wake the queue's thread, which may be waiting for room. */
+static void returned(CL_RXQ *q, uint32_t id, LONG count)
+{
+    ULONG i;
+    BOOLEAN found = FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&q->BatchLock, &irql);
+    for (i = 0; i < q->BatchCount; ++i) {
+        CL_BATCH *batch = &q->Batches[(q->BatchHead + i) % CL_BATCH_QUEUE_SIZE];
+        if (batch->Id == id) { batch->Pending -= count; found = TRUE; break; }
+    }
+    KeReleaseSpinLock(&q->BatchLock, irql);
+    InterlockedExchangeAdd(&q->Outstanding, -count);
+    if (found) pop_batches(q);
+    KeSetEvent(&q->StateEvent, IO_NO_INCREMENT, FALSE);
 }
 
 void ClSessionReturnLists(CL_ADAPTER *a, PNET_BUFFER_LIST lists)
 {
     PNET_BUFFER_LIST nbl, next;
-    CL_SESSION *owner = NULL;
+    CL_RXQ *owner = NULL;
     uint32_t id = 0;
     LONG count = 0, total = 0;
-    KIRQL irql;
 
     for (nbl = lists; nbl != NULL; nbl = next) {
-        CL_SESSION *nblOwner = (CL_SESSION *)nbl->MiniportReserved[1];
+        CL_RXQ *nblOwner = (CL_RXQ *)nbl->MiniportReserved[1];
         uint32_t nblId = (uint32_t)(ULONG_PTR)nbl->MiniportReserved[0];
         next = NET_BUFFER_LIST_NEXT_NBL(nbl);
         NdisFreeNetBufferList(nbl);
         total++;
         if (nblOwner != owner || nblId != id) {
-            if (owner != NULL) {
-                ULONG i;
-                BOOLEAN found = FALSE;
-                KeAcquireSpinLock(&owner->BatchLock, &irql);
-                for (i = 0; i < owner->BatchCount; ++i) {
-                    CL_BATCH *batch = &owner->Batches[(owner->BatchHead + i) % CL_BATCH_QUEUE_SIZE];
-                    if (batch->Id == id) { batch->Pending -= count; found = TRUE; break; }
-                }
-                KeReleaseSpinLock(&owner->BatchLock, irql);
-                if (found) pop_batches(owner);
-            }
+            if (owner != NULL) returned(owner, id, count);
             owner = nblOwner;
             id = nblId;
             count = 1;
         } else count++;
     }
-    if (owner != NULL) {
-        ULONG i;
-        BOOLEAN found = FALSE;
-        KeAcquireSpinLock(&owner->BatchLock, &irql);
-        for (i = 0; i < owner->BatchCount; ++i) {
-            CL_BATCH *batch = &owner->Batches[(owner->BatchHead + i) % CL_BATCH_QUEUE_SIZE];
-            if (batch->Id == id) { batch->Pending -= count; found = TRUE; break; }
-        }
-        KeReleaseSpinLock(&owner->BatchLock, irql);
-        if (found) pop_batches(owner);
-    }
+    if (owner != NULL) returned(owner, id, count);
     if (total != 0 && InterlockedExchangeAdd(&a->RxOutstanding, -total) == total)
         KeSetEvent(&a->RxDrained, IO_NO_INCREMENT, FALSE);
 }
 
-static void wait_idle(CL_SESSION *s, BOOLEAN data)
+static void wait_idle(CL_RXQ *q, BOOLEAN data)
 {
+    CL_SESSION *s = q->Session;
     PVOID objects[3];
     if (!data) {
         objects[0] = &s->StopEvent;
-        objects[1] = &s->StateEvent;
+        objects[1] = &q->StateEvent;
         KeWaitForMultipleObjects(2, objects, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
         return;
     }
-    chmlink_ring_store(&s->To.View, CHMLINK_RING_WAIT_OFFSET, 1);
-    if (chmlink_ring_load(&s->To.View, CHMLINK_RING_TAIL_OFFSET) != s->ReadCursor) {
-        chmlink_ring_store(&s->To.View, CHMLINK_RING_WAIT_OFFSET, 0);
+    chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 1);
+    if (chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET) != q->ReadCursor) {
+        chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 0);
         return;
     }
-    objects[0] = s->To.Event;
+    objects[0] = q->Ring.Event;
     objects[1] = &s->StopEvent;
-    objects[2] = &s->StateEvent;
+    objects[2] = &q->StateEvent;
     KeWaitForMultipleObjects(3, objects, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
-    chmlink_ring_store(&s->To.View, CHMLINK_RING_WAIT_OFFSET, 0);
+    chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 0);
 }
 
 static KSTART_ROUTINE ClSessionThread;
@@ -139,7 +139,8 @@ static KSTART_ROUTINE ClSessionThread;
 _Use_decl_annotations_
 static VOID ClSessionThread(PVOID context)
 {
-    CL_SESSION *s = context;
+    CL_RXQ *q = context;
+    CL_SESSION *s = q->Session;
     CL_ADAPTER *a = s->Adapter;
 
     for (;;) {
@@ -147,10 +148,11 @@ static VOID ClSessionThread(PVOID context)
         CL_FILTER filter;
         KIRQL irql;
         ULONG fine = 0, count = 0, bytes = 0, batchId, room;
+        LONG64 discards = 0;   /* added once: several queue threads count */
         uint32_t tail, cursor;
         BOOLEAN running, acquired;
 
-        if (s->Stop) break;
+        if (s->Stop || q->Stop) break;
 
         acquired = ExAcquireRundownProtection(&a->IoRundown);
         running = FALSE;
@@ -164,46 +166,47 @@ static VOID ClSessionThread(PVOID context)
         }
         if (!acquired || !running || s->Broken) {
             if (acquired) ExReleaseRundownProtection(&a->IoRundown);
-            wait_idle(s, FALSE);
+            wait_idle(q, FALSE);
             continue;
         }
 
-        KeAcquireSpinLock(&s->BatchLock, &irql);
-        room = s->BatchCount < CL_BATCH_QUEUE_SIZE;
-        KeReleaseSpinLock(&s->BatchLock, irql);
-        if (!room || InterlockedCompareExchange(&a->RxOutstanding, 0, 0) >= CL_SESSION_OUTSTANDING_MAX) {
+        KeAcquireSpinLock(&q->BatchLock, &irql);
+        room = q->BatchCount < CL_BATCH_QUEUE_SIZE;
+        KeReleaseSpinLock(&q->BatchLock, irql);
+        if (!room || InterlockedCompareExchange(&q->Outstanding, 0, 0) >= CL_SESSION_OUTSTANDING_MAX) {
+            /* A return sets StateEvent. */
             ExReleaseRundownProtection(&a->IoRundown);
-            wait_idle(s, FALSE);
+            wait_idle(q, FALSE);
             continue;
         }
 
-        tail = chmlink_ring_load(&s->To.View, CHMLINK_RING_TAIL_OFFSET);
-        cursor = s->ReadCursor;
+        tail = chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET);
+        cursor = q->ReadCursor;
         while (count < CL_SESSION_BATCH_MAX) {
             uint32_t offset, size;
             chmlink_offload descriptor;
             UCHAR *packet;
             PNET_BUFFER_LIST nbl;
             chmlink_ring_status status;
-            status = chmlink_ring_next(&s->To.View, &cursor, tail, ClPacketLimit(a),
+            status = chmlink_ring_next(&q->Ring.View, &cursor, tail, ClPacketLimit(a),
                                        &offset, &size, &descriptor);
             if (status == CHMLINK_RING_EMPTY) break;
             if (status == CHMLINK_RING_CORRUPT) { s->Broken = TRUE; break; }
-            packet = s->To.View.data + offset;
+            packet = q->Ring.View.data + offset;
             if (a->Mode == CHMLINK_MODE_IP) {
                 if (!chmlink_ip_packet_valid(packet, size,
                         descriptor.gso_type != CHMLINK_GSO_NONE ? CHMLINK_PACKET_MAX_SIZE : ClPacketLimit(a))) {
-                    a->RxDiscards++;
+                    discards++;
                     continue;
                 }
             } else if (!accepts(&filter, packet)) {
-                a->RxDiscards++;
+                discards++;
                 continue;
             }
-            nbl = NdisAllocateNetBufferAndNetBufferList(a->Pool, 0, 0, s->To.Mdl,
+            nbl = NdisAllocateNetBufferAndNetBufferList(a->Pool, 0, 0, q->Ring.Mdl,
                     CHMLINK_RING_HEADER_SIZE + offset, size);
             if (nbl == NULL) {
-                a->RxDiscards++;
+                discards++;
                 break;   /* the record is dropped, the rest stays for next time */
             }
             nbl->SourceHandle = a->Handle;
@@ -217,7 +220,7 @@ static VOID ClSessionThread(PVOID context)
             NET_BUFFER_LIST_NEXT_NBL(nbl) = NULL;
             if (!ClPrepareInjected(a, nbl, packet, size, &descriptor, fine)) {
                 NdisFreeNetBufferList(nbl);
-                a->RxDiscards++;
+                discards++;
                 continue;
             }
             if (last != NULL) NET_BUFFER_LIST_NEXT_NBL(last) = nbl;
@@ -227,27 +230,29 @@ static VOID ClSessionThread(PVOID context)
             bytes += size;
         }
 
-        if (cursor != s->ReadCursor) {
-            batchId = ++s->NextBatchId;
-            if (batchId == 0) batchId = ++s->NextBatchId;
+        if (discards != 0) InterlockedAdd64((LONG64 volatile *)&a->RxDiscards, discards);
+        if (cursor != q->ReadCursor) {
+            batchId = ++q->NextBatchId;
+            if (batchId == 0) batchId = ++q->NextBatchId;
             if (count != 0) {
                 PNET_BUFFER_LIST nbl;
                 for (nbl = first; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
                     nbl->MiniportReserved[0] = (PVOID)(ULONG_PTR)batchId;
-                    nbl->MiniportReserved[1] = s;
+                    nbl->MiniportReserved[1] = q;
                 }
             }
-            KeAcquireSpinLock(&s->BatchLock, &irql);
+            KeAcquireSpinLock(&q->BatchLock, &irql);
             {
-                CL_BATCH *batch = &s->Batches[(s->BatchHead + s->BatchCount) % CL_BATCH_QUEUE_SIZE];
+                CL_BATCH *batch = &q->Batches[(q->BatchHead + q->BatchCount) % CL_BATCH_QUEUE_SIZE];
                 batch->End = cursor;
                 batch->Id = batchId;
                 batch->Pending = (LONG)count;
-                s->BatchCount++;
+                q->BatchCount++;
             }
-            KeReleaseSpinLock(&s->BatchLock, irql);
-            s->ReadCursor = cursor;
+            KeReleaseSpinLock(&q->BatchLock, irql);
+            q->ReadCursor = cursor;
             if (count != 0) {
+                InterlockedExchangeAdd(&q->Outstanding, (LONG)count);
                 if (InterlockedExchangeAdd(&a->RxOutstanding, (LONG)count) == 0)
                     KeClearEvent(&a->RxDrained);
                 KeAcquireSpinLock(&a->Lock, &irql);
@@ -257,7 +262,7 @@ static VOID ClSessionThread(PVOID context)
                 NdisMIndicateReceiveNetBufferLists(a->Handle, first, NDIS_DEFAULT_PORT_NUMBER,
                                                    count, 0);
             } else {
-                pop_batches(s);
+                pop_batches(q);
             }
         }
         ExReleaseRundownProtection(&a->IoRundown);
@@ -267,7 +272,7 @@ static VOID ClSessionThread(PVOID context)
             ClSessionStateLocked(a);
             KeReleaseSpinLock(&a->Lock, irql);
         }
-        if (cursor == s->ReadCursor && count == 0) wait_idle(s, TRUE);
+        if (cursor == q->ReadCursor && count == 0) wait_idle(q, TRUE);
     }
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -328,13 +333,44 @@ static void unmap_ring(CL_RING *ring)
     ring->Address = NULL;
 }
 
+static void init_queue(CL_SESSION *s, CL_RXQ *q)
+{
+    NdisZeroMemory(q, sizeof(*q));
+    q->Session = s;
+    KeInitializeSpinLock(&q->BatchLock);
+    /* Auto-reset: a state change or return that happens before the thread
+     * waits is consumed by its next wait instead of being lost or piling up. */
+    KeInitializeEvent(&q->StateEvent, SynchronizationEvent, FALSE);
+}
+
+/* Start the queue's thread. On failure no thread runs any more; NBLs it may
+ * have indicated can still be outstanding (q->Outstanding). */
+static NTSTATUS start_queue(CL_RXQ *q)
+{
+    HANDLE handle = NULL;
+    NTSTATUS status = PsCreateSystemThread(&handle, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                                           ClSessionThread, q);
+    if (NT_SUCCESS(status)) {
+        status = ObReferenceObjectByHandle(handle, THREAD_ALL_ACCESS, *PsThreadType,
+                                           KernelMode, (PVOID *)&q->Thread, NULL);
+        if (!NT_SUCCESS(status)) {
+            q->Thread = NULL;
+            q->Stop = TRUE;
+            KeSetEvent(&q->StateEvent, IO_NO_INCREMENT, FALSE);
+            ZwWaitForSingleObject(handle, FALSE, NULL);
+        }
+        ZwClose(handle);
+    }
+    return status;
+}
+
 NTSTATUS ClSessionRegister(CL_ADAPTER *a, PIRP irp, ULONG length)
 {
     chmlink_session_rings rings;
     CL_SESSION *s;
     NTSTATUS status;
     KIRQL irql;
-    HANDLE handle = NULL;
+    ULONG i;
 
     if (irp->RequestorMode != UserMode || length != CHMLINK_SESSION_SIZE)
         return STATUS_INVALID_PARAMETER;
@@ -353,18 +389,14 @@ NTSTATUS ClSessionRegister(CL_ADAPTER *a, PIRP irp, ULONG length)
     s->Adapter = a;
     InterlockedIncrement(&a->References);
     KeInitializeSpinLock(&s->SendLock);
-    KeInitializeSpinLock(&s->BatchLock);
     ExInitializeRundownProtection(&s->SendRundown);
     KeInitializeEvent(&s->StopEvent, NotificationEvent, FALSE);
-    /* Auto-reset: a state change that happens before the thread waits is
-     * consumed by its next wait instead of being lost or piling up. */
-    KeInitializeEvent(&s->StateEvent, SynchronizationEvent, FALSE);
-    KeInitializeEvent(&s->ReturnEvent, SynchronizationEvent, FALSE);
+    for (i = 0; i < CHMLINK_INJECT_RINGS_MAX; ++i) init_queue(s, &s->Rx[i]);
 
     status = map_ring(&s->From, rings.from_windows_ring, rings.from_windows_capacity,
                       rings.from_windows_event);
     if (!NT_SUCCESS(status)) goto fail;
-    status = map_ring(&s->To, rings.to_windows_ring, rings.to_windows_capacity,
+    status = map_ring(&s->Rx[0].Ring, rings.to_windows_ring, rings.to_windows_capacity,
                       rings.to_windows_event);
     if (!NT_SUCCESS(status)) goto fail;
 
@@ -375,66 +407,110 @@ NTSTATUS ClSessionRegister(CL_ADAPTER *a, PIRP irp, ULONG length)
         goto fail;
     }
     a->Session = s;
+    s->RxCount = 1;
     chmlink_ring_reset(&s->From.View);
-    chmlink_ring_reset(&s->To.View);
+    chmlink_ring_reset(&s->Rx[0].Ring.View);
     ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
 
-    status = PsCreateSystemThread(&handle, THREAD_ALL_ACCESS, NULL, NULL, NULL,
-                                  ClSessionThread, s);
-    if (NT_SUCCESS(status)) {
-        status = ObReferenceObjectByHandle(handle, THREAD_ALL_ACCESS, *PsThreadType,
-                                           KernelMode, (PVOID *)&s->Thread, NULL);
-    }
+    status = start_queue(&s->Rx[0]);
     if (!NT_SUCCESS(status)) {
-        if (handle != NULL) {
-            s->Stop = TRUE;
-            KeSetEvent(&s->StopEvent, IO_NO_INCREMENT, FALSE);
-            ZwWaitForSingleObject(handle, FALSE, NULL);
-        }
         KeAcquireSpinLock(&a->Lock, &irql);
         if (a->Session == s) a->Session = NULL;
         KeReleaseSpinLock(&a->Lock, irql);
+        goto fail;
     }
-    if (handle != NULL) ZwClose(handle);
-    if (!NT_SUCCESS(status)) goto fail;
     return STATUS_SUCCESS;
 
 fail:
     if (InterlockedCompareExchange(&a->RxOutstanding, 0, 0) != 0)
         KeWaitForSingleObject(&a->RxDrained, Executive, KernelMode, FALSE, NULL);
-    unmap_ring(&s->To);
+    for (i = 0; i < CHMLINK_INJECT_RINGS_MAX; ++i) unmap_ring(&s->Rx[i].Ring);
     unmap_ring(&s->From);
     ExFreePoolWithTag(s, CL_TAG);
     ClRelease(a);
     return status;
 }
 
+/* ControlMutex held (as for REGISTER_RINGS and cleanup), so the session
+ * stays and RxCount only changes here. */
+NTSTATUS ClSessionAddRing(CL_ADAPTER *a, PIRP irp, ULONG length)
+{
+    chmlink_inject_ring request;
+    CL_SESSION *s;
+    CL_RXQ *q;
+    NTSTATUS status;
+    KIRQL irql;
+    ULONG index = 0;
+
+    if (irp->RequestorMode != UserMode || length != CHMLINK_INJECT_RING_SIZE)
+        return STATUS_INVALID_PARAMETER;
+    if (chmlink_inject_ring_decode(&request, irp->AssociatedIrp.SystemBuffer, length) != CHMLINK_OK)
+        return STATUS_INVALID_PARAMETER;
+    KeAcquireSpinLock(&a->Lock, &irql);
+    s = a->Session;
+    if (s == NULL || s->Broken || s->RxCount >= CHMLINK_INJECT_RINGS_MAX) s = NULL;
+    else index = s->RxCount;
+    KeReleaseSpinLock(&a->Lock, irql);
+    if (s == NULL) return STATUS_INVALID_DEVICE_STATE;
+
+    q = &s->Rx[index];
+    init_queue(s, q);
+    status = map_ring(&q->Ring, request.ring, request.capacity, request.event);
+    if (!NT_SUCCESS(status)) return status;
+
+    KeAcquireSpinLock(&a->Lock, &irql);
+    chmlink_ring_reset(&q->Ring.View);
+    s->RxCount = index + 1;
+    ClSessionStateLocked(a);
+    KeReleaseSpinLock(&a->Lock, irql);
+
+    status = start_queue(q);
+    if (!NT_SUCCESS(status)) {
+        KeAcquireSpinLock(&a->Lock, &irql);
+        s->RxCount = index;
+        KeReleaseSpinLock(&a->Lock, irql);
+        /* Returns set StateEvent; wait for this queue's NBLs only. */
+        while (InterlockedCompareExchange(&q->Outstanding, 0, 0) != 0)
+            KeWaitForSingleObject(&q->StateEvent, Executive, KernelMode, FALSE, NULL);
+        unmap_ring(&q->Ring);
+    }
+    return status;
+}
+
 void ClSessionTeardown(CL_ADAPTER *a, CL_SESSION *s)
 {
     KIRQL irql;
+    ULONG i, count;
 
     KeAcquireSpinLock(&a->Lock, &irql);
     if (a->Session == s) a->Session = NULL;
+    count = s->RxCount;
     chmlink_ring_store(&s->From.View, CHMLINK_RING_STATE_OFFSET, CHMLINK_RING_STATE_CLOSED);
-    chmlink_ring_store(&s->To.View, CHMLINK_RING_STATE_OFFSET, CHMLINK_RING_STATE_CLOSED);
     KeSetEvent(s->From.Event, IO_NO_INCREMENT, FALSE);
-    KeSetEvent(s->To.Event, IO_NO_INCREMENT, FALSE);
-    KeSetEvent(&s->StateEvent, IO_NO_INCREMENT, FALSE);
+    for (i = 0; i < count; ++i) {
+        chmlink_ring_store(&s->Rx[i].Ring.View, CHMLINK_RING_STATE_OFFSET, CHMLINK_RING_STATE_CLOSED);
+        KeSetEvent(s->Rx[i].Ring.Event, IO_NO_INCREMENT, FALSE);
+        KeSetEvent(&s->Rx[i].StateEvent, IO_NO_INCREMENT, FALSE);
+    }
     KeReleaseSpinLock(&a->Lock, irql);
 
     /* No sender may still be copying into the application's ring. */
     ExWaitForRundownProtectionRelease(&s->SendRundown);
     s->Stop = TRUE;
     KeSetEvent(&s->StopEvent, IO_NO_INCREMENT, FALSE);
-    KeSetEvent(&s->StateEvent, IO_NO_INCREMENT, FALSE);
-    if (s->Thread != NULL)
-        KeWaitForSingleObject(s->Thread, Executive, KernelMode, FALSE, NULL);
+    for (i = 0; i < count; ++i) {
+        KeSetEvent(&s->Rx[i].StateEvent, IO_NO_INCREMENT, FALSE);
+        if (s->Rx[i].Thread != NULL)
+            KeWaitForSingleObject(s->Rx[i].Thread, Executive, KernelMode, FALSE, NULL);
+    }
     /* Every indicated NBL must be back before the pages are unlocked. */
     if (InterlockedCompareExchange(&a->RxOutstanding, 0, 0) != 0)
         KeWaitForSingleObject(&a->RxDrained, Executive, KernelMode, FALSE, NULL);
-    if (s->Thread != NULL) ObDereferenceObject(s->Thread);
-    unmap_ring(&s->To);
+    for (i = 0; i < CHMLINK_INJECT_RINGS_MAX; ++i) {
+        if (s->Rx[i].Thread != NULL) ObDereferenceObject(s->Rx[i].Thread);
+        unmap_ring(&s->Rx[i].Ring);
+    }
     unmap_ring(&s->From);
     ExFreePoolWithTag(s, CL_TAG);
     ClRelease(a);
@@ -443,7 +519,7 @@ void ClSessionTeardown(CL_ADAPTER *a, CL_SESSION *s)
 void ClSessionStateLocked(CL_ADAPTER *a)
 {
     CL_SESSION *s = a->Session;
-    ULONG state = 0;
+    ULONG state = 0, i;
     if (s == NULL) return;
     if (a->State == ClAdapterRunning && a->PowerState == NdisDeviceStateD0 &&
         !a->ShuttingDown && !a->SurpriseRemoved && a->SessionState == ClSessionOpen)
@@ -452,7 +528,9 @@ void ClSessionStateLocked(CL_ADAPTER *a)
         a->SurpriseRemoved || a->ShuttingDown || s->Broken)
         state |= CHMLINK_RING_STATE_CLOSED;
     chmlink_ring_store(&s->From.View, CHMLINK_RING_STATE_OFFSET, state);
-    chmlink_ring_store(&s->To.View, CHMLINK_RING_STATE_OFFSET, state);
     KeSetEvent(s->From.Event, IO_NO_INCREMENT, FALSE);
-    KeSetEvent(&s->StateEvent, IO_NO_INCREMENT, FALSE);
+    for (i = 0; i < s->RxCount; ++i) {
+        chmlink_ring_store(&s->Rx[i].Ring.View, CHMLINK_RING_STATE_OFFSET, state);
+        KeSetEvent(&s->Rx[i].StateEvent, IO_NO_INCREMENT, FALSE);
+    }
 }

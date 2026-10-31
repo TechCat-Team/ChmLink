@@ -9,6 +9,7 @@
 #include "chmlink/protocol.h"
 #include "chmlink/config.h"
 #include "chmlink/ring.h"
+#include "chmlink/session.h"
 
 typedef char CL_MODE_IP_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_IP == CHMLINK_MODE_IP) ? 1 : -1];
 typedef char CL_MODE_ETHERNET_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_ETHERNET == CHMLINK_MODE_ETHERNET) ? 1 : -1];
@@ -70,25 +71,38 @@ typedef struct CL_BATCH {
     LONG Pending;
 } CL_BATCH;
 
-typedef struct CL_SESSION {
-    CL_ADAPTER *Adapter;
-    CL_RING From;           /* driver produces packets Windows sent */
-    CL_RING To;             /* application produces packets for Windows */
-    /* Send path (ClSend, any CPU <= DISPATCH). */
-    KSPIN_LOCK SendLock;
-    uint32_t SendCursor;
-    EX_RUNDOWN_REF SendRundown;
-    /* Receive path (session thread, PASSIVE). */
+struct CL_SESSION;
+
+/* One to-Windows ring and the kernel thread that indicates its records. A
+ * session has one per producing application thread, up to
+ * CHMLINK_INJECT_RINGS_MAX, so indications run on several cores. */
+typedef struct CL_RXQ {
+    struct CL_SESSION *Session;
+    CL_RING Ring;           /* application produces packets for Windows */
     uint32_t ReadCursor;
     CL_BATCH Batches[CL_BATCH_QUEUE_SIZE];
     ULONG BatchHead;
     ULONG BatchCount;
     KSPIN_LOCK BatchLock;
     uint32_t NextBatchId;
-    KEVENT StopEvent;
-    KEVENT StateEvent;
-    KEVENT ReturnEvent;
+    LONG Outstanding;       /* this queue's NBLs not yet returned */
+    KEVENT StateEvent;      /* auto-reset: state change or a return */
     PETHREAD Thread;
+    BOOLEAN Stop;           /* this queue only (a failed ADD_INJECT_RING) */
+} CL_RXQ;
+
+typedef struct CL_SESSION {
+    CL_ADAPTER *Adapter;
+    CL_RING From;           /* driver produces packets Windows sent */
+    /* Send path (ClSend, any CPU <= DISPATCH). */
+    KSPIN_LOCK SendLock;
+    uint32_t SendCursor;
+    EX_RUNDOWN_REF SendRundown;
+    /* Receive path: Rx[0] from REGISTER_RINGS, more from ADD_INJECT_RING.
+     * RxCount changes under the adapter lock and ControlMutex. */
+    CL_RXQ Rx[CHMLINK_INJECT_RINGS_MAX];
+    ULONG RxCount;
+    KEVENT StopEvent;
     BOOLEAN Stop;
     BOOLEAN Broken;
 } CL_SESSION;
@@ -181,6 +195,7 @@ NDIS_STATUS ClReadConfiguration(NDIS_HANDLE adapter, UCHAR *configuration);
 /* Session. ClSessionStateLocked runs under a->Lock and tells both rings the
  * adapter state; it also wakes the application and the session thread. */
 NTSTATUS ClSessionRegister(CL_ADAPTER *adapter, PIRP irp, ULONG length);
+NTSTATUS ClSessionAddRing(CL_ADAPTER *adapter, PIRP irp, ULONG length);
 void ClSessionTeardown(CL_ADAPTER *adapter, CL_SESSION *session);
 void ClSessionStateLocked(CL_ADAPTER *adapter);
 void ClSessionReturnLists(CL_ADAPTER *adapter, PNET_BUFFER_LIST lists);

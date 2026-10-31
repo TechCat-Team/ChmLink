@@ -33,6 +33,32 @@ int main(void)
     CHECK(chmlink_session_decode(&got, bytes, sizeof(bytes)) != CHMLINK_OK);
     r.to_windows_ring = 0x7ff000000000ull; r.from_windows_event = 0; chmlink_session_encode(bytes, &r);
     CHECK(chmlink_session_decode(&got, bytes, sizeof(bytes)) != CHMLINK_OK);
+    {
+        chmlink_inject_ring q, back;
+        uint8_t raw[CHMLINK_INJECT_RING_SIZE], bad[CHMLINK_INJECT_RING_SIZE];
+        size_t k;
+        memset(&q, 0, sizeof(q));
+        q.version = CHMLINK_INJECT_RING_VERSION; q.capacity = 128 * 1024;
+        q.ring = 0x7ff000100000ull; q.event = 0x2c4;
+        chmlink_inject_ring_encode(raw, &q);
+        CHECK(chmlink_inject_ring_decode(&back, raw, sizeof(raw)) == CHMLINK_OK);
+        CHECK(back.version == q.version && back.capacity == q.capacity && back.ring == q.ring && back.event == q.event);
+        CHECK(chmlink_inject_ring_decode(&back, raw, sizeof(raw) - 1) == CHMLINK_INVALID_ARGUMENT);
+        CHECK(chmlink_inject_ring_decode(NULL, raw, sizeof(raw)) == CHMLINK_INVALID_ARGUMENT);
+        for (k = 0; k < sizeof(raw); ++k) {   /* every single-bit change is either refused or visible */
+            memcpy(bad, raw, sizeof(raw)); bad[k] ^= 0x01;
+            if (chmlink_inject_ring_decode(&back, bad, sizeof(bad)) == CHMLINK_OK)
+                CHECK(back.capacity != q.capacity || back.ring != q.ring || back.event != q.event);
+        }
+        q.capacity = 1000; chmlink_inject_ring_encode(raw, &q);
+        CHECK(chmlink_inject_ring_decode(&back, raw, sizeof(raw)) != CHMLINK_OK);
+        q.capacity = 128 * 1024; q.ring += 32; chmlink_inject_ring_encode(raw, &q);
+        CHECK(chmlink_inject_ring_decode(&back, raw, sizeof(raw)) != CHMLINK_OK);
+        q.ring -= 32; q.event = 0; chmlink_inject_ring_encode(raw, &q);
+        CHECK(chmlink_inject_ring_decode(&back, raw, sizeof(raw)) != CHMLINK_OK);
+        q.event = 0x2c4; q.version = 2; chmlink_inject_ring_encode(raw, &q);
+        CHECK(chmlink_inject_ring_decode(&back, raw, sizeof(raw)) != CHMLINK_OK);
+    }
     puts("session ok");
     return 0;
 }

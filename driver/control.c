@@ -241,7 +241,7 @@ static NTSTATUS ClCreate(CL_ADAPTER *a, PIO_STACK_LOCATION stack)
     return status;
 }
 
-/* Rundown held. Only REGISTER_RINGS and SET_OFFLOAD remain; both need the
+/* Rundown held. Only REGISTER_RINGS, ADD_INJECT_RING and SET_OFFLOAD remain; they need the
  * caller's process context and NDIS handles, and must not race session
  * cleanup, so ClNeedsControlMutex serializes them. */
 static NTSTATUS ClDataControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
@@ -251,6 +251,8 @@ static NTSTATUS ClDataControl(CL_ADAPTER *a, PIRP irp, PIO_STACK_LOCATION stack)
     switch (stack->Parameters.DeviceIoControl.IoControlCode) {
     case CHMLINK_IOCTL_REGISTER_RINGS:
         return output != 0 ? STATUS_INVALID_PARAMETER : ClSessionRegister(a, irp, input);
+    case CHMLINK_IOCTL_ADD_INJECT_RING:
+        return output != 0 ? STATUS_INVALID_PARAMETER : ClSessionAddRing(a, irp, input);
     case CHMLINK_IOCTL_SET_OFFLOAD:
         return set_offload(a, irp, input, output);
     default:

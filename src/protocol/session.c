@@ -44,3 +44,29 @@ chmlink_result chmlink_session_decode(chmlink_session_rings *out, const void *by
     *out = r;
     return CHMLINK_OK;
 }
+
+/* Byte layout: 0 version, 4 capacity, 8 ring, 16 event. */
+void chmlink_inject_ring_encode(uint8_t *out, const chmlink_inject_ring *r)
+{
+    memset(out, 0, CHMLINK_INJECT_RING_SIZE);
+    put32(out, r->version);
+    put32(out + 4, r->capacity);
+    put64(out + 8, r->ring);
+    put64(out + 16, r->event);
+}
+
+chmlink_result chmlink_inject_ring_decode(chmlink_inject_ring *out, const void *bytes, size_t length)
+{
+    const uint8_t *p = (const uint8_t *)bytes;
+    chmlink_inject_ring r;
+    if (out == NULL || p == NULL || length != CHMLINK_INJECT_RING_SIZE) return CHMLINK_INVALID_ARGUMENT;
+    r.version = get32(p);
+    r.capacity = get32(p + 4);
+    r.ring = get64(p + 8);
+    r.event = get64(p + 16);
+    if (r.version != CHMLINK_INJECT_RING_VERSION || !chmlink_ring_capacity_valid(r.capacity) ||
+        r.ring == 0 || (r.ring % 64) != 0 || r.event == 0)
+        return CHMLINK_INVALID_ARGUMENT;
+    *out = r;
+    return CHMLINK_OK;
+}
