@@ -17,7 +17,7 @@ target_link_libraries(chmlink_protocol PUBLIC chmlink_packet chmlink_ring)
 target_compile_features(chmlink_protocol PUBLIC c_std_99)
 
 if(WIN32)
-    add_library(chmlink STATIC src/windows/api.c)
+    add_library(chmlink STATIC src/windows/adapter.c src/windows/receive.c src/windows/send.c src/windows/wait.c)
     target_link_libraries(chmlink PUBLIC chmlink_protocol iphlpapi ole32)
     target_compile_definitions(chmlink PRIVATE _WIN32_WINNT=0x0A00)
     add_executable(chmlink-list examples/list.c)
