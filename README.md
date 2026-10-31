@@ -100,7 +100,7 @@ minimum-version runtime coverage remain outstanding.
 
 ## Windows prototype
 
-The current SDK requires device interface version 4 (the shared-ring data path)
+The current SDK requires device interface version 5 (the shared-ring data path)
 and rejects other drivers instead of silently assuming compatible limits. The
 batch format is unchanged; batches are now an SDK convenience over the rings.
 `chmlink-list` enumerates accessible adapters and prints their GUID, state,
@@ -154,8 +154,10 @@ of shared-memory rings (`include/chmlink/ring.h`), 4 MiB per direction by
 default: the driver produces Windows traffic into one, and injects packets the
 application produces into the other, without a copy or a per-batch IOCTL. A
 packet that does not fit is dropped and counted in `tx_queue_drops`.
-`chmlink_receive` and `chmlink_inject` remain batch-shaped conveniences over the
-rings; `chmlink_inject` takes a whole batch or none of it (a full ring returns
+Each thread that injects gets its own to-Windows ring, up to four per session,
+so the driver indicates several threads' packets on several cores; order holds
+per thread. `chmlink_receive` and `chmlink_inject` remain batch-shaped
+conveniences over the rings; `chmlink_inject` takes a whole batch or none of it (a full ring returns
 `ERROR_BUFFER_OVERFLOW` and the batch can be retried as is); `chmlink_receive_packet`, `chmlink_release_packet`,
 `chmlink_allocate_packet` and `chmlink_send_packet` are zero copy.
 Packet injection honors the Windows packet filter and multicast list. Pausing
@@ -370,30 +372,31 @@ cleanup is explicit and separate from upgrade and rollback.
 
 `tools/bench.ps1` runs `tests/windows_bench.c` and `tests/windows_tcp_bench.c` on
 the test VM (AMD Ryzen 9 9950X host, 4 vCPUs, Windows 11 build 26200, package
-0.4.0.3, medians of three runs). These are in-VM figures, not network figures:
+0.4.1.0, medians of three runs). These are in-VM figures, not network figures:
 there is no encryption and no physical NIC.
 
 | scenario | shared rings (v2) | IOCTL batches (v1, 8 vCPUs) |
 |---|---|---|
-| UDP from Windows, one sender, 64 B | 469k pps | 460k pps |
+| UDP from Windows, one sender, 64 B | 468k pps | 460k pps |
 | UDP from Windows, four senders, 64 B | 1.27M pps (1.61M with 8 vCPUs) | 1.54M pps |
-| UDP to Windows, one injector, batches of 1 | 661k pps | 184k pps |
-| UDP to Windows, one injector, batches of 32 | 616k pps | 536k pps |
-| UDP to Windows, two injectors | 647k pps | 1.06M pps |
-| 64 B round trip, median / 99th percentile | 36 / 187 µs | 59 / 299 µs |
-| TCP through the stack, IP mode, one stream | 20.6 Gbps | about 1.6 Gbps (VM slow at the time) |
-| TCP, Ethernet mode, one stream, no offloads | 18.7 Gbps | — |
-| TCP, Ethernet mode, one stream, LSO + RSC | 108 Gbps (45 KB per packet) | — |
-| TCP, Ethernet mode, four streams, LSO + RSC | 64.6 Gbps | — |
+| UDP to Windows, one injector, batches of 1 | 663k pps | 184k pps |
+| UDP to Windows, one injector, batches of 32 | 634k pps | 536k pps |
+| UDP to Windows, two injector threads | 1.19M pps | 1.06M pps |
+| 64 B round trip, median / 99th percentile | 35 / 191 µs | 59 / 299 µs |
+| TCP through the stack, IP mode, one stream | 21.6 Gbps | about 1.6 Gbps (VM slow at the time) |
+| TCP, Ethernet mode, one stream, no offloads | 19.3 Gbps | — |
+| TCP, Ethernet mode, one stream, LSO + RSC | 117 Gbps (45 KB per packet) | — |
+| TCP, Ethernet mode, four streams, LSO + RSC | 66.5 Gbps | — |
 
-Packets to Windows are indicated by one driver thread per session, and the stack
-processes them on that thread, so that direction stops at about one core
-(650k pps) however many threads inject. v1 indicated from each injecting
-thread and reached 1.06M pps with two; spreading indications over several
-cores is the next piece of work. A consumer stalled for 20 ms every 100 ms
-still receives 86% to 100% of the offered rate, depending on packet size, with
-the default 4 MiB ring. `tools/ci/vm-run.sh run full` gates a build against the
-recorded baseline for the machine profile.
+The stack processes a receive indication on the indicating thread, so one
+to-Windows ring is indicated at about one core's worth (650k pps). The SDK
+gives each injecting thread its own ring, up to four per session
+(`CHMLINK_IOCTL_ADD_INJECT_RING`), each indicated by its own driver thread:
+two injecting threads reach 1.19M pps. Packets from one thread stay in order;
+packets from different threads are not ordered against each other. A consumer
+stalled for 20 ms every 100 ms still receives 84% to 100% of the offered rate,
+depending on packet size, with the default 4 MiB ring. `tools/ci/vm-run.sh run
+full` gates a build against the recorded baseline for the machine profile.
 
 ## Status
 
@@ -403,14 +406,13 @@ platform with sleep states, surprise-removal testing, and the Rust device I/O
 and agent integration. Sleep is reported to a session as
 `CHMLINK_STATE_LOW_POWER`, a system power-off as `CHMLINK_STATE_SHUTDOWN`
 (`ERROR_SHUTDOWN_IN_PROGRESS` from a wait), and a surprise removal as
-`CHMLINK_STATE_REMOVING`. Package 0.4.0.3 (shared rings and offloads) passed
+`CHMLINK_STATE_REMOVING`. Package 0.4.1.0 (shared rings, per-thread injection rings and offloads) passed
 the smoke, full and nightly lanes: lifecycle (with IOCTL and ring-content
 fuzzing), IP and stress suites under standard Driver Verifier with NDIS
 verification, then adapter churn and fuzzing under randomized and under
 systematic low resources simulation (initialization failures included), with no
-leaked allocations, and reboots with a live session. Packets to Windows are
-still limited to about one core per session (see Performance). The C interface
-and device contract are experimental.
+leaked allocations, and reboots with a live session. The C interface and device
+contract are experimental.
 
 ## License
 
