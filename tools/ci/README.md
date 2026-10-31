@@ -113,7 +113,7 @@ power options.
 
 ### IOCTL fuzzing
 
-`chmlink-ioctl-fuzz` (`tests/windows_ioctl_fuzz.c`) issues raw requests below the SDK: the four contract
+`chmlink-ioctl-fuzz` (`tests/windows/ioctl_fuzz.c`) issues raw requests below the SDK: the four contract
 codes and foreign ones, edge lengths, mutated batches, wrong handle types for the read event, bad user
 buffers, read/write/cancel. Workers share one session's file object and close their handles at random, so
 `IRP_MJ_CLEANUP` races requests in flight; an inspection thread opens and closes read-only handles. In strict

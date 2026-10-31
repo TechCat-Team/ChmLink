@@ -30,7 +30,7 @@ jobs:
         run: >-
           clang -std=c99 -g -O1 -Wall -Wextra -Werror
           -fsanitize=fuzzer,address,undefined -Iinclude
-          src/packet/packet.c src/protocol/batch.c tests/fuzz_batch.c
+          src/packet/packet.c src/protocol/batch.c tests/unit/fuzz_batch.c
           -o fuzz_batch
       - name: Seed corpus
         run: |
