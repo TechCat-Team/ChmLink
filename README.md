@@ -192,8 +192,8 @@ upgrade the existing instances explicitly before creating additional adapters.
 ## IP adapter
 
 The same INF describes `Root\ChmLink` (Ethernet) and `Root\ChmLinkIP` (raw IP).
-IP mode uses `NdisMediumIP`, a 1500-byte MTU and one complete IPv4 or IPv6
-packet per ring record, without task offloads (see above). The API's mode and capability fields identify
+IP mode uses `NdisMediumIP` and one complete IPv4 or IPv6 packet per ring
+record, without task offloads (see above). The API's mode and capability fields identify
 the data format; IP metadata has a zero MAC. IPv6 jumbograms are not supported.
 IP packet validation checks framing, not IP checksums or transport semantics.
 
@@ -203,6 +203,44 @@ the intended creation command is:
 ```powershell
 .\tools\manage-adapter.ps1 -Action Create -InfPath C:\packages\signed\chmlink.inf -Mode ip -Name 'ChmLink IP Test'
 ```
+
+### MTU
+
+An IP adapter's MTU is the largest IP packet it carries: 1500 by default,
+configurable per adapter from 1280 (the IPv6 minimum) to 65535. Ethernet
+adapters stay at 1500 and use task offloads instead. The value reaches NDIS
+and the stack's interface MTU, and QUERY reports it as `mtu` and
+`packet_limit`. Applications can still lower the interface MTU at run time
+(`Set-NetIPInterface -NlMtuBytes`), not raise it above this value.
+
+```powershell
+.\tools\manage-adapter.ps1 -Action Create -InfPath ... -Mode ip -Mtu 65535
+.\tools\manage-adapter.ps1 -Action SetMtu -InstanceId 'ROOT\NET\0001' -Mtu 9000   # restarts the adapter
+```
+
+`chmlink-device create ... --mtu N` and `chmlink-device set-mtu <instance> N`
+do the same. Changing the MTU restarts the adapter, which ends an open data
+session.
+
+A large MTU is the IP-mode counterpart of LSO and GRO: the stack hands over a
+TCP flow as packets of up to the MTU instead of 1500-byte ones, so the
+per-packet cost is paid far less often (see Performance). It is an opt-in,
+because the application then owns what a NIC would do:
+
+- Packets from Windows can be as large as the MTU. Before they leave through a
+  path with a smaller MTU, cut them with `chmlink_ip_split` (`chmlink/offload.h`):
+  TCP becomes complete segments, other IPv4 and IPv6 packets are fragmented.
+  An IPv4 packet with DF set that is not TCP is refused (`CHMLINK_TOO_BIG`);
+  drop it or answer with ICMP "fragmentation needed".
+- Packets injected into Windows may be as large as the MTU, so an application
+  can merge consecutive TCP segments of a flow before injecting them. Plain
+  packets are always fine.
+- TCP connections over the adapter advertise an MSS derived from the MTU; the
+  peer still sends no more than its own MTU allows.
+
+With the default 1500, the adapter behaves like any NIC and none of this is
+needed. Wintun, by contrast, reports 65535 and leaves the interface there
+until the application lowers it.
 
 With IPv4/IPv6 addresses and routes explicitly configured on the test adapter, `chmlink-ip-test <ifIndex>
 <local4> <peer4> <local6> <peer6>` is intended to exercise UDP in both
@@ -219,16 +257,19 @@ peer routes must be isolated from the rest of the test VM. The runner and test
 are not registered in CTest; the runtime CI runs them in every lane.
 
 Both modes share one service and package, so package upgrades affect all
-instances. Stop clients and use version 4 maintenance tooling for both modes.
+instances. Stop clients and use version 5 maintenance tooling for both modes.
 Do not use older management tools while IP devices exist: their inventory does
 not include the IP hardware ID. A downgrade is refused if the target INF lacks
 the IP model.
 
 ## Persistent adapter configuration
 
-Driver packages from 0.3.0.0 on require configuration version 2. Each device stores an
-immutable adapter GUID, owner GUID and mode in a 64-byte versioned registry
-value, together with its desired name. Ethernet also stores a locally
+Each device stores an immutable adapter GUID, owner GUID and mode, and its MTU,
+in a 64-byte versioned registry value (configuration version 3, written by the
+device tool from 0.4.2.0 on), together with its desired name. Drivers from
+0.4.2.0 on also read version 2 from earlier tools, which has no MTU and means
+1500; the maintenance script refuses to install a package older than 0.4.2.0
+while any device has a version 3 configuration. Ethernet also stores a locally
 administered unicast MAC; IP has no MAC address. The driver
 reads this state from the device hardware key rather than deriving a MAC from
 the interface index. Removing and recreating a device creates a new identity;
@@ -356,7 +397,7 @@ cleanup is explicit and separate from upgrade and rollback.
 
 `tools/bench.ps1` runs `bench/packet_bench.c` and `bench/tcp_bench.c` on
 the test VM (AMD Ryzen 9 9950X host, 4 vCPUs, Windows 11 build 26200, package
-0.4.1.0, medians of three runs). These are in-VM figures, not network figures:
+0.4.2.0, medians of three runs). These are in-VM figures, not network figures:
 there is no encryption and no physical NIC.
 
 | scenario | shared rings (v2) | IOCTL batches (v1, 8 vCPUs) |
@@ -366,8 +407,10 @@ there is no encryption and no physical NIC.
 | UDP to Windows, one injector, batches of 1 | 663k pps | 184k pps |
 | UDP to Windows, one injector, batches of 32 | 634k pps | 536k pps |
 | UDP to Windows, two injector threads | 1.19M pps | 1.06M pps |
-| 64 B round trip, median / 99th percentile | 35 / 191 µs | 59 / 299 µs |
-| TCP through the stack, IP mode, one stream | 21.6 Gbps | about 1.6 Gbps (VM slow at the time) |
+| 64 B round trip, median / 99th percentile | 15 / 69 µs | 59 / 299 µs |
+| TCP through the stack, IP mode, one stream | 20.6 Gbps | about 1.6 Gbps (VM slow at the time) |
+| TCP, IP mode at MTU 65535, cut to 1500 before injecting | 21.0 Gbps, 19% less CPU | — |
+| TCP, IP mode at MTU 65535, injected whole | 96 Gbps (50 KB per packet) | — |
 | TCP, Ethernet mode, one stream, no offloads | 19.3 Gbps | — |
 | TCP, Ethernet mode, one stream, LSO + RSC | 117 Gbps (45 KB per packet) | — |
 | TCP, Ethernet mode, four streams, LSO + RSC | 66.5 Gbps | — |
@@ -381,6 +424,21 @@ packets from different threads are not ordered against each other. A consumer
 stalled for 20 ms every 100 ms still receives 84% to 100% of the offered rate,
 depending on packet size, with the default 4 MiB ring. `tools/ci/vm-run.sh run
 full` gates a build against the recorded baseline for the machine profile.
+
+The TCP benchmark reflects every packet back into the same adapter, so one
+host carries both ends. At MTU 65535 the sending side gets large packets and
+uses less CPU, but when the reflector cuts them to 1500 bytes the receiving
+side still processes 1500-byte packets, and that side is the limit; on two
+hosts the sender keeps the saving. Injecting them whole shows what a tunnel
+that carries large packets end to end reaches.
+
+`tools/bench-wintun.ps1` runs the same IP-mode benchmarks over Wintun 0.14.1
+(`bench/wintun_shim.c`) on the same VM. With both at MTU 1500, ChmLink
+injects about 1.9 times as many packets per second from one thread and 3.5
+times from two, carries TCP about 5 times as fast, uses about half the CPU per
+injected packet, and matches Wintun for packets from Windows and round-trip
+latency. At Wintun's default MTU of 65535 with packets passed whole, Wintun
+reaches 52 Gbps of TCP against ChmLink's 96 Gbps above.
 
 ## Status
 
