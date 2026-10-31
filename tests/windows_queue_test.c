@@ -73,22 +73,29 @@ void lifecycle_queue_check(uint32_t first, uint32_t second)
     destination.sin_family = AF_INET; destination.sin_port = htons(48888);
     REQUIRE(InetPtonA(AF_INET, "169.254.250.255", &destination.sin_addr) == 1);
     REQUIRE(chmlink_query(a, &before));
-    /* Small frames are bounded by the packet count, not the ring's bytes. */
-    for (i = 0; i < before.queue_capacity + 1024; ++i) {
+    REQUIRE(before.ring_capacity != 0);
+    /* The shared ring is bounded by bytes, not packets. */
+    for (i = 0; i < 400000; ++i) {
         int result = sendto(socket_handle, (const char *)payload, sizeof(payload), 0,
                             (const struct sockaddr *)&destination, sizeof(destination));
         REQUIRE(result == sizeof(payload) || (result == SOCKET_ERROR && WSAGetLastError() == WSAENOBUFS));
+        if ((i & 1023) == 1023) {
+            REQUIRE(chmlink_query(a, &full));
+            if (full.tx_queue_drops > before.tx_queue_drops) break;
+        }
     }
     REQUIRE(chmlink_query(a, &full));
-    REQUIRE(full.queued_packets == full.queue_capacity && full.tx_queue_drops > before.tx_queue_drops);
-    printf("Queue full: %lu/%lu, drops increased by %llu\n", (unsigned long)full.queued_packets,
-        (unsigned long)full.queue_capacity, (unsigned long long)(full.tx_queue_drops - before.tx_queue_drops));
-    /* One receive returns at most one batch; drain the whole queue. */
-    for (i = 0; i < before.queue_capacity / 64 + 64; ++i) {
+    REQUIRE(full.ring_pending_bytes > 0 && full.ring_pending_bytes <= full.ring_capacity);
+    REQUIRE(full.tx_queue_drops > before.tx_queue_drops);
+    printf("Ring full: %lu/%lu bytes, drops increased by %llu\n", (unsigned long)full.ring_pending_bytes,
+        (unsigned long)full.ring_capacity, (unsigned long long)(full.tx_queue_drops - before.tx_queue_drops));
+    /* One receive returns at most one batch; drain the whole ring. */
+    for (i = 0; i < 8192; ++i) {
         REQUIRE(chmlink_query(a, &after));
-        if (after.queued_packets == 0) break;
+        if (after.ring_pending_bytes == 0) break;
         consume(a, buffer, NULL, 0); consume(b, buffer, NULL, 1);
     }
+    REQUIRE(after.ring_pending_bytes == 0);
     for (i = 1; i <= 1000; ++i) {
         payload[4] = (uint8_t)i; payload[5] = (uint8_t)(i >> 8);
         REQUIRE(sendto(socket_handle, (const char *)payload, sizeof(payload), 0,
@@ -100,7 +107,7 @@ void lifecycle_queue_check(uint32_t first, uint32_t second)
         total += consume(a, buffer, seen, 0); consume(b, buffer, NULL, 1); Sleep(1);
     }
     REQUIRE(total == 1000 && chmlink_query(a, &after));
-    REQUIRE(after.queued_packets <= after.queue_capacity);
+    REQUIRE(after.ring_pending_bytes <= after.ring_capacity);
     closesocket(socket_handle); WSACleanup(); free(buffer); chmlink_close(a); chmlink_close(b);
     puts("PASS bounded queue saturation, recovery, 1000 unique marker packets and adapter isolation");
 }

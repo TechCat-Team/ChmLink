@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <wchar.h>
+#include <string.h>
 #include "chmlink/api.h"
+#include "chmlink/device.h"
 #include "chmlink/protocol.h"
 
 void lifecycle_queue_check(uint32_t first, uint32_t second);
@@ -14,6 +16,63 @@ void lifecycle_sdk_check(uint32_t index);
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "%s:%d: %s (error %lu)\n", __FILE__, __LINE__, #x, GetLastError()); \
     ExitProcess(1); } } while (0)
+
+/* A foreign Ethernet frame with a descriptor; the receive filter would drop
+ * it, so only the offload rules decide the result. */
+static uint32_t offload_batch(uint8_t *batch, size_t capacity, uint8_t flags)
+{
+    uint8_t frame[60];
+    chmlink_offload descriptor = {0, 0, 0, 0, 0, 0};
+    chmlink_batch_writer writer;
+    memset(frame, 0, sizeof(frame));
+    frame[0] = 0x02; frame[5] = 0x7e; frame[6] = 0x02; frame[11] = 0x7f;
+    frame[12] = 0x88; frame[13] = 0xb5;
+    descriptor.flags = flags;
+    descriptor.csum_start = 14;
+    descriptor.csum_offset = 2;
+    CHECK(chmlink_batch_begin_offload(&writer, batch, capacity, CHMLINK_MODE_ETHERNET, 1522) == CHMLINK_OK);
+    CHECK(chmlink_batch_append_offload(&writer, frame, sizeof(frame), &descriptor) == CHMLINK_OK);
+    return (uint32_t)writer.length;
+}
+
+static void offload_check(uint32_t index)
+{
+    chmlink_adapter *a;
+    chmlink_adapter_info info;
+    uint32_t granted = 0;
+    uint8_t batch[256], input[4] = {0, 0, 0, 0}, output[4];
+    wchar_t path[64];
+    HANDLE read_only;
+    DWORD returned, error;
+    a = chmlink_open(index); CHECK(a != NULL);
+    CHECK(chmlink_set_offload(a, CHMLINK_OFFLOAD_ALL, &granted));
+    CHECK((granted & ~(uint32_t)CHMLINK_OFFLOAD_ALL) == 0 && granted != 0);
+    CHECK(chmlink_query(a, &info) && info.offload == granted);
+    CHECK((info.capabilities & CHMLINK_CAP_OFFLOAD) != 0);
+    CHECK(!chmlink_set_offload(a, 0x10, NULL) && GetLastError() == ERROR_INVALID_PARAMETER);
+    /* NEEDS_CSUM without DATA_VALID is refused before it reaches the ring. */
+    CHECK(!chmlink_inject(a, batch, offload_batch(batch, sizeof(batch), CHMLINK_OFFLOAD_NEEDS_CSUM)) &&
+          GetLastError() == ERROR_INVALID_PARAMETER);
+    chmlink_close(a);
+    /* The setting belongs to the session. */
+    a = chmlink_open(index); CHECK(a != NULL);
+    CHECK(chmlink_query(a, &info) && info.offload == 0);
+    CHECK(!chmlink_inject(a, batch, offload_batch(batch, sizeof(batch), CHMLINK_OFFLOAD_DATA_VALID)) &&
+          GetLastError() == ERROR_INVALID_PARAMETER);
+    chmlink_close(a);
+    /* SET_OFFLOAD on an inspection handle. */
+    swprintf(path, 64, L"\\\\.\\ChmLink%lu", (unsigned long)index);
+    read_only = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    CHECK(read_only != INVALID_HANDLE_VALUE);
+    SetLastError(ERROR_SUCCESS);
+    CHECK(!DeviceIoControl(read_only, CHMLINK_IOCTL_SET_OFFLOAD, input, sizeof(input),
+                           output, sizeof(output), &returned, NULL));
+    error = GetLastError();
+    CloseHandle(read_only);
+    CHECK(error == ERROR_ACCESS_DENIED);
+    puts("PASS session offloads: granted matches QUERY, reset on close, refused descriptors");
+}
 
 typedef struct waiter {
     chmlink_adapter *adapter;
@@ -212,5 +271,6 @@ int wmain(int argc, wchar_t **argv)
     puts("PASS timeout, cancellation, busy wait, close drain, session isolation, process exit and reopen");
     lifecycle_queue_check(first, second);
     lifecycle_sdk_check(first);
+    offload_check(first);
     return 0;
 }

@@ -215,7 +215,7 @@ static DWORD WINAPI consumer_thread(void *arg)
 
 typedef struct injector_args {
     chmlink_adapter *a; const uint8_t *batch; uint32_t length, count;
-    volatile LONG *stop; uint64_t calls, packets, errors; DWORD last_error;
+    volatile LONG *stop; uint64_t calls, packets, full, errors; DWORD last_error;
 } injector_args;
 
 static DWORD WINAPI injector_thread(void *arg)
@@ -223,7 +223,13 @@ static DWORD WINAPI injector_thread(void *arg)
     injector_args *j = arg;
     while (!*j->stop) {
         if (chmlink_inject(j->a, j->batch, j->length)) { j->calls++; j->packets += j->count; }
-        else { j->errors++; j->last_error = GetLastError(); SwitchToThread(); }
+        else {
+            DWORD e = GetLastError();
+            /* A full ring is back-pressure, not an error: the batch was not taken. */
+            if (e == ERROR_BUFFER_OVERFLOW) j->full++;
+            else { j->errors++; j->last_error = e; }
+            SwitchToThread();
+        }
     }
     return 0;
 }
@@ -303,7 +309,7 @@ static void run_load(chmlink_adapter *a, const chmlink_adapter_info *info, const
     LARGE_INTEGER t0, t1, t2;
     uint8_t *drain_buffer = malloc(CHMLINK_BATCH_MAX_SIZE), *batch = NULL;
     uint32_t batch_length = 0;
-    uint64_t sent = 0, send_errors = 0, injected = 0, inject_calls = 0, inject_errors = 0;
+    uint64_t sent = 0, send_errors = 0, injected = 0, inject_calls = 0, inject_errors = 0, inject_full = 0;
     double wall_producers, wall_total;
     cpu_delta cpu;
     SOCKET tx_socket = INVALID_SOCKET, rx_socket = INVALID_SOCKET;
@@ -356,7 +362,7 @@ static void run_load(chmlink_adapter *a, const chmlink_adapter_info *info, const
     for (i = 0; i < cfg->tx_senders; ++i) { sent += senders[i].sent; send_errors += senders[i].errors; }
     for (i = 0; i < cfg->rx_injectors; ++i) {
         injected += injectors[i].packets; inject_calls += injectors[i].calls;
-        inject_errors += injectors[i].errors; if (injectors[i].last_error) inject_error = injectors[i].last_error;
+        inject_errors += injectors[i].errors; inject_full += injectors[i].full; if (injectors[i].last_error) inject_error = injectors[i].last_error;
     }
     {
         uint64_t delivered = consumer.packets;
@@ -383,12 +389,12 @@ static void run_load(chmlink_adapter *a, const chmlink_adapter_info *info, const
         if (cfg->rx_injectors) {
             printf(",\"rx_injectors\":%d,\"rx_payload\":%d,\"rx_batch\":%u,\"rx_injected_pps\":%.0f,"
                    "\"rx_received_pps\":%.0f,\"rx_received_mbps\":%.1f,\"rx_loss_pct\":%.2f,"
-                   "\"rx_inject_calls_per_s\":%.0f,\"rx_inject_errors\":%llu,\"rx_last_error\":%lu,"
+                   "\"rx_inject_calls_per_s\":%.0f,\"rx_inject_full_per_s\":%.0f,\"rx_inject_errors\":%llu,\"rx_last_error\":%lu,"
                    "\"drv_rx_packets\":%llu,\"drv_rx_discards\":%llu",
                    cfg->rx_injectors, cfg->rx_payload, cfg->rx_batch, injected / wall_producers,
                    receiver.packets / wall_producers, (receiver.packets * (28.0 + cfg->rx_payload)) * 8.0 / wall_producers / 1e6,
                    injected ? 100.0 * (1.0 - (double)receiver.packets / (double)injected) : 0.0,
-                   inject_calls / wall_producers, (unsigned long long)inject_errors, inject_error,
+                   inject_calls / wall_producers, inject_full / wall_producers, (unsigned long long)inject_errors, inject_error,
                    (unsigned long long)(after.rx_packets - before.rx_packets),
                    (unsigned long long)(after.rx_discards - before.rx_discards));
         }
@@ -521,8 +527,8 @@ int main(int argc, char **argv)
     REQUIRE(chmlink_query(a, &info));
     REQUIRE(info.mode == CHMLINK_MODE_IP);
     printf("{\"event\":\"info\",\"cpus\":%lu,\"seconds\":%.1f,\"mtu\":%u,\"packet_limit\":%u,"
-           "\"queue_capacity\":%u,\"capabilities\":%u}\n",
-           cpu_count, seconds, info.mtu, info.packet_limit, info.queue_capacity, info.capabilities);
+           "\"ring_capacity\":%u,\"capabilities\":%u}\n",
+           cpu_count, seconds, info.mtu, info.packet_limit, info.ring_capacity, info.capabilities);
     fflush(stdout);
 
     if (selected("latency")) run_latency(a, &info, seconds, 64);

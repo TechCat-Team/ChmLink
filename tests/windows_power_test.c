@@ -138,7 +138,13 @@ int wmain(int argc, wchar_t **argv)
     REQUIRE(after.interface_index == before.interface_index);
     length = foreign_frame_batch(batch, sizeof(batch));
     REQUIRE(chmlink_inject(a, batch, length));
-    REQUIRE(chmlink_query(a, &after));
+    /* Injection is asynchronous; the session thread counts it shortly. */
+    deadline = GetTickCount64() + 5000;
+    do {
+        REQUIRE(chmlink_query(a, &after));
+        if (after.rx_discards > before.rx_discards) break;
+        Sleep(10);
+    } while (GetTickCount64() < deadline);
     REQUIRE(after.rx_discards > before.rx_discards);
     REQUIRE(chmlink_wait_readable(a, 0) || GetLastError() == ERROR_TIMEOUT);
     chmlink_close(a);

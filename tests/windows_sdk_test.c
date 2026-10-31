@@ -85,8 +85,16 @@ static void concurrent_calls(uint32_t index)
         CloseHandle(threads[i]); free(callers[i].buffer);
     }
     CloseHandle(start);
-    REQUIRE(chmlink_query(a, &after));
-    /* Every injected frame was refused by the receive filter and counted. */
+    /* Injection is asynchronous: wait for the session thread to account for
+     * every frame, then check that each was refused by the receive filter. */
+    {
+        ULONGLONG deadline = GetTickCount64() + 30000;
+        do {
+            REQUIRE(chmlink_query(a, &after));
+            if (after.rx_discards - before.rx_discards >= (uint64_t)SDK_THREADS * SDK_ROUNDS) break;
+            Sleep(10);
+        } while (GetTickCount64() < deadline);
+    }
     REQUIRE(after.rx_discards - before.rx_discards == (uint64_t)SDK_THREADS * SDK_ROUNDS);
     chmlink_close(a);
 }

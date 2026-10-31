@@ -1,7 +1,11 @@
 #requires -Version 5.1
 # Opt-in data-path benchmark for the disposable test VM. Creates one owned
 # IP-mode adapter, assigns 198.18.0.1/24 (benchmarking range), runs
-# chmlink-bench against simulated peer 198.18.0.2 and removes the adapter.
+# chmlink-bench against simulated peer 198.18.0.2, then chmlink-tcp-bench
+# (TCP through the stack, with 198.18.0.3 as the reflected alias). Then an
+# Ethernet-mode adapter on 198.18.1.0/24 runs chmlink-tcp-bench without and
+# with task offloads (Windows uses them in Ethernet mode only). Adapters are
+# removed at the end. -Filter tcp runs the TCP part only.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InfPath,
@@ -14,7 +18,9 @@ param(
 if (-not $BuildDirectory) { $BuildDirectory = Join-Path $PSScriptRoot '../build/verify/Release' }
 $ErrorActionPreference = 'Stop'
 $owner = [guid]'3F6B2D7E-91A4-4C58-B0E2-7A1D5C9E4B36'
-$local = '198.18.0.1'; $peer = '198.18.0.2'
+$local = '198.18.0.1'; $peer = '198.18.0.2'; $alias = '198.18.0.3'
+# The Ethernet-mode adapter for the offload TCP benchmark gets its own subnet.
+$ethLocal = '198.18.1.1'; $ethPeer = '198.18.1.2'; $ethAlias = '198.18.1.3'
 $devices = @(); $exitCode = 1
 function Run-Device([string[]]$Arguments) {
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -32,7 +38,7 @@ try {
     if (!(Test-Path -LiteralPath $tool) -or !(Test-Path -LiteralPath $bench)) { throw 'Build chmlink-bench and the device tool first.' }
     if (Test-Path -LiteralPath $OutputDirectory) { throw 'Use a fresh output directory.' }
     $output = New-Item -ItemType Directory -Path $OutputDirectory
-    foreach ($ip in @($local, $peer)) {
+    foreach ($ip in @($local, $peer, $alias, $ethLocal, $ethPeer, $ethAlias)) {
         if (Get-NetIPAddress -IPAddress $ip -ErrorAction SilentlyContinue) { throw "Benchmark address already assigned: $ip" }
     }
     $inf = (Resolve-Path -LiteralPath $InfPath).Path
@@ -56,19 +62,68 @@ try {
         Started = (Get-Date).ToString('s')
     } | ConvertTo-Json | Set-Content (Join-Path $output.FullName 'environment.json') -Encoding UTF8
     Start-Sleep -Seconds 3   # let address registration and IPv6 neighbor chatter settle
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = $bench; $start.Arguments = "$index $local $peer $Seconds $Filter".Trim()
-    $start.UseShellExecute = $false; $start.CreateNoWindow = $true
-    $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
-    $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
-    if (!$process.Start()) { throw 'Cannot start the benchmark.' }
-    $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
-    $deadline = [int](($Seconds * 20 + 60) * 1000)
-    if (!$process.WaitForExit($deadline)) { $process.Kill(); throw 'Benchmark exceeded its deadline.' }
-    $process.WaitForExit()
-    $stdout.Result | Set-Content (Join-Path $output.FullName 'bench.jsonl') -Encoding UTF8
-    $stderr.Result | Set-Content (Join-Path $output.FullName 'bench.err') -Encoding UTF8
-    if ($process.ExitCode -ne 0) { throw "Benchmark exited $($process.ExitCode); inspect bench.err." }
+    function Invoke-Bench([string]$Program, [string]$Arguments, [string]$Label, [int]$DeadlineSeconds) {
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $Program; $start.Arguments = $Arguments
+        $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::new(); $process.StartInfo = $start
+        if (!$process.Start()) { throw "Cannot start $Label." }
+        $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
+        if (!$process.WaitForExit($DeadlineSeconds * 1000)) { $process.Kill(); throw "$Label exceeded its deadline." }
+        $process.WaitForExit()
+        $stdout.Result | Add-Content (Join-Path $output.FullName 'bench.jsonl') -Encoding UTF8
+        $stderr.Result | Add-Content (Join-Path $output.FullName 'bench.err') -Encoding UTF8
+        if ($process.ExitCode -ne 0) { throw "$Label exited $($process.ExitCode); inspect bench.err." }
+    }
+    $tcpOnly = $Filter -eq 'tcp'
+    if (!$tcpOnly) {
+        Invoke-Bench $bench "$index $local $peer $Seconds $Filter".Trim() 'benchmark' ([int]($Seconds * 20 + 60))
+    }
+    if ($Filter -eq '' -or $tcpOnly) {
+        $tcpBench = Join-Path $build 'chmlink-tcp-bench.exe'
+        if (!(Test-Path -LiteralPath $tcpBench)) { throw 'Build chmlink-tcp-bench first.' }
+        # IP mode: Windows uses no task offloads there, so one plain run.
+        Invoke-Bench $tcpBench "$index $local $peer $alias $Seconds 4" 'TCP benchmark (IP mode)' ([int]($Seconds * 4 + 60))
+
+        # Ethernet mode: without and with offloads. The reflector answers ARP itself.
+        $eth = Run-Device @('create', $inf, '--owner', $owner.ToString('B'), '--mode', 'ethernet', '--name', 'ChmLink Bench Ethernet') | ConvertFrom-Json
+        $devices += $eth
+        if ($deviceRestart) { throw 'Device installation requires a restart; stopping before the benchmark.' }
+        $ethWindows = @(Get-CimInstance Win32_NetworkAdapter | Where-Object PNPDeviceID -eq $eth.InstanceId)
+        if ($ethWindows.Count -ne 1 -or !$ethWindows[0].GUID) { throw 'Ethernet test interface is not ready.' }
+        $ethAdapter = @(Get-NetAdapter -IncludeHidden | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$ethWindows[0].GUID })
+        if ($ethAdapter.Count -ne 1) { throw 'Cannot resolve the unique Ethernet test adapter.' }
+        $ethIndex = $ethAdapter[0].ifIndex
+        Set-NetIPInterface -InterfaceIndex $ethIndex -AddressFamily IPv4 -Dhcp Disabled -PolicyStore ActiveStore
+        New-NetIPAddress -InterfaceIndex $ethIndex -IPAddress $ethLocal -PrefixLength 24 -PolicyStore ActiveStore | Out-Null
+        Start-Sleep -Seconds 3
+
+        # What Windows believes about the adapter's offloads, sampled in each half.
+        $phase = 2 * ($Seconds + 0.2) + 1.5
+        $state = Start-Job -ArgumentList $ethIndex, $phase, (Join-Path $output.FullName 'offload-state.txt') -ScriptBlock {
+            param($ifIndex, $phase, $path)
+            [Console]::OutputEncoding = [Text.Encoding]::UTF8; chcp 65001 | Out-Null
+            foreach ($label in 'without offloads', 'with offloads') {
+                Start-Sleep -Milliseconds ([int]($phase * 500 + 1000))
+                $name = (Get-NetAdapter -IncludeHidden | Where-Object ifIndex -eq $ifIndex).Name
+                "== $label ($(Get-Date -Format s))" | Add-Content $path -Encoding UTF8
+                foreach ($probe in { Get-NetAdapterLso -Name $name -IncludeHidden | Format-List * },
+                                   { Get-NetAdapterChecksumOffload -Name $name -IncludeHidden | Format-List * },
+                                   { Get-NetAdapterRsc -Name $name -IncludeHidden | Format-List * },
+                                   { netsh int ipv4 show offload $ifIndex }) {
+                    try { & $probe 2>&1 | Out-String -Width 200 | Add-Content $path -Encoding UTF8 }
+                    catch { "probe failed: $_" | Add-Content $path -Encoding UTF8 }
+                }
+                Start-Sleep -Milliseconds ([int]($phase * 500))
+            }
+        }
+        try {
+            Invoke-Bench $tcpBench "$ethIndex $ethLocal $ethPeer $ethAlias $Seconds 4" 'TCP benchmark (Ethernet mode)' ([int]($Seconds * 8 + 90))
+        } finally {
+            $state | Wait-Job -Timeout 30 | Out-Null; $state | Remove-Job -Force
+        }
+    }
     'PASS benchmark complete'; $exitCode = 0
 } catch { Write-Warning $_.Exception.Message }
 finally {

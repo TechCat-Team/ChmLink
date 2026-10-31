@@ -8,28 +8,65 @@
 #include "chmlink/device.h"
 #include "chmlink/protocol.h"
 #include "chmlink/query.h"
+#include "chmlink/ring.h"
+#include "chmlink/session.h"
 
-/* Completion events for the overlapped requests (see device_ioctl) are
- * cached per adapter: a call takes one in enter() and returns it in leave(),
- * under the lock those already take. The cache holds at most
- * CHMLINK_EVENT_CACHE events, enough for the usual receive, inject, query and
- * wait threads; more concurrent calls create and close their own. Close frees
- * them all. The SDK keeps no per-thread or process-wide state, so it can be
- * linked into a DLL that is unloaded. */
+/* Completion events for the remaining synchronous requests (QUERY,
+ * SET_OFFLOAD, REGISTER_RINGS) are cached per adapter: a call takes one in
+ * enter() and returns it in leave(). Ring calls do not need an event and do
+ * not take one. The cache holds at most CHMLINK_EVENT_CACHE events,
+ * enough for the usual query and offload threads; more concurrent calls
+ * create and close their own. Close frees them all. The SDK keeps no
+ * per-thread or process-wide state, so it can be linked into a DLL that is
+ * unloaded. */
 #define CHMLINK_EVENT_CACHE 8
+#define CHMLINK_DEFAULT_RING (4u * 1024u * 1024u)
+#define CHMLINK_RX_ENTRIES_MIN 1024u
+#define CHMLINK_TX_ENTRIES_MIN 256u
+
+/* A record read but not released yet. start is the record header offset in
+ * the ring, end the position after it. */
+typedef struct chmlink_rx_entry {
+    uint32_t start;
+    uint32_t end;
+    BOOL released;
+} chmlink_rx_entry;
+
+/* A reserved but not published send record. */
+typedef struct chmlink_tx_entry {
+    uint32_t start;
+    uint32_t end;
+    BOOL published;
+} chmlink_tx_entry;
 
 struct chmlink_adapter {
     HANDLE device;
     uint32_t packet_limit;
     chmlink_mode mode;
     uint32_t capabilities;
-    HANDLE ready_event, cancel_event, close_event;
+    uint32_t offload;
+    HANDLE cancel_event, close_event;
     SRWLOCK gate;
     CONDITION_VARIABLE drained;
     ULONG active;
     BOOL closing, waiting;
     ULONG cached;
     HANDLE events[CHMLINK_EVENT_CACHE];
+
+    void *from_memory, *to_memory;
+    uint32_t from_capacity, to_capacity;
+    chmlink_ring from, to;
+    HANDLE from_event, to_event;
+
+    SRWLOCK rx_lock;
+    uint32_t rx_cursor;            /* next record to read */
+    chmlink_rx_entry *rx_entries;
+    uint32_t rx_count, rx_entries_capacity, rx_head;
+
+    SRWLOCK tx_lock;
+    uint32_t tx_cursor;            /* next free record position */
+    chmlink_tx_entry *tx_entries;
+    uint32_t tx_count, tx_entries_capacity, tx_head;
 };
 
 static HANDLE new_request_event(void)
@@ -37,10 +74,10 @@ static HANDLE new_request_event(void)
     return CreateEventW(NULL, TRUE, FALSE, NULL);
 }
 
-/* Admit a call and give it a completion event. */
+/* Admit a call and give it a completion event when it needs one. */
 static int enter(chmlink_adapter *a, HANDLE *event)
 {
-    *event = NULL;
+    if (event != NULL) *event = NULL;
     if (a == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
     AcquireSRWLockExclusive(&a->gate);
     if (a->closing) {
@@ -48,10 +85,10 @@ static int enter(chmlink_adapter *a, HANDLE *event)
         SetLastError(ERROR_OPERATION_ABORTED); return 0;
     }
     a->active++;
-    if (a->cached != 0) *event = a->events[--a->cached];
+    if (event != NULL && a->cached != 0) *event = a->events[--a->cached];
     ReleaseSRWLockExclusive(&a->gate);
-    if (*event == NULL) *event = new_request_event();
-    if (*event == NULL) {
+    if (event != NULL && *event == NULL) *event = new_request_event();
+    if (event != NULL && *event == NULL) {
         DWORD error = GetLastError();
         AcquireSRWLockExclusive(&a->gate);
         if (--a->active == 0) WakeAllConditionVariable(&a->drained);
@@ -75,13 +112,11 @@ static int leave(chmlink_adapter *a, HANDLE event, int result)
 }
 
 /* Device handles are opened for overlapped I/O. On a synchronous handle the
- * I/O manager serializes every request on the file object, so a thread in a
- * tight inject loop would starve a concurrent receive or readiness query.
- * Each request still behaves synchronously for the caller: device_ioctl waits
- * on the caller's event until the driver completes it. Preserves the
- * request's error code; a request cancelled by chmlink_close fails with
- * ERROR_OPERATION_ABORTED. The event is manual-reset; DeviceIoControl resets
- * it when the request starts. */
+ * I/O manager serializes every request on the file object. Each request
+ * still behaves synchronously for the caller: device_ioctl waits on the
+ * caller's event until the driver completes it. Preserves the request's
+ * error code; a request cancelled by chmlink_close fails with
+ * ERROR_OPERATION_ABORTED. */
 static BOOL device_ioctl(HANDLE device, HANDLE event, DWORD code, const void *input, DWORD input_size,
                          void *output, DWORD output_size, DWORD *returned)
 {
@@ -145,8 +180,9 @@ static int query_device(HANDLE device, HANDLE event, chmlink_adapter_info *info)
     next.version = wire.version; next.capabilities = wire.capabilities;
     next.state = wire.state; next.mode = wire.mode;
     next.interface_index = wire.interface_index; next.mtu = wire.mtu;
-    next.packet_limit = wire.packet_limit; next.queue_capacity = wire.queue_capacity;
-    next.queued_packets = wire.queued_packets; next.packet_filter = wire.packet_filter;
+    next.packet_limit = wire.packet_limit; next.ring_capacity = wire.ring_capacity;
+    next.ring_pending_bytes = wire.ring_pending_bytes; next.packet_filter = wire.packet_filter;
+    next.offload = wire.offload;
     memcpy(next.mac, wire.mac, sizeof(next.mac));
     for (i = 0; i < 39; ++i) next.interface_id[i] = (char)id[i];
     next.tx_packets = wire.tx_packets; next.tx_bytes = wire.tx_bytes;
@@ -186,12 +222,73 @@ int chmlink_query(chmlink_adapter *adapter, chmlink_adapter_info *info)
     return leave(adapter, event, result);
 }
 
-chmlink_adapter *chmlink_open(uint32_t index)
+static void release_resources(chmlink_adapter *adapter)
+{
+    ULONG i;
+    if (adapter->device != NULL && adapter->device != INVALID_HANDLE_VALUE) {
+        CloseHandle(adapter->device);
+        adapter->device = INVALID_HANDLE_VALUE;
+    }
+    if (adapter->from_memory != NULL) VirtualFree(adapter->from_memory, 0, MEM_RELEASE);
+    if (adapter->to_memory != NULL) VirtualFree(adapter->to_memory, 0, MEM_RELEASE);
+    if (adapter->from_event != NULL) CloseHandle(adapter->from_event);
+    if (adapter->to_event != NULL) CloseHandle(adapter->to_event);
+    if (adapter->cancel_event != NULL) CloseHandle(adapter->cancel_event);
+    if (adapter->close_event != NULL) CloseHandle(adapter->close_event);
+    for (i = 0; i < adapter->cached; ++i) CloseHandle(adapter->events[i]);
+    HeapFree(GetProcessHeap(), 0, adapter->rx_entries);
+    HeapFree(GetProcessHeap(), 0, adapter->tx_entries);
+    HeapFree(GetProcessHeap(), 0, adapter);
+}
+
+static int register_rings(chmlink_adapter *adapter, HANDLE event)
+{
+    uint8_t bytes[CHMLINK_SESSION_SIZE];
+    chmlink_session_rings rings;
+    DWORD received;
+    memset(&rings, 0, sizeof(rings));
+    rings.version = CHMLINK_SESSION_VERSION;
+    rings.from_windows_ring = (uint64_t)(ULONG_PTR)adapter->from_memory;
+    rings.from_windows_capacity = adapter->from_capacity;
+    rings.from_windows_event = (uint64_t)(ULONG_PTR)adapter->from_event;
+    rings.to_windows_ring = (uint64_t)(ULONG_PTR)adapter->to_memory;
+    rings.to_windows_capacity = adapter->to_capacity;
+    rings.to_windows_event = (uint64_t)(ULONG_PTR)adapter->to_event;
+    chmlink_session_encode(bytes, &rings);
+    return device_ioctl(adapter->device, event, CHMLINK_IOCTL_REGISTER_RINGS, bytes,
+                        sizeof(bytes), NULL, 0, &received) != 0;
+}
+
+/* Caller must have validated capacity. Allocates a ring and its address
+ * space; the driver locks it at registration. */
+static int create_ring(void **memory, chmlink_ring *ring, uint32_t capacity)
+{
+    void *base = VirtualAlloc(NULL, CHMLINK_RING_HEADER_SIZE + capacity,
+                              MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (base == NULL) return 0;
+    if (!chmlink_ring_attach(ring, base, capacity)) {
+        VirtualFree(base, 0, MEM_RELEASE);
+        return 0;
+    }
+    chmlink_ring_reset(ring);
+    *memory = base;
+    return 1;
+}
+
+chmlink_adapter *chmlink_open_ex(uint32_t index, const chmlink_open_options *options)
 {
     HANDLE device, event;
     chmlink_adapter *adapter;
     chmlink_adapter_info info;
+    uint32_t capacity = CHMLINK_DEFAULT_RING;
     DWORD error;
+
+    if (options != NULL) {
+        if (options->size != sizeof(*options)) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+        if (options->ring_capacity != 0) capacity = options->ring_capacity;
+    }
+    if (!chmlink_ring_capacity_valid(capacity)) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+
     event = new_request_event();
     if (event == NULL) return NULL;
     device = open_device(index, GENERIC_READ | GENERIC_WRITE);
@@ -207,6 +304,7 @@ chmlink_adapter *chmlink_open(uint32_t index)
         SetLastError(ERROR_NOT_FOUND);
         return NULL;
     }
+
     adapter = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*adapter));
     if (adapter == NULL) {
         CloseHandle(device); CloseHandle(event);
@@ -219,32 +317,47 @@ chmlink_adapter *chmlink_open(uint32_t index)
     adapter->packet_limit = info.packet_limit;
     adapter->mode = (chmlink_mode)info.mode;
     adapter->capabilities = info.capabilities;
+    adapter->offload = info.offload;
+    adapter->from_capacity = capacity;
+    adapter->to_capacity = capacity;
     InitializeSRWLock(&adapter->gate);
+    InitializeSRWLock(&adapter->rx_lock);
+    InitializeSRWLock(&adapter->tx_lock);
     InitializeConditionVariable(&adapter->drained);
-    adapter->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!adapter->ready_event) {
-        DWORD error = GetLastError(); chmlink_close(adapter); SetLastError(error); return NULL;
-    }
     adapter->cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!adapter->cancel_event) {
-        DWORD error = GetLastError(); chmlink_close(adapter); SetLastError(error); return NULL;
-    }
     adapter->close_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!adapter->close_event) {
-        DWORD error = GetLastError(); chmlink_close(adapter); SetLastError(error); return NULL;
+    adapter->from_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    adapter->to_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    adapter->rx_entries_capacity = CHMLINK_RX_ENTRIES_MIN;
+    adapter->tx_entries_capacity = CHMLINK_TX_ENTRIES_MIN;
+    adapter->rx_entries = HeapAlloc(GetProcessHeap(), 0,
+        adapter->rx_entries_capacity * sizeof(*adapter->rx_entries));
+    adapter->tx_entries = HeapAlloc(GetProcessHeap(), 0,
+        adapter->tx_entries_capacity * sizeof(*adapter->tx_entries));
+    if (adapter->cancel_event == NULL || adapter->close_event == NULL ||
+        adapter->from_event == NULL || adapter->to_event == NULL ||
+        adapter->rx_entries == NULL || adapter->tx_entries == NULL) {
+        error = GetLastError(); release_resources(adapter); SetLastError(error); return NULL;
     }
-    if (info.capabilities & CHMLINK_CAP_WAIT) {
-        uint8_t bytes[8];
-        uint64_t handle = (uint64_t)(ULONG_PTR)adapter->ready_event;
-        DWORD received;
-        unsigned int i;
-        for (i = 0; i < 8; ++i) bytes[i] = (uint8_t)(handle >> (i * 8));
-        if (!device_ioctl(device, event, CHMLINK_IOCTL_REGISTER_READ_EVENT, bytes,
-                          sizeof(bytes), NULL, 0, &received)) {
-            DWORD error = GetLastError(); chmlink_close(adapter); SetLastError(error); return NULL;
-        }
+    if (!create_ring(&adapter->from_memory, &adapter->from, capacity) ||
+        !create_ring(&adapter->to_memory, &adapter->to, capacity)) {
+        error = GetLastError() ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY;
+        release_resources(adapter); SetLastError(error); return NULL;
+    }
+    if (!register_rings(adapter, event)) {
+        error = GetLastError();
+        /* release_resources closes the device, which is what unlocks the
+         * pages, and only then frees the ring memory. */
+        release_resources(adapter);
+        SetLastError(error);
+        return NULL;
     }
     return adapter;
+}
+
+chmlink_adapter *chmlink_open(uint32_t index)
+{
+    return chmlink_open_ex(index, NULL);
 }
 
 chmlink_adapter *chmlink_open_by_id(const char *id)
@@ -316,67 +429,421 @@ int chmlink_enumerate(chmlink_enum_callback callback, void *context)
 void chmlink_close(chmlink_adapter *adapter)
 {
     if (adapter != NULL) {
-        ULONG i;
         AcquireSRWLockExclusive(&adapter->gate);
         adapter->closing = TRUE;
         if (adapter->close_event) SetEvent(adapter->close_event);
-        /* No new call is admitted now. Cancel what the calls in progress have
-         * outstanding, and keep cancelling until they have left: a call that
-         * was admitted but had not yet issued its request when one round of
-         * cancellation ran would otherwise be missed. The current driver
-         * completes every request without pending it, so this normally ends
-         * after one round; it guarantees that close never waits on the driver.
-         * ERROR_NOT_FOUND (nothing outstanding) is the normal result. */
+        /* No new call is admitted now. Wake waits and wait for calls already
+         * inside to leave before the rings disappear. */
         while (adapter->active != 0) {
             ReleaseSRWLockExclusive(&adapter->gate);
-            (void)CancelIoEx(adapter->device, NULL);
+            if (adapter->device != INVALID_HANDLE_VALUE && adapter->device != NULL)
+                (void)CancelIoEx(adapter->device, NULL);
             AcquireSRWLockExclusive(&adapter->gate);
             if (adapter->active != 0)
                 SleepConditionVariableSRW(&adapter->drained, &adapter->gate, 10, 0);
         }
         ReleaseSRWLockExclusive(&adapter->gate);
-        CloseHandle(adapter->device);
-        for (i = 0; i < adapter->cached; ++i) CloseHandle(adapter->events[i]);
-        if (adapter->ready_event) CloseHandle(adapter->ready_event);
-        if (adapter->cancel_event) CloseHandle(adapter->cancel_event);
-        if (adapter->close_event) CloseHandle(adapter->close_event);
-        HeapFree(GetProcessHeap(), 0, adapter);
+        /* Closing the device runs the driver's cleanup, which waits for its
+         * thread and every indicated NBL, then unlocks the ring pages. */
+        if (adapter->device != INVALID_HANDLE_VALUE && adapter->device != NULL) {
+            CloseHandle(adapter->device);
+            adapter->device = INVALID_HANDLE_VALUE;
+        }
+        release_resources(adapter);
     }
+}
+
+void *chmlink_get_read_event(chmlink_adapter *adapter)
+{
+    if (adapter == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    return adapter->from_event;
+}
+
+/* ---- receiving ---- */
+
+static int rx_push(chmlink_adapter *a, uint32_t start, uint32_t end, BOOL released)
+{
+    if (a->rx_count == a->rx_entries_capacity) {
+        if (a->rx_head != 0) {
+            memmove(a->rx_entries, a->rx_entries + a->rx_head,
+                    (a->rx_count - a->rx_head) * sizeof(*a->rx_entries));
+            a->rx_count -= a->rx_head;
+            a->rx_head = 0;
+        } else {
+            uint32_t capacity = a->rx_entries_capacity * 2;
+            chmlink_rx_entry *grown;
+            if (capacity > a->from_capacity / (CHMLINK_RING_RECORD_HEADER + 16u) + 16u)
+                return 0;
+            grown = HeapReAlloc(GetProcessHeap(), 0, a->rx_entries,
+                                capacity * sizeof(*a->rx_entries));
+            if (grown == NULL) return 0;
+            a->rx_entries = grown;
+            a->rx_entries_capacity = capacity;
+        }
+    }
+    a->rx_entries[a->rx_count].start = start;
+    a->rx_entries[a->rx_count].end = end;
+    a->rx_entries[a->rx_count].released = released;
+    a->rx_count++;
+    return 1;
+}
+
+/* Publish the contiguous released prefix to the driver. */
+static void rx_advance(chmlink_adapter *a)
+{
+    uint32_t end = 0;
+    BOOL advanced = FALSE;
+    while (a->rx_head < a->rx_count && a->rx_entries[a->rx_head].released) {
+        end = a->rx_entries[a->rx_head].end;
+        a->rx_head++;
+        advanced = TRUE;
+    }
+    if (advanced) chmlink_ring_release(&a->from, end);
+    if (a->rx_head == a->rx_count) a->rx_head = a->rx_count = 0;
+}
+
+static int rx_pending(chmlink_adapter *a)
+{
+    int pending;
+    uint32_t tail;
+    AcquireSRWLockExclusive(&a->rx_lock);
+    tail = chmlink_ring_load(&a->from, CHMLINK_RING_TAIL_OFFSET);
+    pending = a->rx_cursor != tail;
+    ReleaseSRWLockExclusive(&a->rx_lock);
+    return pending;
+}
+
+const uint8_t *chmlink_receive_packet(chmlink_adapter *adapter, uint32_t *size,
+                                      chmlink_offload *offload)
+{
+    chmlink_ring_status status;
+    chmlink_offload descriptor;
+    uint32_t offset = 0, length = 0, saved;
+    const uint8_t *packet = NULL;
+    if (size != NULL) *size = 0;
+    if (offload != NULL) memset(offload, 0, sizeof(*offload));
+    if (size == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    if (!enter(adapter, NULL)) return NULL;
+    AcquireSRWLockExclusive(&adapter->rx_lock);
+    saved = adapter->rx_cursor;
+    status = chmlink_ring_next(&adapter->from, &adapter->rx_cursor,
+        chmlink_ring_load(&adapter->from, CHMLINK_RING_TAIL_OFFSET), adapter->packet_limit,
+        &offset, &length, &descriptor);
+    if (status == CHMLINK_RING_OK) {
+        if (!rx_push(adapter, offset - CHMLINK_RING_RECORD_HEADER, adapter->rx_cursor, FALSE)) {
+            adapter->rx_cursor = saved;
+            status = CHMLINK_RING_FULL;
+        } else {
+            packet = adapter->from.data + offset;
+            *size = length;
+            if (offload != NULL) *offload = descriptor;
+        }
+    }
+    ReleaseSRWLockExclusive(&adapter->rx_lock);
+    if (packet == NULL) {
+        DWORD error = status == CHMLINK_RING_EMPTY ? ERROR_NO_MORE_ITEMS :
+                      status == CHMLINK_RING_FULL ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_DATA;
+        leave(adapter, NULL, 0);
+        SetLastError(error);
+        return NULL;
+    }
+    leave(adapter, NULL, 1);
+    return packet;
+}
+
+void chmlink_release_packet(chmlink_adapter *adapter, const uint8_t *packet)
+{
+    uint32_t start, i;
+    if (adapter == NULL || packet == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return; }
+    if ((uintptr_t)packet < (uintptr_t)(adapter->from.data + CHMLINK_RING_RECORD_HEADER) ||
+        (uintptr_t)packet >= (uintptr_t)(adapter->from.data + adapter->from.capacity)) {
+        SetLastError(ERROR_INVALID_PARAMETER); return;
+    }
+    if (!enter(adapter, NULL)) return;
+    AcquireSRWLockExclusive(&adapter->rx_lock);
+    start = (uint32_t)(packet - adapter->from.data) - CHMLINK_RING_RECORD_HEADER;
+    for (i = adapter->rx_head; i < adapter->rx_count; ++i) {
+        if (adapter->rx_entries[i].start == start && !adapter->rx_entries[i].released) {
+            adapter->rx_entries[i].released = TRUE;
+            rx_advance(adapter);
+            break;
+        }
+    }
+    if (adapter->rx_head > 256 && adapter->rx_head * 2 > adapter->rx_count) {
+        memmove(adapter->rx_entries, adapter->rx_entries + adapter->rx_head,
+                (adapter->rx_count - adapter->rx_head) * sizeof(*adapter->rx_entries));
+        adapter->rx_count -= adapter->rx_head;
+        adapter->rx_head = 0;
+    }
+    ReleaseSRWLockExclusive(&adapter->rx_lock);
+    leave(adapter, NULL, 1);
 }
 
 int chmlink_receive(chmlink_adapter *adapter, void *buffer, uint32_t capacity,
                     uint32_t *bytes_received)
 {
-    DWORD received = 0;
-    HANDLE event;
-    int result;
+    chmlink_batch_writer writer = {0};
+    uint32_t count = 0, probe, tail;
+    BOOL offload_batch = FALSE;
+    int result = 0;
     if (bytes_received != NULL) *bytes_received = 0;
     if (adapter == NULL || buffer == NULL || bytes_received == NULL ||
         capacity < CHMLINK_BATCH_HEADER_SIZE || capacity > CHMLINK_BATCH_MAX_SIZE) {
         SetLastError(ERROR_INVALID_PARAMETER); return 0;
     }
-    if (!enter(adapter, &event)) return 0;
-    result = device_ioctl(adapter->device, event, CHMLINK_IOCTL_RECEIVE, NULL, 0,
-                          buffer, capacity, &received) != 0;
-    if (!result) return leave(adapter, event, 0);
-    if (chmlink_batch_validate(buffer, received, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
-        SetLastError(ERROR_INVALID_DATA); return leave(adapter, event, 0);
+    if (!enter(adapter, NULL)) return 0;
+    AcquireSRWLockExclusive(&adapter->rx_lock);
+    tail = chmlink_ring_load(&adapter->from, CHMLINK_RING_TAIL_OFFSET);
+    if (adapter->rx_cursor == tail) {
+        ReleaseSRWLockExclusive(&adapter->rx_lock);
+        SetLastError(ERROR_NO_MORE_ITEMS);
+        leave(adapter, NULL, 0);
+        return 0;
     }
-    *bytes_received = received;
-    return leave(adapter, event, 1);
+    /* Decide the batch kind before consuming anything: a plain batch must be
+     * produced whenever no descriptor is in use. */
+    probe = adapter->rx_cursor;
+    while (count < CHMLINK_BATCH_MAX_PACKETS) {
+        uint32_t offset, length;
+        chmlink_offload descriptor;
+        chmlink_ring_status status = chmlink_ring_next(&adapter->from, &probe, tail,
+            adapter->packet_limit, &offset, &length, &descriptor);
+        if (status == CHMLINK_RING_EMPTY) break;
+        if (status == CHMLINK_RING_CORRUPT) {
+            ReleaseSRWLockExclusive(&adapter->rx_lock);
+            SetLastError(ERROR_INVALID_DATA); leave(adapter, NULL, 0); return 0;
+        }
+        if (descriptor.flags != 0 || descriptor.gso_type != 0) offload_batch = TRUE;
+        count++;
+    }
+    if (offload_batch)
+        chmlink_batch_begin_offload(&writer, buffer, capacity, adapter->mode, adapter->packet_limit);
+    else
+        chmlink_batch_begin(&writer, buffer, capacity, adapter->mode, adapter->packet_limit);
+    count = 0;
+    for (;;) {
+        uint32_t offset = 0, length = 0, saved = adapter->rx_cursor, record;
+        chmlink_offload descriptor;
+        chmlink_ring_status status;
+        if (count == CHMLINK_BATCH_MAX_PACKETS) break;
+        status = chmlink_ring_next(&adapter->from, &adapter->rx_cursor, tail,
+            adapter->packet_limit, &offset, &length, &descriptor);
+        if (status == CHMLINK_RING_EMPTY) break;
+        if (status == CHMLINK_RING_CORRUPT) {
+            if (count == 0) { ReleaseSRWLockExclusive(&adapter->rx_lock); SetLastError(ERROR_INVALID_DATA);
+                leave(adapter, NULL, 0); return 0; }
+            break;
+        }
+        /* The record needs a length and maybe a descriptor, plus padding. */
+        record = 4u + (offload_batch ? CHMLINK_OFFLOAD_SIZE : 0u) +
+                 ((length + 3u) & ~3u);
+        if ((size_t)writer.length + record > capacity) {
+            adapter->rx_cursor = saved;
+            if (count == 0) {
+                ReleaseSRWLockExclusive(&adapter->rx_lock);
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                leave(adapter, NULL, 0);
+                return 0;
+            }
+            break;
+        }
+        chmlink_batch_writer snapshot = writer;
+        if (chmlink_batch_append_offload(&writer, adapter->from.data + offset, length,
+                offload_batch ? &descriptor : NULL) != CHMLINK_OK ||
+            !rx_push(adapter, offset - CHMLINK_RING_RECORD_HEADER, adapter->rx_cursor, TRUE)) {
+            /* Do not advance past a record the SDK cannot track: the driver
+             * would never be told the memory is free again. */
+            writer = snapshot;
+            adapter->rx_cursor = saved;
+            break;
+        }
+        rx_advance(adapter);
+        count++;
+    }
+    if (count != 0) {
+        *bytes_received = (uint32_t)writer.length;
+        result = 1;
+    } else SetLastError(ERROR_NO_MORE_ITEMS);
+    ReleaseSRWLockExclusive(&adapter->rx_lock);
+    return leave(adapter, NULL, result);
+}
+
+/* ---- sending ---- */
+
+static int tx_push(chmlink_adapter *a, uint32_t start, uint32_t end)
+{
+    if (a->tx_count == a->tx_entries_capacity) {
+        uint32_t capacity;
+        chmlink_tx_entry *grown;
+        if (a->tx_head != 0) {
+            memmove(a->tx_entries, a->tx_entries + a->tx_head,
+                    (a->tx_count - a->tx_head) * sizeof(*a->tx_entries));
+            a->tx_count -= a->tx_head;
+            a->tx_head = 0;
+        } else {
+            capacity = a->tx_entries_capacity * 2;
+            grown = HeapReAlloc(GetProcessHeap(), 0, a->tx_entries,
+                                capacity * sizeof(*a->tx_entries));
+            if (grown == NULL) return 0;
+            a->tx_entries = grown;
+            a->tx_entries_capacity = capacity;
+        }
+    }
+    a->tx_entries[a->tx_count].start = start;
+    a->tx_entries[a->tx_count].end = end;
+    a->tx_entries[a->tx_count].published = FALSE;
+    a->tx_count++;
+    return 1;
+}
+
+/* Publish the contiguous published prefix and wake the driver if it sleeps. */
+static void tx_advance(chmlink_adapter *a, BOOL *wake)
+{
+    uint32_t end = 0;
+    BOOL advanced = FALSE;
+    while (a->tx_head < a->tx_count && a->tx_entries[a->tx_head].published) {
+        end = a->tx_entries[a->tx_head].end;
+        a->tx_head++;
+        advanced = TRUE;
+    }
+    if (advanced) *wake = chmlink_ring_publish(&a->to, end) != 0;
+    if (a->tx_head == a->tx_count) a->tx_head = a->tx_count = 0;
+}
+
+uint8_t *chmlink_allocate_packet(chmlink_adapter *adapter, uint32_t size,
+                                 const chmlink_offload *offload)
+{
+    chmlink_ring_status status;
+    uint8_t *packet = NULL;
+    uint32_t saved;
+    if (adapter == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    if (!enter(adapter, NULL)) return NULL;
+    AcquireSRWLockExclusive(&adapter->tx_lock);
+    saved = adapter->tx_cursor;
+    status = chmlink_ring_reserve(&adapter->to, &adapter->tx_cursor, size, offload, &packet);
+    if (status == CHMLINK_RING_OK) {
+        if (!tx_push(adapter, (uint32_t)(packet - adapter->to.data) - CHMLINK_RING_RECORD_HEADER,
+                     adapter->tx_cursor)) {
+            adapter->tx_cursor = saved;
+            packet = NULL;
+            status = CHMLINK_RING_FULL;
+        }
+    }
+    ReleaseSRWLockExclusive(&adapter->tx_lock);
+    if (packet == NULL) {
+        SetLastError(status == CHMLINK_RING_FULL ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA);
+        leave(adapter, NULL, 0);
+        return NULL;
+    }
+    leave(adapter, NULL, 1);
+    return packet;
+}
+
+void chmlink_send_packet(chmlink_adapter *adapter, uint8_t *packet)
+{
+    uint32_t start, i;
+    BOOL wake = FALSE;
+    if (adapter == NULL || packet == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return; }
+    if ((uintptr_t)packet < (uintptr_t)(adapter->to.data + CHMLINK_RING_RECORD_HEADER) ||
+        (uintptr_t)packet >= (uintptr_t)(adapter->to.data + adapter->to.capacity)) {
+        SetLastError(ERROR_INVALID_PARAMETER); return;
+    }
+    if (!enter(adapter, NULL)) return;
+    AcquireSRWLockExclusive(&adapter->tx_lock);
+    start = (uint32_t)(packet - adapter->to.data) - CHMLINK_RING_RECORD_HEADER;
+    for (i = adapter->tx_head; i < adapter->tx_count; ++i) {
+        if (adapter->tx_entries[i].start == start && !adapter->tx_entries[i].published) {
+            adapter->tx_entries[i].published = TRUE;
+            break;
+        }
+    }
+    tx_advance(adapter, &wake);
+    ReleaseSRWLockExclusive(&adapter->tx_lock);
+    if (wake) SetEvent(adapter->to_event);
+    leave(adapter, NULL, 1);
 }
 
 int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length)
 {
+    chmlink_batch_reader reader;
+    const uint8_t *packet;
+    uint32_t size, count;
+    chmlink_offload descriptor;
+    int result = 0;
+    if (adapter == NULL || batch == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    if (chmlink_batch_validate(batch, length, adapter->mode, adapter->packet_limit, &count) != CHMLINK_OK ||
+        count == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER); return 0;
+    }
+    if (!enter(adapter, NULL)) return 0;
+    /* Refuse what the driver would drop anyway, so the caller gets an error
+     * instead of a silent loss. */
+    chmlink_batch_read_begin(&reader, batch);
+    while (chmlink_batch_read_next(&reader, &packet, &size, &descriptor)) {
+        if (descriptor.flags == 0 && descriptor.gso_type == 0) continue;
+        if (((descriptor.flags & CHMLINK_OFFLOAD_NEEDS_CSUM) &&
+             !(descriptor.flags & CHMLINK_OFFLOAD_DATA_VALID)) ||
+            (descriptor.gso_type != CHMLINK_GSO_NONE &&
+             !(adapter->offload & CHMLINK_OFFLOAD_RX_RSC)) ||
+            !(adapter->offload & CHMLINK_OFFLOAD_RX_CHECKSUM)) {
+            leave(adapter, NULL, 0); SetLastError(ERROR_INVALID_PARAMETER); return 0;
+        }
+    }
+    /* All or nothing, as one ring publication: a full ring leaves the cursor
+     * where it was, so the caller can retry the whole batch. */
+    {
+        chmlink_ring_status status = CHMLINK_RING_OK;
+        uint32_t saved, start = 0;
+        int first = 1;
+        BOOL wake = FALSE;
+        AcquireSRWLockExclusive(&adapter->tx_lock);
+        saved = adapter->tx_cursor;
+        chmlink_batch_read_begin(&reader, batch);
+        while (chmlink_batch_read_next(&reader, &packet, &size, &descriptor)) {
+            chmlink_offload *described = descriptor.flags != 0 || descriptor.gso_type != 0 ? &descriptor : NULL;
+            uint8_t *slot;
+            status = chmlink_ring_reserve(&adapter->to, &adapter->tx_cursor, size, described, &slot);
+            if (status != CHMLINK_RING_OK) break;
+            if (first) { start = (uint32_t)(slot - adapter->to.data) - CHMLINK_RING_RECORD_HEADER; first = 0; }
+            memcpy(slot, packet, size);
+        }
+        if (status == CHMLINK_RING_OK && !first) {
+            if (tx_push(adapter, start, adapter->tx_cursor)) {
+                adapter->tx_entries[adapter->tx_count - 1].published = TRUE;
+                tx_advance(adapter, &wake);
+                result = 1;
+            } else {
+                status = CHMLINK_RING_FULL;
+            }
+        }
+        if (!result) adapter->tx_cursor = saved;
+        ReleaseSRWLockExclusive(&adapter->tx_lock);
+        if (wake) SetEvent(adapter->to_event);
+        if (!result) SetLastError(status == CHMLINK_RING_CORRUPT ? ERROR_INVALID_DATA : ERROR_BUFFER_OVERFLOW);
+    }
+    return leave(adapter, NULL, result);
+}
+
+int chmlink_set_offload(chmlink_adapter *adapter, uint32_t requested, uint32_t *granted)
+{
+    uint8_t input[4], output[4];
     DWORD received;
     HANDLE event;
     int result;
+    if (granted != NULL) *granted = 0;
+    if (adapter == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    if (requested & ~(uint32_t)CHMLINK_OFFLOAD_ALL) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    input[0] = (uint8_t)requested; input[1] = (uint8_t)(requested >> 8);
+    input[2] = (uint8_t)(requested >> 16); input[3] = (uint8_t)(requested >> 24);
     if (!enter(adapter, &event)) return 0;
-    if (chmlink_batch_validate(batch, length, adapter->mode, adapter->packet_limit, NULL) != CHMLINK_OK) {
-        SetLastError(ERROR_INVALID_PARAMETER); return leave(adapter, event, 0);
+    result = device_ioctl(adapter->device, event, CHMLINK_IOCTL_SET_OFFLOAD, input, sizeof(input),
+                          output, sizeof(output), &received) != 0;
+    if (result) {
+        uint32_t value = (uint32_t)output[0] | ((uint32_t)output[1] << 8) |
+                         ((uint32_t)output[2] << 16) | ((uint32_t)output[3] << 24);
+        adapter->offload = value;
+        if (granted != NULL) *granted = value;
     }
-    result = device_ioctl(adapter->device, event, CHMLINK_IOCTL_INJECT, batch,
-                          length, NULL, 0, &received) != 0;
     return leave(adapter, event, result);
 }
 
@@ -393,55 +860,71 @@ int chmlink_cancel_wait(chmlink_adapter *a)
     return 1;
 }
 
+/* About 20-50 microseconds of PAUSE on current x86 cores. */
+#define CHMLINK_WAIT_SPIN 2048u
+
 int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
 {
-    HANDLE events[3], request;
+    HANDLE events[3];
     ULONGLONG started = GetTickCount64();
     int result = 0;
-    DWORD error = ERROR_SUCCESS;
-    if (!enter(a, &request)) return 0;
-    if (!(a->capabilities & CHMLINK_CAP_WAIT)) {
-        SetLastError(ERROR_NOT_SUPPORTED); return leave(a, request, 0);
-    }
+    DWORD error = ERROR_SUCCESS, remaining = timeout_ms;
+    if (!enter(a, NULL)) return 0;
     AcquireSRWLockExclusive(&a->gate);
     if (a->closing || a->waiting) {
         error = a->closing ? ERROR_OPERATION_ABORTED : ERROR_BUSY;
         ReleaseSRWLockExclusive(&a->gate);
-        SetLastError(error); return leave(a, request, 0);
+        SetLastError(error); return leave(a, NULL, 0);
     }
     a->waiting = TRUE;
     ResetEvent(a->cancel_event);
     ReleaseSRWLockExclusive(&a->gate);
-    events[0] = a->close_event; events[1] = a->cancel_event; events[2] = a->ready_event;
+    events[0] = a->close_event; events[1] = a->cancel_event; events[2] = a->from_event;
     for (;;) {
-        chmlink_adapter_info info;
-        DWORD remaining = timeout_ms, wait;
+        uint32_t state;
         ULONGLONG elapsed;
+        DWORD wait;
         if (WaitForSingleObject(events[0], 0) == WAIT_OBJECT_0 ||
             WaitForSingleObject(events[1], 0) == WAIT_OBJECT_0) {
             error = ERROR_OPERATION_ABORTED; break;
         }
-        if (!query_device(a->device, request, &info)) { error = GetLastError(); break; }
-        if (info.state & CHMLINK_STATE_REMOVING) { error = ERROR_DEVICE_NOT_CONNECTED; break; }
-        if (info.state & CHMLINK_STATE_SHUTDOWN) { error = ERROR_SHUTDOWN_IN_PROGRESS; break; }
-        if (!(info.state & CHMLINK_STATE_RUNNING)) { error = ERROR_NOT_READY; break; }
-        if (!(info.state & CHMLINK_STATE_SESSION)) { error = ERROR_OPERATION_ABORTED; break; }
-        if (info.queued_packets != 0) { result = 1; break; }
-        if (timeout_ms != INFINITE) {
-            elapsed = GetTickCount64() - started;
-            if (elapsed >= timeout_ms) { error = ERROR_TIMEOUT; break; }
-            remaining = timeout_ms - (DWORD)elapsed;
+        if (rx_pending(a)) { result = 1; break; }
+        state = chmlink_ring_load(&a->from, CHMLINK_RING_STATE_OFFSET);
+        if (state & CHMLINK_RING_STATE_CLOSED) { error = ERROR_OPERATION_ABORTED; break; }
+        if (!(state & CHMLINK_RING_STATE_RUNNING)) { error = ERROR_NOT_READY; break; }
+        elapsed = GetTickCount64() - started;
+        if (timeout_ms != CHMLINK_WAIT_INFINITE && elapsed >= timeout_ms) {
+            error = ERROR_TIMEOUT; break;
+        }
+        if (timeout_ms != CHMLINK_WAIT_INFINITE) remaining = timeout_ms - (DWORD)elapsed;
+        /* Poll briefly first: at high packet rates the next record arrives
+         * within microseconds, and staying out of the alertable state spares
+         * the driver a KeSetEvent and us a sleep and wake per few packets. */
+        {
+            unsigned spin;
+            for (spin = 0; spin < CHMLINK_WAIT_SPIN; ++spin) {
+                if (chmlink_ring_load(&a->from, CHMLINK_RING_TAIL_OFFSET) != a->rx_cursor) break;
+                YieldProcessor();
+            }
+            if (spin < CHMLINK_WAIT_SPIN) continue;
+        }
+        /* Announce that a wake-up is needed before re-reading the tail, so a
+         * publish cannot slip between the check and the wait. */
+        chmlink_ring_store(&a->from, CHMLINK_RING_WAIT_OFFSET, 1);
+        if (chmlink_ring_load(&a->from, CHMLINK_RING_TAIL_OFFSET) != a->rx_cursor) {
+            chmlink_ring_store(&a->from, CHMLINK_RING_WAIT_OFFSET, 0);
+            continue;
         }
         wait = WaitForMultipleObjects(3, events, FALSE, remaining);
-        if (wait == WAIT_OBJECT_0 || wait == WAIT_OBJECT_0 + 1) { error = ERROR_OPERATION_ABORTED; break; }
-        if (wait == WAIT_TIMEOUT) { error = ERROR_TIMEOUT; break; }
+        chmlink_ring_store(&a->from, CHMLINK_RING_WAIT_OFFSET, 0);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_OBJECT_0 + 1) {
+            error = ERROR_OPERATION_ABORTED; break;
+        }
         if (wait == WAIT_FAILED) { error = GetLastError(); break; }
-        /* The consumer may have drained the queue before this thread ran.
-         * Recheck state and readiness without resetting the driver's event. */
     }
     AcquireSRWLockExclusive(&a->gate);
     a->waiting = FALSE;
     ReleaseSRWLockExclusive(&a->gate);
     if (!result) SetLastError(error);
-    return leave(a, request, result);
+    return leave(a, NULL, result);
 }

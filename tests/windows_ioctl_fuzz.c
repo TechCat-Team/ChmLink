@@ -4,30 +4,37 @@
 #include <string.h>
 #include <wchar.h>
 #include "chmlink/device.h"
-#include "chmlink/protocol.h"
+#include "chmlink/query.h"
+#include "chmlink/ring.h"
+#include "chmlink/session.h"
 
-/* Fuzzes the device control interface with raw requests, below the SDK.
+/* Fuzzes the control interface and the shared rings with raw requests, below
+ * the SDK.
  *
- * Each round opens the data session, gives every worker its own duplicate of
- * the handle (so all share one file object) and lets them issue random
- * requests; each worker closes its handle after a random number of requests,
- * so the session's IRP_MJ_CLEANUP races requests still in flight on the other
- * handles. An inspection thread opens and closes read-only handles meanwhile.
+ * Each round opens the data session, registers a pair of valid rings, gives
+ * every worker its own duplicate of the handle (so all share one file object)
+ * and lets them issue random requests, including second registrations and
+ * offload changes. One worker also writes random values into both ring
+ * headers and record areas while the driver is using them. Workers close
+ * their handles after a random number of requests, so cleanup races requests
+ * still in flight on the other handles. An inspection thread opens and closes
+ * read-only handles meanwhile.
  *
- * Every result is checked against what the request deserves: the driver must
- * accept an injected batch exactly when chmlink_batch_validate accepts it, and
- * every rejection must carry the error that the dispatch code assigns to it.
- * --tolerant (adapter disabled/removed underneath, or Driver Verifier fault
- * injection) only keeps the safety half: nothing invalid may succeed.
+ * The driver must survive every input: no crash, no hang, no leak. A request
+ * is accepted exactly when the contract allows it; a corrupted ring ends the
+ * session (state CLOSED) instead of causing an out-of-range access, and the
+ * adapter can open a new session afterwards.
  *
- * Usage: chmlink-ioctl-fuzz <interface-index> <seconds> [--seed N] [--tolerant] [--ops MASK]
- * MASK selects request kinds by bit (default all): 0 query, 1 receive,
- * 2 inject, 3 register, 4 foreign codes, 5 bad buffers, 6 read/write/cancel,
- * 7 session churn (without it one session lasts the whole run).
+ * Usage: chmlink-ioctl-fuzz <interface-index> <seconds> [--seed N] [--tolerant]
+ *        [--ops MASK]
+ * MASK selects request kinds by bit (default all): 0 query, 1 set_offload,
+ * 2 register_rings, 3 foreign codes, 4 bad buffers, 5 ring tampering,
+ * 6 read/write/cancel, 7 session churn (without it one session lasts the run).
  */
 
 #define FUZZ_WORKERS 6
 #define BIG (CHMLINK_BATCH_MAX_SIZE + 64u)
+#define RING_CAPACITY (4u * 1024u * 1024u)
 
 #define FAIL(...) do { fprintf(stderr, "fuzz: "); fprintf(stderr, __VA_ARGS__); \
     fprintf(stderr, " (seed %llu)\n", (unsigned long long)g_seed); fflush(stderr); ExitProcess(1); } while (0)
@@ -40,8 +47,16 @@ static uint32_t g_index, g_mode, g_limit;
 static wchar_t g_path[64];
 static volatile LONG g_stop;
 static ULONGLONG g_deadline;
-static volatile LONG64 g_requests, g_accepted_injects, g_registered, g_register_conflicts;
+static volatile LONG64 g_requests, g_registered, g_broken;
+/* Whether this round's session has rings: set by the round's registration or,
+ * when that failed (tolerant runs under low resources), by the first worker
+ * whose registration the driver accepts. Only one can succeed. */
+static volatile LONG g_round_registered;
 static uint8_t *g_readonly_page, *g_guard_edge;
+static uint8_t *g_from, *g_to;
+static HANDLE g_from_event, g_to_event;
+static chmlink_session_rings g_rings;
+static uint8_t g_register_request[CHMLINK_SESSION_SIZE];
 
 typedef struct rng { unsigned long long s; } rng;
 static uint32_t next(rng *r)
@@ -51,11 +66,10 @@ static uint32_t next(rng *r)
 }
 static uint32_t below(rng *r, uint32_t n) { return n ? next(r) % n : 0; }
 
-/* Lengths that sit on the boundaries the driver and the I/O manager check. */
 static uint32_t edge_length(rng *r)
 {
-    static const uint32_t edges[] = { 0, 1, 3, 4, 7, 8, 9, 23, 24, 25, 27, 28, 64, 127, 128, 129,
-        1514, 1522, 4096, 65535, 65536, CHMLINK_BATCH_MAX_SIZE - 1, CHMLINK_BATCH_MAX_SIZE,
+    static const uint32_t edges[] = { 0, 1, 3, 4, 7, 8, 9, 23, 24, 25, 27, 28, 55, 56, 57, 64,
+        127, 128, 129, 4096, 65535, 65536, CHMLINK_BATCH_MAX_SIZE,
         CHMLINK_BATCH_MAX_SIZE + 1 };
     if (below(r, 4) == 0) return below(r, 2048);
     return edges[below(r, (uint32_t)(sizeof(edges) / sizeof(edges[0])))];
@@ -65,11 +79,10 @@ static int is_lifecycle_error(DWORD e)
 {
     return e == ERROR_NOT_READY || e == ERROR_DEVICE_REMOVED || e == ERROR_DEVICE_NOT_CONNECTED ||
            e == ERROR_FILE_NOT_FOUND || e == ERROR_INVALID_HANDLE || e == ERROR_OPERATION_ABORTED ||
-           e == ERROR_NO_SYSTEM_RESOURCES || e == ERROR_NOT_ENOUGH_MEMORY || 
+           e == ERROR_NO_SYSTEM_RESOURCES || e == ERROR_NOT_ENOUGH_MEMORY ||
            e == ERROR_BAD_COMMAND || e == ERROR_GEN_FAILURE;
 }
 
-/* One request, waited for synchronously. Returns the Win32 error, 0 on success. */
 static DWORD issue(HANDLE h, HANDLE event, DWORD code, void *in, DWORD in_size,
                    void *out, DWORD out_size, DWORD *returned)
 {
@@ -98,64 +111,31 @@ static void expect_failure(DWORD got, const char *what, DWORD in_size, DWORD out
     if (got == 0) FAIL("%s in=%lu out=%lu succeeded", what, in_size, out_size);
 }
 
-/* A valid batch of small frames (Ethernet to a foreign unicast address, which
- * the receive filter discards) or minimal IPv4/IPv6 packets. */
-static uint32_t valid_batch(rng *r, uint8_t *buffer, uint32_t capacity)
+/* A structurally valid registration request with one random field replaced. */
+static uint32_t register_input(rng *r, uint8_t *buffer)
 {
-    chmlink_batch_writer w;
-    uint8_t packet[256];
-    uint32_t count = 1 + below(r, 8), i, length;
-    REQUIRE(chmlink_batch_begin(&w, buffer, capacity, (chmlink_mode)g_mode, g_limit) == CHMLINK_OK);
-    for (i = 0; i < count; ++i) {
-        memset(packet, 0, sizeof(packet));
-        if (g_mode == CHMLINK_MODE_ETHERNET) {
-            length = 14 + below(r, 200);
-            packet[0] = 0x02; packet[5] = 0x7e; packet[6] = 0x02; packet[11] = 0x7f;
-            packet[12] = 0x88; packet[13] = 0xb5;
-        } else if (below(r, 2)) {
-            length = 20 + below(r, 100);
-            packet[0] = 0x45; packet[2] = (uint8_t)(length >> 8); packet[3] = (uint8_t)length;
-            packet[8] = 1; packet[9] = 253;                  /* TTL 1, experimental protocol */
-            packet[12] = 192; packet[13] = 0; packet[14] = 2; packet[15] = 1;   /* TEST-NET-1 */
-            packet[16] = 192; packet[17] = 0; packet[18] = 2; packet[19] = 2;
-        } else {
-            length = 40 + below(r, 100);
-            packet[0] = 0x60; packet[4] = (uint8_t)((length - 40) >> 8); packet[5] = (uint8_t)(length - 40);
-            packet[6] = 253; packet[7] = 1;                  /* next header, hop limit */
-            packet[8] = 0x20; packet[9] = 0x01; packet[10] = 0x0d; packet[11] = 0xb8;   /* 2001:db8:: */
-            packet[24] = 0x20; packet[25] = 0x01; packet[26] = 0x0d; packet[27] = 0xb8;
-        }
-        if (chmlink_batch_append(&w, packet, length) != CHMLINK_OK) break;
-    }
-    return (uint32_t)w.length;
-}
-
-static uint32_t inject_input(rng *r, uint8_t *buffer)
-{
-    uint32_t length, i, flips;
-    switch (below(r, 5)) {
-    case 0:                                    /* random bytes, random length */
-        length = edge_length(r); if (length > BIG) length = BIG;
+    static const uint32_t capacities[] = { 0, 1, 127, 128 * 1024 - 16, 128 * 1024,
+        4 * 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024 + 16 };
+    uint32_t kind = below(r, 5), i, capacity;
+    if (kind == 0) {
+        uint32_t length = edge_length(r);
+        if (length > BIG) length = BIG;
         for (i = 0; i < length; ++i) buffer[i] = (uint8_t)next(r);
         return length;
-    case 1: case 2:                            /* a valid batch, mutated */
-        length = valid_batch(r, buffer, BIG);
-        flips = 1 + below(r, 4);
-        for (i = 0; i < flips; ++i) {
-            uint32_t at = below(r, length);
-            if (below(r, 3) == 0 && length >= 24) {
-                /* overwrite one header or record field with an edge value */
-                static const uint32_t values[] = { 0, 1, 2, 3, 24, 255, 256, 257, 65557, 0x7fffffff, 0xffffffff };
-                uint32_t v = values[below(r, (uint32_t)(sizeof(values) / sizeof(values[0])))];
-                at = (below(r, 7) * 4); if (at + 4 > length) at = 0;
-                memcpy(buffer + at, &v, 4);
-            } else buffer[at] ^= (uint8_t)(1u << below(r, 8));
-        }
-        if (below(r, 4) == 0) length = below(r, length + 8);   /* truncate or overrun */
-        return length;
-    default:                                   /* valid */
-        return valid_batch(r, buffer, BIG);
     }
+    memcpy(buffer, g_register_request, CHMLINK_SESSION_SIZE);
+    if (kind == 1) { buffer[below(r, 56)] ^= (uint8_t)(1u << below(r, 8)); return 56; }
+    if (kind == 2) {
+        uint32_t length = 56;
+        if (below(r, 2)) length += 1 + below(r, 8);
+        else if (length > 8) length -= 8;
+        return length;
+    }
+    capacity = capacities[below(r, (uint32_t)(sizeof(capacities) / sizeof(capacities[0])))];
+    buffer[16] = (uint8_t)capacity; buffer[17] = (uint8_t)(capacity >> 8);
+    buffer[18] = (uint8_t)(capacity >> 16); buffer[19] = (uint8_t)(capacity >> 24);
+    if (below(r, 2)) buffer[8] ^= (uint8_t)below(r, 64);   /* misalign the address */
+    return 56;
 }
 
 typedef struct worker {
@@ -173,20 +153,35 @@ static DWORD code_with(DWORD function, DWORD method, DWORD access)
 
 static int is_contract_code(DWORD code)
 {
-    return code == CHMLINK_IOCTL_RECEIVE || code == CHMLINK_IOCTL_INJECT ||
-           code == CHMLINK_IOCTL_QUERY || code == CHMLINK_IOCTL_REGISTER_READ_EVENT;
+    return code == CHMLINK_IOCTL_QUERY || code == CHMLINK_IOCTL_REGISTER_RINGS ||
+           code == CHMLINK_IOCTL_SET_OFFLOAD;
+}
+
+static void tamper(rng *r)
+{
+    static const uint32_t values[] = { 0, 1, 2, 3, 15, 16, 17, 0x7fffffffu, 0xffffffffu };
+    uint32_t value = values[below(r, (uint32_t)(sizeof(values) / sizeof(values[0])))];
+    uint8_t *ring = below(r, 2) ? g_from : g_to;
+    switch (below(r, 5)) {
+    case 0: memcpy(ring + CHMLINK_RING_HEAD_OFFSET, &value, 4); break;
+    case 1: memcpy(ring + CHMLINK_RING_TAIL_OFFSET, &value, 4); break;
+    case 2: memcpy(ring + CHMLINK_RING_STATE_OFFSET, &value, 4); break;
+    case 3: memcpy(ring + CHMLINK_RING_HEADER_SIZE + below(r, 1024), &value, 4); break;
+    default: ring[below(r, CHMLINK_RING_HEADER_SIZE + 2048)] = (uint8_t)next(r); break;
+    }
+    SetEvent(below(r, 2) ? g_from_event : g_to_event);
 }
 
 static void one_request(worker *w, int session)
 {
     DWORD in_size, out_size, got, returned, code;
     rng *r = &w->r;
-    static const int kinds[10] = { 0, 1, 1, 2, 2, 2, 3, 4, 5, 6 };
+    static const int kinds[8] = { 0, 1, 1, 2, 2, 3, 4, 5 };
     uint32_t pick;
-    do pick = below(r, 10); while (!(g_ops & (1ul << kinds[pick])) && (g_ops & 0x7f));
+    do pick = below(r, 8); while (!(g_ops & (1ul << kinds[pick])) && (g_ops & 0x7f));
     if (!(g_ops & 0x7f)) return;
     switch (pick) {
-    case 0: {                                  /* QUERY */
+    case 0: {
         in_size = below(r, 3) == 0 ? edge_length(r) : 0;
         out_size = below(r, 3) == 0 ? edge_length(r) : CHMLINK_INFO_SIZE + below(r, 64);
         if (in_size > BIG) in_size = BIG;
@@ -206,67 +201,52 @@ static void one_request(worker *w, int session)
         }
         break;
     }
-    case 1: case 2: {                          /* RECEIVE */
-        in_size = below(r, 4) == 0 ? edge_length(r) : 0;
-        out_size = edge_length(r);
+    case 1: {
+        uint32_t value = below(r, 4) == 0 ? next(r) : next(r) & 0xfu;
+        int valid;
+        in_size = below(r, 4) == 0 ? edge_length(r) : 4;
+        out_size = below(r, 5) == 0 ? edge_length(r) % 64 : 4;
         if (in_size > BIG) in_size = BIG;
         if (out_size > BIG) out_size = BIG;
-        got = issue(w->handle, w->event, CHMLINK_IOCTL_RECEIVE, in_size ? w->in : NULL, in_size,
+        for (returned = 0; returned < in_size && returned < 4; ++returned)
+            w->in[returned] = (uint8_t)(value >> (8 * returned));
+        valid = in_size == 4 && out_size == 4 && (value & ~0xfu) == 0;
+        got = issue(w->handle, w->event, CHMLINK_IOCTL_SET_OFFLOAD, in_size ? w->in : NULL, in_size,
                     out_size ? w->out : NULL, out_size, &returned);
-        if (!session) expect(got, ERROR_ACCESS_DENIED, "RECEIVE on inspection handle", in_size, out_size);
-        else if (in_size) expect(got, ERROR_INVALID_PARAMETER, "RECEIVE with input", in_size, out_size);
-        else if (out_size > CHMLINK_BATCH_MAX_SIZE) expect(got, ERROR_INVALID_USER_BUFFER, "RECEIVE oversized", in_size, out_size);
-        else if (out_size < CHMLINK_BATCH_HEADER_SIZE) expect(got, ERROR_INSUFFICIENT_BUFFER, "RECEIVE short", in_size, out_size);
-        else if (got == 0) {
-            if (chmlink_batch_validate(w->out, returned, (chmlink_mode)g_mode, g_limit, NULL) != CHMLINK_OK)
-                FAIL("RECEIVE returned an invalid batch of %lu bytes", returned);
-        } else if (got != ERROR_NO_MORE_ITEMS && got != ERROR_INSUFFICIENT_BUFFER)
-            expect(got, ERROR_NO_MORE_ITEMS, "RECEIVE", in_size, out_size);
+        if (!session) expect(got, ERROR_ACCESS_DENIED, "SET_OFFLOAD on inspection handle", in_size, out_size);
+        else expect(got, valid ? 0 : ERROR_INVALID_PARAMETER, "SET_OFFLOAD", in_size, out_size);
+        if (got == 0 && !valid) FAIL("SET_OFFLOAD accepted a malformed request");
         break;
     }
-    case 3: case 4: case 5: {                  /* INJECT */
+    case 2: {
+        chmlink_session_rings rings;
         int valid;
-        in_size = inject_input(r, w->in);
-        out_size = below(r, 6) == 0 ? edge_length(r) % 4096 : 0;
-        valid = chmlink_batch_validate(w->in, in_size, (chmlink_mode)g_mode, g_limit, NULL) == CHMLINK_OK;
-        got = issue(w->handle, w->event, CHMLINK_IOCTL_INJECT, in_size ? w->in : NULL, in_size,
+        in_size = register_input(r, w->in);   /* up to BIG bytes */
+        out_size = below(r, 6) == 0 ? edge_length(r) % 64 : 0;
+        if (in_size > BIG) in_size = BIG;
+        if (out_size > BIG) out_size = BIG;
+        valid = in_size == CHMLINK_SESSION_SIZE && out_size == 0 &&
+                chmlink_session_decode(&rings, w->in, in_size) == CHMLINK_OK;
+        got = issue(w->handle, w->event, CHMLINK_IOCTL_REGISTER_RINGS, in_size ? w->in : NULL, in_size,
                     out_size ? w->out : NULL, out_size, &returned);
-        if (!session) expect(got, ERROR_ACCESS_DENIED, "INJECT on inspection handle", in_size, out_size);
-        else if (out_size || !valid) expect(got, ERROR_INVALID_PARAMETER, valid ? "INJECT with output" : "INJECT invalid batch", in_size, out_size);
-        else {
-            expect(got, 0, "INJECT valid batch", in_size, out_size);
-            if (got == 0) InterlockedIncrement64(&g_accepted_injects);
+        if (!session) {
+            expect(got, ERROR_ACCESS_DENIED, "REGISTER on inspection handle", in_size, out_size);
+        } else if (valid && got == 0) {
+            /* Only possible when the round's own registration failed (tolerant runs). */
+            if (!g_tolerant || InterlockedCompareExchange(&g_round_registered, 1, 0) != 0)
+                FAIL("REGISTER accepted a second registration (in=%lu)", in_size);
+            InterlockedIncrement64(&g_registered);
+        } else {
+            expect(got, valid ? ERROR_BAD_COMMAND : ERROR_INVALID_PARAMETER, "REGISTER", in_size, out_size);
+            /* Strict: the round registered first, so a decodable request finds the session taken.
+             * Tolerant: when that registration failed, a decodable request really maps memory
+             * and handles and may fail for either. */
+            if (!g_tolerant && valid && got != ERROR_BAD_COMMAND)
+                FAIL("REGISTER valid request: error %lu", got);
         }
-        if (got == 0 && (!valid || out_size || !session)) FAIL("INJECT accepted a request it must refuse");
         break;
     }
-    case 6: {                                  /* REGISTER_READ_EVENT */
-        uint64_t value;
-        HANDLE event = NULL;
-        int kind = (int)below(r, 6);
-        in_size = 8; out_size = 0;
-        if (kind == 0) { event = CreateEventW(NULL, TRUE, FALSE, NULL); REQUIRE(event); value = (uint64_t)(ULONG_PTR)event; }
-        else if (kind == 1) value = (uint64_t)(ULONG_PTR)w->wrong_type;
-        else if (kind == 2) value = (uint64_t)(ULONG_PTR)w->weak_event;
-        else if (kind == 3) value = ((uint64_t)next(r) << 32) | next(r);
-        else if (kind == 4) { value = 0; in_size = edge_length(r) % 64; }
-        else { value = (uint64_t)(ULONG_PTR)GetCurrentProcess(); }   /* pseudo-handle */
-        memcpy(w->in, &value, 8);
-        if (kind == 4) { DWORD i; for (i = 8; i < in_size; ++i) w->in[i] = (uint8_t)next(r); }
-        if (below(r, 8) == 0) out_size = 1 + below(r, 64);
-        got = issue(w->handle, w->event, CHMLINK_IOCTL_REGISTER_READ_EVENT, in_size ? w->in : NULL, in_size,
-                    out_size ? w->out : NULL, out_size, &returned);
-        if (!session) expect(got, ERROR_ACCESS_DENIED, "REGISTER on inspection handle", in_size, out_size);
-        else if (out_size || in_size != 8) expect(got, ERROR_INVALID_PARAMETER, "REGISTER malformed", in_size, out_size);
-        else if (kind == 0) {
-            if (got == 0) InterlockedIncrement64(&g_registered);
-            else if (got == ERROR_BAD_COMMAND) InterlockedIncrement64(&g_register_conflicts);
-            else expect(got, 0, "REGISTER event", in_size, out_size);
-        } else expect_failure(got, "REGISTER non-event", in_size, out_size);
-        if (event) CloseHandle(event);        /* the driver keeps its own reference */
-        break;
-    }
-    case 7: {                                  /* codes outside the contract */
+    case 3: {
         do {
             code = code_with(0x7f0 + below(r, 0x40), below(r, 4), below(r, 4));
         } while (is_contract_code(code));
@@ -278,20 +258,25 @@ static void one_request(worker *w, int session)
             FAIL("code 0x%08lx: error %lu", code, got);
         break;
     }
-    case 8: {                                  /* bad buffers: the I/O manager must refuse, the driver never sees them */
+    case 4: {
         void *in = NULL, *out = NULL;
         DWORD kind = below(r, 4);
-        code = below(r, 2) ? CHMLINK_IOCTL_QUERY : CHMLINK_IOCTL_RECEIVE;
-        in_size = 0; out_size = CHMLINK_INFO_SIZE;
-        if (kind == 0) out = NULL;                                  /* NULL with a length */
-        else if (kind == 1) out = g_readonly_page;                  /* not writable */
-        else if (kind == 2) out = g_guard_edge;                     /* runs into a no-access page */
-        else { code = CHMLINK_IOCTL_INJECT; in = g_guard_edge; in_size = 4096; out_size = 0; }
+        code = below(r, 2) ? CHMLINK_IOCTL_QUERY : CHMLINK_IOCTL_REGISTER_RINGS;
+        in_size = code == CHMLINK_IOCTL_QUERY ? 0 : CHMLINK_SESSION_SIZE; out_size = CHMLINK_INFO_SIZE;
+        if (kind == 0) out = NULL;
+        else if (kind == 1) out = g_readonly_page;
+        else if (kind == 2) out = g_guard_edge;
+        else { out = NULL; in = g_guard_edge; out_size = 0; }
         got = issue(w->handle, w->event, code, in, in_size, out, out_size, &returned);
         expect_failure(got, "bad buffer", in_size, out_size);
         break;
     }
-    default: {                                 /* other major functions and cancellation */
+    case 5:
+        /* Only session workers: the rings are freed between rounds while the
+         * inspection thread keeps running. */
+        if (session) tamper(r);
+        break;
+    default: {
         OVERLAPPED o;
         DWORD bytes;
         memset(&o, 0, sizeof(o)); o.hEvent = w->event;
@@ -314,7 +299,7 @@ static DWORD WINAPI session_worker(void *arg)
     worker *w = arg;
     uint32_t i;
     for (i = 0; i < w->requests && !g_stop && GetTickCount64() < g_deadline; ++i) one_request(w, 1);
-    CloseHandle(w->handle);   /* the last close runs IRP_MJ_CLEANUP while others may still be in a request */
+    CloseHandle(w->handle);
     w->handle = NULL;
     return 0;
 }
@@ -343,7 +328,7 @@ static void init_worker(worker *w, unsigned long long seed)
     w->in = malloc(BIG + 64); w->out = malloc(BIG + 64); REQUIRE(w->in && w->out);
     w->wrong_type = CreateSemaphoreW(NULL, 0, 1, NULL); REQUIRE(w->wrong_type);
     REQUIRE(DuplicateHandle(GetCurrentProcess(), w->event, GetCurrentProcess(), &w->weak_event,
-                            SYNCHRONIZE, FALSE, 0));        /* an event without EVENT_MODIFY_STATE */
+                            SYNCHRONIZE, FALSE, 0));
 }
 
 static HANDLE open_session(void)
@@ -373,19 +358,45 @@ static int query_state(chmlink_query_info *info)
     return got == 0 && chmlink_query_decode(info, bytes, returned) == CHMLINK_OK;
 }
 
+static int create_rings(void)
+{
+    g_from = VirtualAlloc(NULL, CHMLINK_RING_HEADER_SIZE + RING_CAPACITY, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_to = VirtualAlloc(NULL, CHMLINK_RING_HEADER_SIZE + RING_CAPACITY, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    g_from_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_to_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_from || !g_to || !g_from_event || !g_to_event) return 0;
+    memset(&g_rings, 0, sizeof(g_rings));
+    g_rings.version = CHMLINK_SESSION_VERSION;
+    g_rings.from_windows_ring = (uint64_t)(ULONG_PTR)g_from;
+    g_rings.from_windows_capacity = RING_CAPACITY;
+    g_rings.from_windows_event = (uint64_t)(ULONG_PTR)g_from_event;
+    g_rings.to_windows_ring = (uint64_t)(ULONG_PTR)g_to;
+    g_rings.to_windows_capacity = RING_CAPACITY;
+    g_rings.to_windows_event = (uint64_t)(ULONG_PTR)g_to_event;
+    chmlink_session_encode(g_register_request, &g_rings);
+    return 1;
+}
+
+static void destroy_rings(void)
+{
+    if (g_from) { VirtualFree(g_from, 0, MEM_RELEASE); g_from = NULL; }
+    if (g_to) { VirtualFree(g_to, 0, MEM_RELEASE); g_to = NULL; }
+    if (g_from_event) { CloseHandle(g_from_event); g_from_event = NULL; }
+    if (g_to_event) { CloseHandle(g_to_event); g_to_event = NULL; }
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     worker workers[FUZZ_WORKERS], inspect;
     HANDLE threads[FUZZ_WORKERS], inspect_thread;
     chmlink_query_info info, after;
-    ULONGLONG deadline;
     unsigned long rounds = 0;
-    DWORD old;
+    DWORD old, returned;
     int i;
     uint8_t *pages;
     if (argc < 3) { fwprintf(stderr, L"usage: chmlink-ioctl-fuzz <index> <seconds> [--seed N] [--tolerant]\n"); return 2; }
     g_index = (uint32_t)wcstoul(argv[1], NULL, 10);
-    deadline = g_deadline = GetTickCount64() + 1000ull * wcstoul(argv[2], NULL, 10);
+    g_deadline = GetTickCount64() + 1000ull * wcstoul(argv[2], NULL, 10);
     g_seed = GetTickCount64() ^ ((unsigned long long)GetCurrentProcessId() << 32);
     for (i = 3; i < argc; ++i) {
         if (wcscmp(argv[i], L"--seed") == 0 && i + 1 < argc) g_seed = _wcstoui64(argv[++i], NULL, 10);
@@ -396,14 +407,12 @@ int wmain(int argc, wchar_t **argv)
     swprintf(g_path, 64, L"\\\\.\\ChmLink%lu", (unsigned long)g_index);
     printf("seed %llu%s\n", (unsigned long long)g_seed, g_tolerant ? " (tolerant)" : ""); fflush(stdout);
 
-    /* A read-only page, then a writable page followed by a no-access page. */
     pages = VirtualAlloc(NULL, 3 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); REQUIRE(pages);
     REQUIRE(VirtualProtect(pages, 4096, PAGE_READONLY, &old));
     REQUIRE(VirtualProtect(pages + 2 * 4096, 4096, PAGE_NOACCESS, &old));
     g_readonly_page = pages; g_guard_edge = pages + 2 * 4096 - 64;
 
     if (!query_state(&info)) {
-        /* Under fault injection or churn the adapter may be starting, failed or gone. */
         ULONGLONG give_up = GetTickCount64() + 20000;
         while (g_tolerant && GetTickCount64() < give_up && !query_state(&info)) Sleep(200);
         if (!query_state(&info)) {
@@ -414,7 +423,6 @@ int wmain(int argc, wchar_t **argv)
     if (!g_tolerant && (info.state & CHMLINK_STATE_SESSION)) FAIL("adapter %u already has a data session", g_index);
     g_mode = info.mode; g_limit = info.packet_limit;
 
-    /* A name below the device must not open. */
     {
         wchar_t sub[80];
         HANDLE h;
@@ -425,10 +433,20 @@ int wmain(int argc, wchar_t **argv)
 
     init_worker(&inspect, g_seed + 1000);
     inspect_thread = CreateThread(NULL, 0, inspector, &inspect, 0, NULL); REQUIRE(inspect_thread);
-    while (GetTickCount64() < deadline) {
+    while (GetTickCount64() < g_deadline) {
         HANDLE session = open_session();
-        LONG64 registered_before = g_registered, conflicts_before = g_register_conflicts;
+        LONG64 registered_before = g_registered;
         if (session == NULL) { if (g_tolerant) continue; FAIL("session never became free"); }
+        if (!create_rings()) { CloseHandle(session); FAIL("ring allocation failed"); }
+        SetLastError(ERROR_SUCCESS);
+        InterlockedExchange(&g_round_registered, 0);
+        if (DeviceIoControl(session, CHMLINK_IOCTL_REGISTER_RINGS, g_register_request,
+                            CHMLINK_SESSION_SIZE, NULL, 0, &returned, NULL)) {
+            InterlockedExchange(&g_round_registered, 1);
+            InterlockedIncrement64(&g_registered);
+        } else if (!g_tolerant) {
+            FAIL("REGISTER_RINGS failed: %lu", GetLastError());
+        }
         for (i = 0; i < FUZZ_WORKERS; ++i) {
             if (rounds == 0) init_worker(&workers[i], g_seed + (unsigned long long)i);
             REQUIRE(DuplicateHandle(GetCurrentProcess(), session, GetCurrentProcess(), &workers[i].handle,
@@ -439,28 +457,34 @@ int wmain(int argc, wchar_t **argv)
         for (i = 0; i < FUZZ_WORKERS; ++i) {
             threads[i] = CreateThread(NULL, 0, session_worker, &workers[i], 0, NULL); REQUIRE(threads[i]);
         }
-        REQUIRE(WaitForMultipleObjects(FUZZ_WORKERS, threads, TRUE, (DWORD)(deadline - GetTickCount64() + 120000)) == WAIT_OBJECT_0);
+        REQUIRE(WaitForMultipleObjects(FUZZ_WORKERS, threads, TRUE,
+                (DWORD)(g_deadline - GetTickCount64() + 120000)) == WAIT_OBJECT_0);
         for (i = 0; i < FUZZ_WORKERS; ++i) CloseHandle(threads[i]);
-        /* One read event per session at most; a refused second one implies the first. */
-        if (g_registered - registered_before > 1) FAIL("two read events registered in one session");
-        if (!g_tolerant && g_register_conflicts > conflicts_before && g_registered == registered_before)
-            FAIL("read event refused as a duplicate with none registered");
-        /* Cleanup ran with the last close: the session must be free again. */
+        if (g_ops & 0x20) {
+            /* A misaligned tail must make the driver close the session rather
+             * than read out of range. */
+            chmlink_ring view;
+            uint32_t bad = 2;
+            memcpy(g_to + CHMLINK_RING_TAIL_OFFSET, &bad, 4);
+            SetEvent(g_to_event);
+            Sleep(50);
+            REQUIRE(chmlink_ring_attach(&view, g_from, RING_CAPACITY));
+            if ((chmlink_ring_load(&view, CHMLINK_RING_STATE_OFFSET) & CHMLINK_RING_STATE_CLOSED) != 0)
+                InterlockedIncrement64(&g_broken);
+            else if (!g_tolerant) FAIL("a corrupted ring was not closed");
+        }
+        destroy_rings();
         if (!g_tolerant) {
             REQUIRE(query_state(&after));
             if (after.state & CHMLINK_STATE_SESSION) FAIL("session still open after every handle closed");
             if (!(after.state & CHMLINK_STATE_RUNNING)) FAIL("adapter not running after round %lu", rounds);
         }
+        if (g_registered == registered_before && !g_tolerant) FAIL("no ring registration in a round");
         rounds++;
     }
     InterlockedExchange(&g_stop, 1);
     REQUIRE(WaitForSingleObject(inspect_thread, 30000) == WAIT_OBJECT_0);
-    if (!g_tolerant) {
-        REQUIRE(query_state(&after));
-        if (after.rx_packets + after.rx_discards < info.rx_packets + info.rx_discards + (uint64_t)g_accepted_injects)
-            FAIL("counters lost injected packets");
-    }
-    printf("PASS ioctl fuzz: %lu rounds, %lld requests, %lld accepted injections, %lld read events\n",
-           rounds, (long long)g_requests, (long long)g_accepted_injects, (long long)g_registered);
+    printf("PASS ioctl fuzz: %lu rounds, %lld requests, %lld registrations, %lld broken sessions\n",
+           rounds, (long long)g_requests, (long long)g_registered, (long long)g_broken);
     return 0;
 }

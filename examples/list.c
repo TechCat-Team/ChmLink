@@ -15,9 +15,9 @@ static int show(const chmlink_adapter_info *info, void *context)
     if (info->mode == CHMLINK_MODE_ETHERNET)
         printf("  mac=%02X:%02X:%02X:%02X:%02X:%02X\n", info->mac[0], info->mac[1],
                info->mac[2], info->mac[3], info->mac[4], info->mac[5]);
-    printf("  queued=%" PRIu32 "/%" PRIu32 " tx=%" PRIu64
-           " rx=%" PRIu64 " queue_drops=%" PRIu64 "\n",
-           info->queued_packets, info->queue_capacity, info->tx_packets,
+    printf("  pending=%" PRIu32 "/%" PRIu32 " tx=%" PRIu64
+           " rx=%" PRIu64 " drops=%" PRIu64 "\n",
+           info->ring_pending_bytes, info->ring_capacity, info->tx_packets,
            info->rx_packets, info->tx_queue_drops);
     return 1;
 }
