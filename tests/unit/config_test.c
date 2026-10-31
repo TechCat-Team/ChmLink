@@ -17,6 +17,7 @@ static void baseline(unsigned char *p)
     p[8] = CHMLINK_CONFIG_SIZE;
     p[12] = CHMLINK_CONFIG_MODE_ETHERNET;
     p[16] = 1; p[32] = 2; p[48] = 2;
+    chmlink_config_set_mtu(p, CHMLINK_MTU_DEFAULT);
 }
 
 int main(void)
@@ -31,6 +32,7 @@ int main(void)
      * including high bytes that must not truncate to the supported version. */
     for (i = 0; i < CHMLINK_CONFIG_SIZE; ++i) {
         if (i >= 16 && i < 54) continue;
+        if (i >= CHMLINK_CONFIG_MTU && i < CHMLINK_CONFIG_MTU + 4) continue;   /* below */
         for (value = 0; value < 256; ++value) {
             unsigned char saved = bytes[i];
             bytes[i] = (unsigned char)value;
@@ -55,7 +57,37 @@ int main(void)
     CHECK(chmlink_config_mode(bytes) == CHMLINK_CONFIG_MODE_IP);
     bytes[48] = 2; CHECK(!chmlink_config_valid(bytes, sizeof(bytes))); bytes[48] = 0;
     bytes[12] = CHMLINK_CONFIG_MODE_ETHERNET; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
-    bytes[12] = CHMLINK_CONFIG_MODE_IP; bytes[4] = 3; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+    bytes[12] = CHMLINK_CONFIG_MODE_IP; bytes[4] = 4; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
     bytes[4] = 1; bytes[12] = 0; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+
+    /* MTU: Ethernet exactly 1500; IP from 1280 to 65535. */
+    baseline(bytes);
+    CHECK(chmlink_config_mtu(bytes) == 1500);
+    for (value = 0; value < 70000; value += (value < 1600 ? 1 : 97)) {
+        chmlink_config_set_mtu(bytes, value);
+        CHECK(chmlink_config_valid(bytes, sizeof(bytes)) == (value == 1500));
+    }
+    baseline(bytes); bytes[12] = CHMLINK_CONFIG_MODE_IP; memset(bytes + 48, 0, 6);
+    for (value = 0; value < 70000; value += (value < 1600 ? 1 : 97)) {
+        chmlink_config_set_mtu(bytes, value);
+        CHECK(chmlink_config_valid(bytes, sizeof(bytes)) == (value >= 1280 && value <= 65535));
+        if (value >= 1280 && value <= 65535) CHECK(chmlink_config_mtu(bytes) == value);
+    }
+    chmlink_config_set_mtu(bytes, 65535); CHECK(chmlink_config_valid(bytes, sizeof(bytes)));
+    chmlink_config_set_mtu(bytes, 65536); CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+    chmlink_config_set_mtu(bytes, 0x80000500u); CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+    chmlink_config_set_mtu(bytes, 9000);
+    bytes[54] = 1; CHECK(!chmlink_config_valid(bytes, sizeof(bytes))); bytes[54] = 0;
+    bytes[63] = 1; CHECK(!chmlink_config_valid(bytes, sizeof(bytes))); bytes[63] = 0;
+    CHECK(chmlink_config_valid(bytes, sizeof(bytes)) && chmlink_config_mtu(bytes) == 9000);
+
+    /* Version 2 (earlier tools): no MTU field, which reads as 1500. */
+    baseline(bytes); bytes[4] = CHMLINK_CONFIG_VERSION_NO_MTU;
+    CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));       /* MTU bytes must be zero */
+    chmlink_config_set_mtu(bytes, 0);
+    CHECK(chmlink_config_valid(bytes, sizeof(bytes)) && chmlink_config_mtu(bytes) == 1500);
+    bytes[12] = CHMLINK_CONFIG_MODE_IP; memset(bytes + 48, 0, 6);
+    CHECK(chmlink_config_valid(bytes, sizeof(bytes)) && chmlink_config_mtu(bytes) == 1500);
+    bytes[57] = 0x23; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
     return 0;
 }

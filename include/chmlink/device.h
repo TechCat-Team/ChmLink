@@ -5,9 +5,9 @@
 #include "version.h"
 #include "query.h"
 #define CHMLINK_ETHERNET_MTU 1500u
-#define CHMLINK_ETHERNET_LIMIT 1522u
-#define CHMLINK_IP_MTU 1500u
-#define CHMLINK_IP_LIMIT CHMLINK_IP_MTU
+#define CHMLINK_ETHERNET_LIMIT 1522u   /* frame with a VLAN tag, without FCS */
+/* An IP adapter's MTU is configured per device (chmlink/config.h: 1500 by
+ * default, 1280 to 65535); QUERY reports it as mtu and packet_limit. */
 /* Packets move through two shared-memory rings per session (chmlink/ring.h):
  * one the driver produces for Windows traffic, one the application produces
  * for injection. The driver registers both with CHMLINK_IOCTL_REGISTER_RINGS

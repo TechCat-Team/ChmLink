@@ -264,7 +264,7 @@ static NDIS_STATUS set(CL_ADAPTER *a, PNDIS_OID_REQUEST r)
                 if (value & ~CL_FILTERS) status = NDIS_STATUS_NOT_SUPPORTED;
                 else a->PacketFilter = value;
             } else if (r->DATA.SET_INFORMATION.Oid == OID_GEN_CURRENT_LOOKAHEAD) {
-                if (value > CHMLINK_ETHERNET_MTU) status = NDIS_STATUS_INVALID_DATA;
+                if (value > a->Mtu) status = NDIS_STATUS_INVALID_DATA;
                 else a->Lookahead = value;
             } else if (value < NdisDeviceStateD0 || value > NdisDeviceStateD3) {
                 status = NDIS_STATUS_INVALID_DATA;

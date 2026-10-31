@@ -149,13 +149,15 @@ typedef struct CL_ADAPTER {
     ULONG64 TxPackets, TxBytes, TxErrors;
     ULONG64 RxPackets, RxBytes, RxDiscards;
     ULONG64 TxQueueDrops;
+    /* Largest IP packet, from the device configuration; 1500 for Ethernet. */
+    ULONG Mtu;
 } CL_ADAPTER;
 
-/* Mode is fixed during ClInitialize and never changes afterwards, so these
- * helpers are safe without holding the adapter lock. */
+/* Mode and Mtu are fixed during ClInitialize and never change afterwards, so
+ * these helpers are safe without holding the adapter lock. */
 static __inline ULONG ClPacketLimit(const CL_ADAPTER *a)
 {
-    return a->Mode == CHMLINK_MODE_IP ? CHMLINK_IP_LIMIT : CHMLINK_ETHERNET_LIMIT;
+    return a->Mode == CHMLINK_MODE_IP ? a->Mtu : CHMLINK_ETHERNET_LIMIT;
 }
 
 /* Smallest frame Windows may hand us: an IPv4 header or an Ethernet header. */

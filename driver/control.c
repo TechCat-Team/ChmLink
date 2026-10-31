@@ -92,7 +92,7 @@ static NTSTATUS query(CL_ADAPTER *a, PIRP irp, ULONG size)
         (a->Mode == CHMLINK_MODE_IP ? 0 : CHMLINK_CAP_OFFLOAD);
     info.mode = (uint32_t)a->Mode;
     info.interface_index = a->InterfaceIndex;
-    info.mtu = CHMLINK_ETHERNET_MTU;
+    info.mtu = a->Mtu;
     info.packet_limit = ClPacketLimit(a);
     if (a->Mode != CHMLINK_MODE_IP) NdisMoveMemory(info.mac, a->Mac, sizeof(info.mac));
     info.luid = a->Luid.Value;

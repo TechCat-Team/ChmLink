@@ -2,13 +2,16 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Create', 'ApplyName')]
+    [ValidateSet('Create', 'ApplyName', 'SetMtu')]
     [string]$Action,
     [string]$InfPath,
     [string]$InstanceId,
     [string]$Name,
     [string]$Mac,
     [ValidateSet('ethernet', 'ip')][string]$Mode = 'ethernet',
+    # IP adapters only: 1280 to 65535, 1500 by default. SetMtu restarts the
+    # adapter, which ends an open data session.
+    [ValidateRange(1280, 65535)][int]$Mtu,
     [guid]$OwnerId = '7C71F369-78C2-44F4-94CD-A2C14A29469B',
     [string]$DeviceTool
 )
@@ -28,14 +31,26 @@ try {
     }
     $DeviceTool = (Resolve-Path -LiteralPath $DeviceTool).Path
     $version = & $DeviceTool version
-    if ($LASTEXITCODE -ne 0 -or ($version -join '').Trim() -ne '4') { throw 'Device tool version 4 is required.' }
+    if ($LASTEXITCODE -ne 0 -or ($version -join '').Trim() -ne '5') { throw 'Device tool version 5 is required.' }
+    if ($Action -eq 'SetMtu') {
+        if (!$InstanceId -or !$Mtu -or $InfPath -or $Name -or $Mac -or $PSBoundParameters.ContainsKey('Mode')) {
+            throw 'SetMtu requires InstanceId and Mtu only.'
+        }
+        $output = & $DeviceTool set-mtu $InstanceId $Mtu --owner $OwnerId.ToString('B')
+        $code = $LASTEXITCODE
+        if ($code -notin @(0, 3010)) { throw "Setting the MTU failed (exit $code)." }
+        $output
+        exit $code
+    }
     if ($Action -eq 'Create') {
         if (!$InfPath -or $InstanceId) { throw 'Create requires InfPath and does not accept InstanceId.' }
         if ($Mode -eq 'ip' -and $Mac) { throw 'IP adapters do not have a MAC address.' }
+        if ($Mtu -and $Mode -ne 'ip') { throw 'Only IP adapters have a configurable MTU.' }
         $arguments = @('create', (Resolve-Path -LiteralPath $InfPath).Path, '--owner', $OwnerId.ToString('B'))
         if ($Name) { $arguments += @('--name', $Name) }
         if ($Mac) { $arguments += @('--mac', $Mac) }
         $arguments += @('--mode', $Mode.ToLowerInvariant())
+        if ($Mtu) { $arguments += @('--mtu', [string]$Mtu) }
         $changed = $true # native stderr can throw before LASTEXITCODE is inspected
         $output = & $DeviceTool @arguments
         $code = $LASTEXITCODE
@@ -44,7 +59,7 @@ try {
         $changed = $true; $nativeRestart = $code -eq 3010
         $created = $output | ConvertFrom-Json
         $InstanceId = $created.InstanceId
-    } elseif (!$InstanceId -or $InfPath -or $Name -or $Mac -or $PSBoundParameters.ContainsKey('Mode')) {
+    } elseif (!$InstanceId -or $InfPath -or $Name -or $Mac -or $Mtu -or $PSBoundParameters.ContainsKey('Mode')) {
         throw 'ApplyName requires InstanceId and applies its stored name; creation parameters are not accepted.'
     }
 

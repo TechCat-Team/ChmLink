@@ -61,7 +61,6 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     a->Handle = handle;
     a->InterfaceIndex = index;
     a->Luid = parameters->NetLuid;
-    a->Lookahead = CHMLINK_ETHERNET_MTU;
     a->PowerState = NdisDeviceStateD0;
     a->OffloadAllowed = CL_OFFLOAD_FINE_ALL;
     KeInitializeSpinLock(&a->Lock);
@@ -71,6 +70,9 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     status = ClReadConfiguration(handle, a->Configuration);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
     a->Mode = (chmlink_mode)chmlink_config_mode(a->Configuration);
+    /* chmlink_config_valid allows only 1500 for Ethernet and 1280..65535 for IP. */
+    a->Mtu = chmlink_config_mtu(a->Configuration);
+    a->Lookahead = a->Mtu;
     NdisMoveMemory(a->Mac, a->Configuration + CHMLINK_CONFIG_MAC, sizeof(a->Mac));
 
     NdisZeroMemory(&registration, sizeof(registration));
@@ -93,12 +95,12 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     general.Header.Size = NDIS_SIZEOF_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES_REVISION_2;
     general.MediaType = a->Mode == CHMLINK_MODE_IP ? NdisMediumIP : NdisMedium802_3;
     general.PhysicalMediumType = NdisPhysicalMediumUnspecified;
-    general.MtuSize = CHMLINK_ETHERNET_MTU;
+    general.MtuSize = a->Mtu;
     general.MaxXmitLinkSpeed = general.MaxRcvLinkSpeed = 1000000000ULL;
     general.XmitLinkSpeed = general.RcvLinkSpeed = 1000000000ULL;
     general.MediaConnectState = MediaConnectStateDisconnected;
     general.MediaDuplexState = MediaDuplexStateFull;
-    general.LookaheadSize = CHMLINK_ETHERNET_MTU;
+    general.LookaheadSize = a->Mtu;
     general.MacOptions = NDIS_MAC_OPTION_COPY_LOOKAHEAD_DATA |
         NDIS_MAC_OPTION_TRANSFERS_NOT_PEND | NDIS_MAC_OPTION_NO_LOOPBACK;
     general.SupportedPacketFilters = CL_FILTERS;

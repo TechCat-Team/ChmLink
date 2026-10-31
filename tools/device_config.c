@@ -61,7 +61,7 @@ static BOOL parse_guid(const wchar_t *text, GUID *id)
 }
 
 BOOL ClNewConfig(CL_DEVICE_CONFIG *config, const wchar_t *owner, const wchar_t *name,
-                 const wchar_t *mac, unsigned int mode)
+                 const wchar_t *mac, unsigned int mode, unsigned int mtu)
 {
     GUID id, owner_id;
     wchar_t generated[64], id_text[39];
@@ -81,6 +81,7 @@ BOOL ClNewConfig(CL_DEVICE_CONFIG *config, const wchar_t *owner, const wchar_t *
     CopyMemory(config->Bytes, "CLCF", 4);
     config->Bytes[4] = CHMLINK_CONFIG_VERSION; config->Bytes[8] = CHMLINK_CONFIG_SIZE;
     config->Bytes[CHMLINK_CONFIG_MODE] = (BYTE)mode;
+    chmlink_config_set_mtu(config->Bytes, mtu ? mtu : CHMLINK_MTU_DEFAULT);
     CopyMemory(config->Bytes + CHMLINK_CONFIG_ADAPTER_ID, &id, sizeof(id));
     CopyMemory(config->Bytes + CHMLINK_CONFIG_OWNER_ID, &owner_id, sizeof(owner_id));
     if (mac != NULL) {
@@ -175,6 +176,31 @@ BOOL ClWriteConfig(HDEVINFO set, SP_DEVINFO_DATA *device, const CL_DEVICE_CONFIG
     return TRUE;
 }
 
+BOOL ClUpdateMtu(HDEVINFO set, SP_DEVINFO_DATA *device, const CL_DEVICE_CONFIG *current, unsigned int mtu)
+{
+    BYTE bytes[CHMLINK_CONFIG_SIZE], stored[CHMLINK_CONFIG_SIZE];
+    DWORD size = sizeof(stored), type = 0;
+    HKEY key;
+    LSTATUS error;
+    CopyMemory(bytes, current->Bytes, sizeof(bytes));
+    bytes[4] = CHMLINK_CONFIG_VERSION;
+    chmlink_config_set_mtu(bytes, mtu);
+    if (!chmlink_config_valid(bytes, sizeof(bytes))) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    key = SetupDiOpenDevRegKey(set, device, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE | KEY_SET_VALUE);
+    if (key == INVALID_HANDLE_VALUE) return FALSE;
+    /* Only the MTU may change: the stored identity must still be the one read. */
+    error = RegQueryValueExW(key, CHMLINK_CONFIG_VALUE, NULL, &type, stored, &size);
+    if (error == ERROR_SUCCESS &&
+        (type != REG_BINARY || size != sizeof(stored) || memcmp(stored, current->Bytes, sizeof(stored)) != 0))
+        error = ERROR_INVALID_DATA;
+    if (error == ERROR_SUCCESS)
+        error = RegSetValueExW(key, CHMLINK_CONFIG_VALUE, 0, REG_BINARY, bytes, sizeof(bytes));
+    if (error == ERROR_SUCCESS) error = RegFlushKey(key);
+    RegCloseKey(key);
+    if (error != ERROR_SUCCESS) { SetLastError(error); return FALSE; }
+    return TRUE;
+}
+
 BOOL ClCheckOwner(const CL_DEVICE_CONFIG *config, const wchar_t *owner)
 {
     GUID id;
@@ -216,7 +242,7 @@ int ClShowConfig(const wchar_t *instance)
     else wprintf(L"\"%02X:%02X:%02X:%02X:%02X:%02X\"", config.Bytes[CHMLINK_CONFIG_MAC], config.Bytes[CHMLINK_CONFIG_MAC + 1],
         config.Bytes[CHMLINK_CONFIG_MAC + 2], config.Bytes[CHMLINK_CONFIG_MAC + 3],
         config.Bytes[CHMLINK_CONFIG_MAC + 4], config.Bytes[CHMLINK_CONFIG_MAC + 5]);
-    wprintf(L",\"Name\":");
+    wprintf(L",\"Mtu\":%u,\"Name\":", chmlink_config_mtu(config.Bytes));
     json_string(config.Name); wprintf(L",\"InstanceId\":"); json_string(instance); wprintf(L"}\n");
     SetupDiDestroyDeviceInfoList(set); return 0;
 fail:

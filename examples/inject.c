@@ -10,8 +10,9 @@ int main(int argc, char **argv)
 {
     unsigned long index;
     char *end;
-    uint8_t frame[CHMLINK_ETHERNET_LIMIT + 1];
-    uint8_t batch[CHMLINK_ETHERNET_LIMIT + CHMLINK_BATCH_HEADER_SIZE + 8];
+    /* Large enough for any adapter: an IP adapter's MTU can be up to 65535. */
+    static uint8_t frame[CHMLINK_PACKET_MAX_SIZE + 1];
+    static uint8_t batch[CHMLINK_PACKET_MAX_SIZE + CHMLINK_BATCH_HEADER_SIZE + 8];
     chmlink_batch_writer writer;
     chmlink_adapter *adapter;
     chmlink_adapter_info info;
@@ -30,8 +31,8 @@ int main(int argc, char **argv)
     length = fread(frame, 1, sizeof(frame), file);
     result = ferror(file);
     fclose(file);
-    if (result || length > CHMLINK_ETHERNET_LIMIT) {
-        fprintf(stderr, "Packet file is unreadable or exceeds the adapter limit.\n"); return 1;
+    if (result || length > CHMLINK_PACKET_MAX_SIZE) {
+        fprintf(stderr, "Packet file is unreadable or too large.\n"); return 1;
     }
     adapter = chmlink_open((uint32_t)index);
     if (adapter == NULL) { fprintf(stderr, "Open failed: %lu\n", GetLastError()); return 1; }

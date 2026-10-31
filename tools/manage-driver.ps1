@@ -46,8 +46,8 @@ function Get-Inventory {
         $configuration = & $DeviceTool show $device.InstanceId
         if ($LASTEXITCODE -ne 0) { throw "Missing or incompatible identity on $($device.InstanceId); back up and recreate old devices." }
         $configuration = $configuration | ConvertFrom-Json
-        if ((!$configuration.Managed -or $configuration.Version -ne 2) -and $Action -ne 'Plan') {
-            throw 'Configuration version 2 is required; recreate old experimental devices after backing up their settings.'
+        if ((!$configuration.Managed -or $configuration.Version -notin @(2, 3)) -and $Action -ne 'Plan') {
+            throw 'Configuration version 2 or 3 is required; recreate old experimental devices after backing up their settings.'
         }
         $result += [pscustomobject]@{
             InstanceId = $device.InstanceId; PublishedInf = $inf
@@ -298,7 +298,7 @@ $configMutex = $null; $configLocked = $false
 try {
     $DeviceTool = (Resolve-Path -LiteralPath $DeviceTool).Path
     $toolVersion = & $DeviceTool version
-    if ($LASTEXITCODE -ne 0 -or ($toolVersion -join '').Trim() -ne '4') { throw 'Device tool version 4 is required.' }
+    if ($LASTEXITCODE -ne 0 -or ($toolVersion -join '').Trim() -ne '5') { throw 'Device tool version 5 is required.' }
     if ($Action -eq 'Plan') {
         $inventory = @(Get-Inventory)
         $target = if ($InfPath) { [string](Get-PackageVersion (Resolve-Path -LiteralPath $InfPath).Path) } else { $null }
@@ -364,6 +364,10 @@ try {
     }
     foreach ($device in $devices) {
         if ([version]$device.Version -lt [version]'0.3.0.0') { throw 'Installed package predates configuration version 2.' }
+        # Configuration version 3 (with the MTU) is read from 0.4.2.0 on.
+        if ($device.Configuration.Version -eq 3 -and $version -lt [version]'0.4.2.0') {
+            throw "Target package cannot read the configuration version 3 of $($device.InstanceId); it needs 0.4.2.0 or later."
+        }
         if (!$AllowDowngrade -and $version -le [version]$device.Version) {
             throw 'Target must be newer than every installed version; use -AllowDowngrade for explicit repair/downgrade.'
         }
