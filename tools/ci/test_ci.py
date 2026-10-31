@@ -125,6 +125,22 @@ class DriverVersionTest(unittest.TestCase):
         self.repo.commit("driver")
         self.assertEqual(self.check(base="0" * 40)[0], 1)
 
+    def test_future_driverver_date_fails(self):
+        # Written on 11/01 in UTC+8 while UTC is still 10/31: Inf2Cat on a UTC runner refuses it.
+        self.repo.write("driver/chmlink.inf", inf("0.3.1.0").replace("10/30/2026", "11/01/2026"))
+        self.repo.write("driver/control.c", "int b;\n")
+        self.repo.commit("driver")
+        original = cdv.utc_today
+        cdv.utc_today = lambda: cdv.datetime.date(2026, 10, 31)
+        try:
+            code, out, _ = self.check()
+            self.assertEqual(code, 1)
+            self.assertIn("UTC", out)
+            cdv.utc_today = lambda: cdv.datetime.date(2026, 11, 1)
+            self.assertEqual(self.check()[0], 0)
+        finally:
+            cdv.utc_today = original
+
     def test_duplicate_driverver_is_an_error(self):
         self.repo.write("driver/chmlink.inf", inf("0.3.1.0") + "DriverVer = 10/30/2026,0.3.2.0\n")
         self.repo.write("driver/control.c", "int b;\n")

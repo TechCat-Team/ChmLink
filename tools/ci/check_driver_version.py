@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fail when driver-affecting files changed but the INF DriverVer did not rise.
+"""Fail when driver-affecting files changed but the INF DriverVer did not rise,
+or when the DriverVer date lies in the future.
 
 Windows keys a published driver package on its INF. A new binary shipped with
 an unchanged DriverVer is silently ignored: the old package is reused and the
@@ -8,10 +9,15 @@ CI so that cannot reach a release.
 
     check_driver_version.py [--base REV] [--head REV] [--repo DIR]
 
+Inf2Cat refuses a postdated DriverVer, judged by the build machine's clock.
+Hosted CI runners use UTC, so a date written in a later time zone (Beijing is
+UTC+8) can still be tomorrow there: the date must not be after today in UTC.
+
 Without --base the base is the merge base with main (or HEAD~1 on main).
 Exit status: 0 ok, 1 violation, 2 usage or git error.
 """
 import argparse
+import datetime
 import re
 import subprocess
 import sys
@@ -37,6 +43,13 @@ DRIVER_FILES = (
 )
 
 DRIVER_VER = re.compile(r"^\s*DriverVer\s*=\s*[^,\s]+\s*,\s*(\d+)\.(\d+)\.(\d+)\.(\d+)\s*$", re.M)
+
+
+DRIVER_DATE = re.compile(r"^\s*DriverVer\s*=\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*,", re.M)
+
+
+def utc_today():
+    return datetime.datetime.now(datetime.timezone.utc).date()
 
 
 class CheckError(Exception):
@@ -76,6 +89,21 @@ def driver_version(repo, rev):
     if len(matches) != 1:
         raise CheckError("%s at %s must contain exactly one DriverVer, found %d" % (INF, rev, len(matches)))
     return tuple(int(part) for part in matches[0])
+
+
+def driver_date(repo, rev):
+    """DriverVer date at rev, or None when the INF does not exist there."""
+    probe = subprocess.run(("git", "-C", repo, "cat-file", "-e", "%s:%s" % (rev, INF)), capture_output=True)
+    if probe.returncode != 0:
+        return None
+    matches = DRIVER_DATE.findall(git(repo, "show", "%s:%s" % (rev, INF)))
+    if len(matches) != 1:
+        raise CheckError("%s at %s must contain exactly one DriverVer date (mm/dd/yyyy)" % (INF, rev))
+    month, day, year = (int(part) for part in matches[0])
+    try:
+        return datetime.date(year, month, day)
+    except ValueError:
+        raise CheckError("%s at %s has an invalid DriverVer date" % (INF, rev))
 
 
 def affects_driver(path):
@@ -127,6 +155,10 @@ def code_changed(repo, base, head, path):
 
 def check(repo, base, head):
     """Returns (ok, message)."""
+    date, today = driver_date(repo, head), utc_today()
+    if date is not None and date > today:
+        return False, ("DriverVer date %s is after today's UTC date %s. Inf2Cat rejects a postdated "
+                       "DriverVer on UTC build machines; use the UTC date." % (date.isoformat(), today.isoformat()))
     changed = [p for p in git(repo, "diff", "--name-only", base, head).splitlines() if p]
     touched = sorted(p for p in changed if affects_driver(p) and code_changed(repo, base, head, p))
     if not touched:

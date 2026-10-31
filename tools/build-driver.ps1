@@ -119,6 +119,14 @@ Invoke-Checked 'link.exe' (@('/nologo', '/driver', '/subsystem:native,10.00',
     '/debug', "/pdb:$Output/chmlink.pdb", '/opt:ref', '/opt:icf',
     "/out:$Output/chmlink.sys", "/libpath:$wdk/Lib/$kitVersion/km/x64",
     'ntoskrnl.lib', 'hal.lib', 'ndis.lib', 'ntstrsafe.lib', 'BufferOverflowK.lib') + $objects)
+# Inf2Cat refuses a postdated DriverVer by the build machine's clock, and hosted
+# runners use UTC: a date taken in a later time zone fails there but not here.
+$driverDate = [regex]::Match((Get-Content -Raw "$repo/driver/chmlink.inf"), '(?m)^\s*DriverVer\s*=\s*(\d{1,2}/\d{1,2}/\d{4})\s*,')
+if (!$driverDate.Success) { throw 'driver/chmlink.inf has no DriverVer date.' }
+$driverDate = [DateTime]::ParseExact($driverDate.Groups[1].Value, 'M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture)
+if ($driverDate -gt [DateTime]::UtcNow.Date) {
+    throw "DriverVer date $($driverDate.ToString('MM/dd/yyyy')) is after today's UTC date $([DateTime]::UtcNow.ToString('MM/dd/yyyy')); use the UTC date."
+}
 Copy-Item "$repo/driver/chmlink.inf" $Output -Force
 $infverif = "$wdk/tools/$kitVersion/x64/infverif.exe"
 Invoke-InfVerification @('/u', "$Output/chmlink.inf")
