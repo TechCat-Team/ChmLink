@@ -44,6 +44,13 @@ if(WIN32)
     add_executable(chmlink-tcp-bench bench/tcp_bench.c tests/support/arp_peer.c)
     target_include_directories(chmlink-tcp-bench PRIVATE tests/support)
     target_link_libraries(chmlink-tcp-bench PRIVATE chmlink iphlpapi ws2_32)
+    # The same benchmarks over Wintun (bench/wintun_shim.c), for comparison;
+    # they load wintun.dll from their own directory at run time.
+    add_executable(wintun-bench bench/packet_bench.c bench/wintun_shim.c)
+    target_link_libraries(wintun-bench PRIVATE chmlink_protocol iphlpapi ws2_32)
+    add_executable(wintun-tcp-bench bench/tcp_bench.c bench/wintun_shim.c tests/support/arp_peer.c)
+    target_include_directories(wintun-tcp-bench PRIVATE tests/support)
+    target_link_libraries(wintun-tcp-bench PRIVATE chmlink_protocol iphlpapi ws2_32)
     add_executable(chmlink-lifecycle-test tests/windows/lifecycle_test.c tests/windows/queue_test.c tests/windows/sdk_test.c)
     target_link_libraries(chmlink-lifecycle-test PRIVATE chmlink iphlpapi ws2_32)
     if(MINGW)
