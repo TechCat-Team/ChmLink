@@ -3,6 +3,13 @@
 
 /* Exported by ntoskrnl; not declared in the headers this driver includes. */
 NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+NTSYSAPI NTSTATUS NTAPI ZwYieldExecution(VOID);
+
+/* How long a queue thread polls an empty ring before it sleeps: a wake-up
+ * costs the application a system call and the packet a thread switch, and at
+ * high rates or in a request-response exchange the next record usually comes
+ * within this time. Yielding while polling leaves the core to other threads. */
+#define CL_RX_POLL_DIVISOR 10000   /* 1/10000 s = 100 microseconds */
 
 /* A session owns shared-memory rings (chmlink/ring.h): one the driver
  * produces into from ClSend, and one to CHMLINK_INJECT_RINGS_MAX the
@@ -121,6 +128,16 @@ static void wait_idle(CL_RXQ *q, BOOLEAN data)
         objects[1] = &q->StateEvent;
         KeWaitForMultipleObjects(2, objects, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
         return;
+    }
+    {
+        LARGE_INTEGER frequency, start = KeQueryPerformanceCounter(&frequency), now;
+        for (;;) {
+            if (chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET) != q->ReadCursor) return;
+            if (s->Stop || q->Stop) return;
+            now = KeQueryPerformanceCounter(NULL);
+            if (now.QuadPart - start.QuadPart >= frequency.QuadPart / CL_RX_POLL_DIVISOR) break;
+            ZwYieldExecution();
+        }
     }
     chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 1);
     if (chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET) != q->ReadCursor) {
