@@ -1,0 +1,44 @@
+LIBRARY chmlink
+EXPORTS
+    ; chmlink/api.h
+    chmlink_enumerate
+    chmlink_inspect
+    chmlink_query
+    chmlink_open
+    chmlink_open_ex
+    chmlink_open_by_id
+    chmlink_close
+    chmlink_wait_readable
+    chmlink_cancel_wait
+    chmlink_get_read_event
+    chmlink_receive_packet
+    chmlink_release_packet
+    chmlink_allocate_packet
+    chmlink_send_packet
+    chmlink_receive
+    chmlink_inject
+    chmlink_set_offload
+    ; chmlink/manage.h
+    chmlink_create_adapter
+    chmlink_delete_adapter
+    chmlink_set_adapter_mtu
+    chmlink_get_device
+    chmlink_enumerate_devices
+    chmlink_delete_driver
+    ; chmlink/protocol.h
+    chmlink_batch_begin
+    chmlink_batch_begin_offload
+    chmlink_batch_append
+    chmlink_batch_append_offload
+    chmlink_offload_valid
+    chmlink_batch_read_begin
+    chmlink_batch_read_next
+    chmlink_batch_validate
+    ; chmlink/packet.h
+    chmlink_packet_valid
+    chmlink_ip_packet_valid
+    ; chmlink/offload.h
+    chmlink_checksum_add
+    chmlink_offload_complete
+    chmlink_gso_segment
+    chmlink_ip_split

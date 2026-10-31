@@ -176,6 +176,19 @@ static void exchange(const exchange_args *x, size_t size4, size_t size6)
     REQUIRE(got4 && got6);
 }
 
+typedef struct find_device_args {
+    uint32_t index;
+    unsigned int matches;
+    chmlink_device device;
+} find_device_args;
+
+static int find_device(const chmlink_device *device, void *context)
+{
+    find_device_args *args = context;
+    if (device->interface_index == args->index) { args->device = *device; args->matches++; }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     WSADATA wsa;
@@ -210,6 +223,15 @@ int main(int argc, char **argv)
         char expected[16];
         if (GetEnvironmentVariableA("CHMLINK_TEST_MTU", expected, sizeof(expected)) != 0)
             REQUIRE(info.mtu == (uint32_t)strtoul(expected, NULL, 10));
+    }
+    {
+        /* The management API finds the same adapter with its configuration. */
+        find_device_args found = {0};
+        found.index = (uint32_t)index;
+        REQUIRE(chmlink_enumerate_devices(NULL, find_device, &found) && found.matches == 1);
+        REQUIRE(found.device.mode == CHMLINK_MODE_IP && found.device.mtu == info.mtu && found.device.name[0]);
+        REQUIRE(chmlink_get_device(found.device.instance_id, &found.device) &&
+                found.device.interface_index == (uint32_t)index);
     }
     if (argc == 7) {
         unsigned long ethernetIndex;

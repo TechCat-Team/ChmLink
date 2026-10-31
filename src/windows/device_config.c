@@ -1,3 +1,10 @@
+/* newdev.h declares DiInstallDevice for Unicode builds only. */
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -6,10 +13,165 @@
 #include <bcrypt.h>
 #include <devguid.h>
 #include <cfgmgr32.h>
+#include <newdev.h>
+#include <initguid.h>   /* defines the DEVPKEY below rather than declaring it */
+#include <devpkey.h>
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <wchar.h>
 #include "device_config.h"
+
+const wchar_t ClHardwareId[] = L"Root\\ChmLink";
+const wchar_t ClIpHardwareId[] = L"Root\\ChmLinkIP";
+
+unsigned int ClDeviceMode(HDEVINFO set, SP_DEVINFO_DATA *device)
+{
+    wchar_t ids[512] = {0};
+    DWORD type, bytes;
+    size_t offset, count;
+    unsigned int mode = 0;
+    if (!SetupDiGetDeviceRegistryPropertyW(set, device, SPDRP_HARDWAREID, &type,
+                                          (BYTE *)ids, sizeof(ids), &bytes)) return 0;
+    if (type != REG_MULTI_SZ || bytes < 2 * sizeof(wchar_t) ||
+        bytes > sizeof(ids) || bytes % sizeof(wchar_t) != 0) return 0;
+    count = bytes / sizeof(wchar_t);
+    if (ids[count - 1] != 0 || ids[count - 2] != 0) return 0;
+    for (offset = 0; offset < count - 1 && ids[offset] != 0;
+         offset += wcslen(ids + offset) + 1) {
+        unsigned int found = _wcsicmp(ids + offset, ClHardwareId) == 0 ? CHMLINK_CONFIG_MODE_ETHERNET :
+            _wcsicmp(ids + offset, ClIpHardwareId) == 0 ? CHMLINK_CONFIG_MODE_IP : 0;
+        if (found && mode && found != mode) return 0;
+        if (found) mode = found;
+    }
+    return mode;
+}
+
+BOOL ClIsDevice(HDEVINFO set, SP_DEVINFO_DATA *device) { return ClDeviceMode(set, device) != 0; }
+
+BOOL ClIsOemName(const wchar_t *name)
+{
+    size_t i = 3;
+    if (_wcsnicmp(name, L"oem", 3) != 0) return FALSE;
+    if (name[i] < L'0' || name[i] > L'9') return FALSE;
+    while (name[i] >= L'0' && name[i] <= L'9') ++i;
+    return _wcsicmp(name + i, L".inf") == 0;
+}
+
+BOOL ClPackageVersion(const wchar_t *path, unsigned long long *package)
+{
+    HINF inf;
+    INFCONTEXT line;
+    wchar_t version[80], *cursor, *end;
+    unsigned long parts[4];
+    unsigned int i;
+    inf = SetupOpenInfFileW(path, L"Net", INF_STYLE_WIN4, NULL);
+    if (inf == INVALID_HANDLE_VALUE) return FALSE;
+    if (!SetupFindFirstLineW(inf, L"Version", L"DriverVer", &line) ||
+        !SetupGetStringFieldW(&line, 2, version, 80, NULL)) {
+        SetupCloseInfFile(inf); SetLastError(ERROR_INVALID_DATA); return FALSE;
+    }
+    SetupCloseInfFile(inf);
+    cursor = version;
+    for (i = 0; i < 4; ++i) {
+        if (*cursor < L'0' || *cursor > L'9') { SetLastError(ERROR_INVALID_DATA); return FALSE; }
+        errno = 0; parts[i] = wcstoul(cursor, &end, 10);
+        if (errno || parts[i] > 65535 || (i < 3 ? *end != L'.' : *end != 0)) {
+            SetLastError(ERROR_INVALID_DATA); return FALSE;
+        }
+        cursor = end + (i < 3 ? 1 : 0);
+    }
+    *package = CL_PACKAGE(parts[0], parts[1], parts[2], parts[3]);
+    if (*package < CL_PACKAGE_CONFIG_2) { SetLastError(ERROR_REVISION_MISMATCH); return FALSE; }
+    return TRUE;
+}
+
+unsigned long long ClBoundPackage(HDEVINFO set, SP_DEVINFO_DATA *device)
+{
+    wchar_t text[64];
+    DEVPROPTYPE type;
+    unsigned long parts[4] = {0};
+    if (!SetupDiGetDevicePropertyW(set, device, &DEVPKEY_Device_DriverVersion, &type, (PBYTE)text,
+                                   sizeof(text) - sizeof(wchar_t), NULL, 0) || type != DEVPROP_TYPE_STRING)
+        return 0;
+    text[63] = 0;
+    if (swscanf(text, L"%lu.%lu.%lu.%lu", &parts[0], &parts[1], &parts[2], &parts[3]) != 4) return 0;
+    return CL_PACKAGE(parts[0], parts[1], parts[2], parts[3]);
+}
+
+/* Windows remains responsible for signature, architecture and compatibility
+ * checks. */
+BOOL ClInstallOnDevice(HDEVINFO set, SP_DEVINFO_DATA *device, const wchar_t *path, BOOL *reboot)
+{
+    SP_DEVINSTALL_PARAMS_W parameters;
+    SP_DRVINFO_DATA_W selected;
+    DWORD error;
+    BOOL result;
+    ZeroMemory(&parameters, sizeof(parameters));
+    parameters.cbSize = sizeof(parameters);
+    if (!SetupDiGetDeviceInstallParamsW(set, device, &parameters)) return FALSE;
+    parameters.Flags |= DI_ENUMSINGLEINF;
+    if (wcslen(path) >= MAX_PATH) { SetLastError(ERROR_FILENAME_EXCED_RANGE); return FALSE; }
+    CopyMemory(parameters.DriverPath, path, (wcslen(path) + 1) * sizeof(wchar_t));
+    if (!SetupDiSetDeviceInstallParamsW(set, device, &parameters) ||
+        !SetupDiBuildDriverInfoList(set, device, SPDIT_COMPATDRIVER)) return FALSE;
+    ZeroMemory(&selected, sizeof(selected)); selected.cbSize = sizeof(selected);
+    result = SetupDiCallClassInstaller(DIF_SELECTBESTCOMPATDRV, set, device) &&
+             SetupDiGetSelectedDriverW(set, device, &selected) &&
+             DiInstallDevice(NULL, set, device, &selected, 0, reboot);
+    error = GetLastError();
+    SetupDiDestroyDriverInfoList(set, device, SPDIT_COMPATDRIVER);
+    if (!result) SetLastError(error);
+    return result;
+}
+
+/* The network interface of a device: its GUID once the class installer has
+ * assigned one, and its index once NDIS has bound the miniport. */
+BOOL ClInterfaceOf(HDEVINFO set, SP_DEVINFO_DATA *device, GUID *guid, uint32_t *index)
+{
+    wchar_t text[39];
+    DWORD type, bytes = sizeof(text);
+    NET_LUID luid;
+    NET_IFINDEX found;
+    LSTATUS error;
+    HKEY key = SetupDiOpenDevRegKey(set, device, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_QUERY_VALUE);
+    if (index != NULL) *index = 0;
+    if (key == INVALID_HANDLE_VALUE) return FALSE;
+    error = RegQueryValueExW(key, L"NetCfgInstanceId", NULL, &type, (BYTE *)text, &bytes);
+    RegCloseKey(key);
+    if (error != ERROR_SUCCESS) { SetLastError(error); return FALSE; }
+    if (type != REG_SZ || bytes != sizeof(text) || text[38] != 0 || FAILED(CLSIDFromString(text, guid))) {
+        SetLastError(ERROR_INVALID_DATA); return FALSE;
+    }
+    if (index == NULL) return TRUE;
+    error = ConvertInterfaceGuidToLuid(guid, &luid);
+    if (error == NO_ERROR) error = ConvertInterfaceLuidToIndex(&luid, &found);
+    if (error != NO_ERROR) { SetLastError(error); return FALSE; }
+    *index = found;
+    return TRUE;
+}
+
+/* An abandoned lock means a change was interrupted halfway: refuse once so
+ * that the caller inspects the devices, as the lock is then released. */
+BOOL ClLock(HANDLE *mutex)
+{
+    DWORD locked;
+    *mutex = CreateMutexW(NULL, FALSE, L"Global\\ChmLink.AdapterConfiguration");
+    if (*mutex == NULL) return FALSE;
+    locked = WaitForSingleObject(*mutex, 10000);
+    if (locked == WAIT_OBJECT_0) return TRUE;
+    if (locked == WAIT_ABANDONED) ReleaseMutex(*mutex);
+    CloseHandle(*mutex); *mutex = NULL;
+    SetLastError(locked == WAIT_ABANDONED ? ERROR_INVALID_STATE : locked == WAIT_TIMEOUT ? ERROR_BUSY : GetLastError());
+    return FALSE;
+}
+
+void ClUnlock(HANDLE mutex)
+{
+    DWORD error = GetLastError();
+    ReleaseMutex(mutex); CloseHandle(mutex);
+    SetLastError(error);
+}
 
 static BOOL valid_name(const wchar_t *name)
 {
@@ -52,7 +214,7 @@ BOOL ClReadConfig(HDEVINFO set, SP_DEVINFO_DATA *device, CL_DEVICE_CONFIG *confi
     return TRUE;
 }
 
-static BOOL parse_guid(const wchar_t *text, GUID *id)
+BOOL ClParseGuid(const wchar_t *text, GUID *id)
 {
     static const GUID zero = {0};
     if (wcslen(text) != 38 || text[0] != L'{' || text[37] != L'}' || FAILED(CLSIDFromString(text, id)) ||
@@ -60,15 +222,38 @@ static BOOL parse_guid(const wchar_t *text, GUID *id)
     return TRUE;
 }
 
-BOOL ClNewConfig(CL_DEVICE_CONFIG *config, const wchar_t *owner, const wchar_t *name,
-                 const wchar_t *mac, unsigned int mode, unsigned int mtu)
+/* xx:xx:xx:xx:xx:xx or xx-xx-xx-xx-xx-xx */
+BOOL ClParseMac(const wchar_t *mac, BYTE out[6])
 {
-    GUID id, owner_id;
+    unsigned int i, digit;
+    if (wcslen(mac) != 17) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    for (i = 0; i < 6; ++i) {
+        unsigned int value = 0;
+        for (digit = 0; digit < 2; ++digit) {
+            wchar_t c = mac[i * 3 + digit];
+            if (c >= L'0' && c <= L'9') value = value * 16 + c - L'0';
+            else if (c >= L'a' && c <= L'f') value = value * 16 + c - L'a' + 10;
+            else if (c >= L'A' && c <= L'F') value = value * 16 + c - L'A' + 10;
+            else { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+        }
+        if (i < 5 && ((mac[2] != L':' && mac[2] != L'-') || mac[i * 3 + 2] != mac[2])) {
+            SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
+        }
+        out[i] = (BYTE)value;
+    }
+    return TRUE;
+}
+
+BOOL ClNewConfig(CL_DEVICE_CONFIG *config, const GUID *owner, const wchar_t *name,
+                 const BYTE *mac, unsigned int mode, unsigned int mtu)
+{
+    static const GUID zero = {0};
+    GUID id;
     wchar_t generated[64], id_text[39];
-    unsigned int i;
     ZeroMemory(config, sizeof(*config));
     if ((mode != CHMLINK_CONFIG_MODE_ETHERNET && mode != CHMLINK_CONFIG_MODE_IP) ||
-        (mode == CHMLINK_CONFIG_MODE_IP && mac != NULL) || !parse_guid(owner, &owner_id)) {
+        (mode == CHMLINK_CONFIG_MODE_IP && mac != NULL) || owner == NULL ||
+        memcmp(owner, &zero, sizeof(zero)) == 0) {
         SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
     }
     if (FAILED(CoCreateGuid(&id))) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
@@ -83,23 +268,9 @@ BOOL ClNewConfig(CL_DEVICE_CONFIG *config, const wchar_t *owner, const wchar_t *
     config->Bytes[CHMLINK_CONFIG_MODE] = (BYTE)mode;
     chmlink_config_set_mtu(config->Bytes, mtu ? mtu : CHMLINK_MTU_DEFAULT);
     CopyMemory(config->Bytes + CHMLINK_CONFIG_ADAPTER_ID, &id, sizeof(id));
-    CopyMemory(config->Bytes + CHMLINK_CONFIG_OWNER_ID, &owner_id, sizeof(owner_id));
+    CopyMemory(config->Bytes + CHMLINK_CONFIG_OWNER_ID, owner, sizeof(*owner));
     if (mac != NULL) {
-        if (wcslen(mac) != 17) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-        for (i = 0; i < 6; ++i) {
-            unsigned int digit, value = 0;
-            for (digit = 0; digit < 2; ++digit) {
-                wchar_t c = mac[i * 3 + digit];
-                if (c >= L'0' && c <= L'9') value = value * 16 + c - L'0';
-                else if (c >= L'a' && c <= L'f') value = value * 16 + c - L'a' + 10;
-                else if (c >= L'A' && c <= L'F') value = value * 16 + c - L'A' + 10;
-                else { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-            }
-            if (i < 5 && ((mac[2] != L':' && mac[2] != L'-') || mac[i * 3 + 2] != mac[2])) {
-                SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
-            }
-            config->Bytes[CHMLINK_CONFIG_MAC + i] = (BYTE)value;
-        }
+        CopyMemory(config->Bytes + CHMLINK_CONFIG_MAC, mac, CHMLINK_CONFIG_MAC_SIZE);
     } else if (mode == CHMLINK_CONFIG_MODE_ETHERNET) {
         if (BCryptGenRandom(NULL, config->Bytes + CHMLINK_CONFIG_MAC, CHMLINK_CONFIG_MAC_SIZE, BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) {
             SetLastError(ERROR_GEN_FAILURE); return FALSE;
@@ -201,51 +372,10 @@ BOOL ClUpdateMtu(HDEVINFO set, SP_DEVINFO_DATA *device, const CL_DEVICE_CONFIG *
     return TRUE;
 }
 
-BOOL ClCheckOwner(const CL_DEVICE_CONFIG *config, const wchar_t *owner)
+BOOL ClCheckOwner(const CL_DEVICE_CONFIG *config, const GUID *owner)
 {
-    GUID id;
-    if (!parse_guid(owner, &id)) return FALSE;
-    if (memcmp(config->Bytes + CHMLINK_CONFIG_OWNER_ID, &id, CHMLINK_CONFIG_ID_SIZE) == 0) return TRUE;
+    if (owner != NULL && memcmp(config->Bytes + CHMLINK_CONFIG_OWNER_ID, owner, CHMLINK_CONFIG_ID_SIZE) == 0)
+        return TRUE;
     SetLastError(ERROR_ACCESS_DENIED); return FALSE;
 }
 
-static void json_string(const wchar_t *text)
-{
-    const wchar_t *p;
-    putwchar(L'"');
-    for (p = text; *p; ++p) wprintf(L"\\u%04x", (unsigned int)*p);
-    putwchar(L'"');
-}
-
-int ClShowConfig(const wchar_t *instance)
-{
-    HDEVINFO set = SetupDiCreateDeviceInfoList(&GUID_DEVCLASS_NET, NULL);
-    SP_DEVINFO_DATA device = {sizeof(device)};
-    CL_DEVICE_CONFIG config;
-    GUID id, owner;
-    wchar_t id_text[39], owner_text[39];
-    DWORD error;
-    if (set == INVALID_HANDLE_VALUE) return 1;
-    if (!SetupDiOpenDeviceInfoW(set, instance, NULL, 0, &device)) goto fail;
-    if (!ClIsDevice(set, &device)) { SetLastError(ERROR_ACCESS_DENIED); goto fail; }
-    if (!ClReadConfig(set, &device, &config)) {
-        if (GetLastError() != ERROR_FILE_NOT_FOUND) goto fail;
-        wprintf(L"{\"Managed\":false,\"InstanceId\":"); json_string(instance); wprintf(L"}\n");
-        SetupDiDestroyDeviceInfoList(set); return 0;
-    }
-    CopyMemory(&id, config.Bytes + CHMLINK_CONFIG_ADAPTER_ID, CHMLINK_CONFIG_ID_SIZE);
-    CopyMemory(&owner, config.Bytes + CHMLINK_CONFIG_OWNER_ID, CHMLINK_CONFIG_ID_SIZE);
-    StringFromGUID2(&id, id_text, 39); StringFromGUID2(&owner, owner_text, 39);
-    wprintf(L"{\"Managed\":true,\"Version\":%u,\"Mode\":%u,\"AdapterId\":\"%ls\",\"OwnerId\":\"%ls\",\"Mac\":",
-        (unsigned int)config.Bytes[4], chmlink_config_mode(config.Bytes), id_text, owner_text);
-    if (chmlink_config_mode(config.Bytes) == CHMLINK_CONFIG_MODE_IP) wprintf(L"null");
-    else wprintf(L"\"%02X:%02X:%02X:%02X:%02X:%02X\"", config.Bytes[CHMLINK_CONFIG_MAC], config.Bytes[CHMLINK_CONFIG_MAC + 1],
-        config.Bytes[CHMLINK_CONFIG_MAC + 2], config.Bytes[CHMLINK_CONFIG_MAC + 3],
-        config.Bytes[CHMLINK_CONFIG_MAC + 4], config.Bytes[CHMLINK_CONFIG_MAC + 5]);
-    wprintf(L",\"Mtu\":%u,\"Name\":", chmlink_config_mtu(config.Bytes));
-    json_string(config.Name); wprintf(L",\"InstanceId\":"); json_string(instance); wprintf(L"}\n");
-    SetupDiDestroyDeviceInfoList(set); return 0;
-fail:
-    error = GetLastError(); SetupDiDestroyDeviceInfoList(set);
-    fprintf(stderr, "Configuration query failed: %lu\n", error); return 1;
-}

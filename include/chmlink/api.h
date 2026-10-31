@@ -5,6 +5,10 @@
 #include "version.h"
 #include "packet.h"
 #include "protocol.h"
+#include "offload.h"
+#ifdef _WIN32
+#include "manage.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,7 +20,8 @@ extern "C" {
  * Close cancels an existing wait, drains calls already in progress, closes
  * the device (the driver then unlocks the ring pages), and finally releases
  * the rings and events. The pointer must never be used after close returns.
- * These functions do not create devices or modify IP addresses/routes.
+ * These functions do not modify IP addresses or routes; chmlink/manage.h
+ * (included below) creates and deletes adapters.
  *
  * Packets move through two shared-memory rings (chmlink/ring.h) that the SDK
  * allocates and the driver locks. chmlink_receive_packet and

@@ -26,6 +26,8 @@ function Get-TestAdapter($Device) {
     if ($windows.Count -ne 1 -or !$windows[0].GUID) { throw 'Test interface is not ready.' }
     $adapter = @(Get-NetAdapter -IncludeHidden | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$windows[0].GUID })
     if ($adapter.Count -ne 1) { throw 'Cannot resolve the unique test adapter.' }
+    # Creation names the connection itself.
+    if ($adapter[0].Name -cne $current.Name) { throw "The connection is named '$($adapter[0].Name)', not '$($current.Name)'." }
     return $adapter[0]
 }
 try {

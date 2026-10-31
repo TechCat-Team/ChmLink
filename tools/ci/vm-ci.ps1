@@ -1019,6 +1019,11 @@ function Invoke-Run {
             Invoke-Process 'sign cat' $signtool ("sign /q $sign `"$signed\chmlink.cat`"") 120
             Invoke-Process 'verify catalog' $signtool ("verify /q /pa /c `"$signed\chmlink.cat`" `"$signed\chmlink.sys`"") 120
         }
+        Invoke-Stage 'build-embedded' {
+            # chmlink.dll with the signed candidate inside, as applications ship it.
+            Invoke-Process 'cmake configure (embedded)' 'cmake.exe' ('-S . -B build/embedded -G "Visual Studio 17 2022" -A x64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBUILD_TESTING=OFF "-DCHMLINK_DRIVER_DIR={0}"' -f $signed) 300 $script:srcDir
+            Invoke-Process 'cmake build (embedded)' 'cmake.exe' '--build build/embedded --config Release --target chmlink-quickstart -- /m /v:minimal /nologo' 600 $script:srcDir
+        }
         $candidateInf = Join-Path $signed 'chmlink.inf'
         $candidateSys = Get-Sha256 (Join-Path $signed 'chmlink.sys')
         $script:driverVersion = Get-InfVersion $candidateInf
@@ -1047,6 +1052,10 @@ function Invoke-Run {
         $suite = New-SuiteRunner $candidateInf $build
         Invoke-Stage 'lifecycle' { & $suite 'lifecycle' (Join-Path $out 'lifecycle') 900 }
         Invoke-Stage 'ip' { & $suite 'ip' (Join-Path $out 'ip') 600 }
+        Invoke-Stage 'quickstart' {
+            # Creation from the embedded package, naming, a ping round trip and deletion.
+            Invoke-Process 'quickstart self-test' (Join-Path $script:srcDir 'build\embedded\Release\chmlink-quickstart.exe') '--self-test' 120 $script:srcDir
+        }
         if ($Lane -eq 'full') {
             for ($i = 1; $i -le $config.BenchRepeats; $i++) {
                 Invoke-Stage "bench-$i" {

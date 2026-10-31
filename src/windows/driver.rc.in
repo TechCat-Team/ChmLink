@@ -1,0 +1,5 @@
+// The signed driver package embedded in chmlink.dll (CHMLINK_DRIVER_DIR);
+// chmlink_create_adapter installs it when no INF is given.
+CHMLINK_INF RCDATA "@CHMLINK_DRIVER_DIR@/chmlink.inf"
+CHMLINK_SYS RCDATA "@CHMLINK_DRIVER_DIR@/chmlink.sys"
+CHMLINK_CAT RCDATA "@CHMLINK_DRIVER_DIR@/chmlink.cat"
