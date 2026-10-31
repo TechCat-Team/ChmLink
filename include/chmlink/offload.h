@@ -39,6 +39,22 @@ chmlink_result chmlink_gso_segment(chmlink_mode mode, uint8_t *packet, size_t le
     const chmlink_offload *offload, uint8_t *scratch, size_t scratch_size,
     chmlink_segment_callback callback, void *context);
 
+/* An IP packet (CHMLINK_MODE_IP) larger than `mtu`, as an IP adapter with a
+ * large MTU hands it over, cut into packets of at most `mtu` bytes for a link
+ * or tunnel with that MTU. A packet that fits is delivered unchanged. TCP over
+ * IPv4, or over IPv6 without extension headers, becomes complete TCP segments
+ * (as chmlink_gso_segment: lengths, IPv4 identification and header checksum,
+ * sequence numbers, flags and full TCP checksums). Anything else is
+ * fragmented: IPv4 per RFC 791 (later fragments keep only options with the
+ * copy flag), IPv6 with a Fragment header carrying `ipv6_id` after the
+ * unfragmentable part (RFC 8200). An IPv4 packet with DF set that is not
+ * segmentable TCP fails with CHMLINK_TOO_BIG; the caller may drop it or
+ * answer with ICMP "fragmentation needed". `mtu` is 576 or more for IPv4 and
+ * 1280 or more for IPv6; `scratch` holds `mtu` bytes. Segments are valid only
+ * during the callback; returning zero stops early. `packet` is not modified. */
+chmlink_result chmlink_ip_split(uint8_t *packet, size_t length, size_t mtu, uint32_t ipv6_id,
+    uint8_t *scratch, size_t scratch_size, chmlink_segment_callback callback, void *context);
+
 #ifdef __cplusplus
 }
 #endif

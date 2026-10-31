@@ -43,7 +43,8 @@ typedef enum chmlink_result {
     CHMLINK_INVALID_BATCH,
     CHMLINK_INVALID_PACKET,
     CHMLINK_BUFFER_TOO_SMALL,
-    CHMLINK_INVALID_QUERY
+    CHMLINK_INVALID_QUERY,
+    CHMLINK_TOO_BIG          /* larger than allowed and must not be fragmented */
 } chmlink_result;
 
 #define CHMLINK_BATCH_FLAG_OFFLOAD 0x1u

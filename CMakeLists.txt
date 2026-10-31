@@ -5,7 +5,7 @@ add_library(chmlink_packet STATIC src/packet/packet.c)
 target_include_directories(chmlink_packet PUBLIC include)
 target_compile_features(chmlink_packet PUBLIC c_std_99)
 
-add_library(chmlink_protocol STATIC src/protocol/batch.c src/protocol/query.c src/protocol/session.c src/packet/offload.c)
+add_library(chmlink_protocol STATIC src/protocol/batch.c src/protocol/query.c src/protocol/session.c src/packet/offload.c src/packet/split.c)
 
 # Shared-memory packet ring, used by the SDK and (as source) by the driver.
 add_library(chmlink_ring STATIC src/ring/ring.c)
@@ -91,6 +91,9 @@ if(BUILD_TESTING)
     add_executable(offload_test tests/unit/offload_test.c)
     target_link_libraries(offload_test PRIVATE chmlink_protocol)
     add_test(NAME offload_test COMMAND offload_test)
+    add_executable(split_test tests/unit/split_test.c)
+    target_link_libraries(split_test PRIVATE chmlink_protocol)
+    add_test(NAME split_test COMMAND split_test)
     add_executable(session_test tests/unit/session_test.c)
     target_link_libraries(session_test PRIVATE chmlink_protocol chmlink_ring)
     add_test(NAME session_test COMMAND session_test)
