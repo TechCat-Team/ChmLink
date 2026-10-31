@@ -67,6 +67,12 @@ static int arp_count;
  * carries large packets (a stream transport between two large-MTU adapters). */
 #define SPLIT_MTU 1500u
 static int g_split;
+/* Software GRO on the reflector's injecting side (chmlink_coalescer): with
+ * CHMLINK_BENCH_GRO=1 in split mode the 1500-byte pieces are merged again
+ * before injection, as a receiving tunnel endpoint would; in Ethernet mode the
+ * "_gro" runs give Windows plain frames (no LSO) and merge them into RSC. The
+ * reflector thread creates and frees the coalescer when this flag changes. */
+static volatile LONG g_want_gro;
 static char g_prefix[32] = "";
 static volatile LONG64 injected_packets;
 static LARGE_INTEGER qpf;
@@ -303,6 +309,7 @@ typedef struct reflector {
     uint8_t *fallback, *scratch;
     chmlink_batch_writer out;   /* split packets waiting to be injected */
     uint32_t ipv6_id;
+    chmlink_coalescer *coalescer;
 } reflector;
 
 /* Inject a batch, waiting while the ring is full. */
@@ -315,6 +322,11 @@ static void inject_all(reflector *r, const uint8_t *batch, uint32_t length)
 static int append_split(const uint8_t *segment, size_t length, void *context)
 {
     reflector *r = context;
+    if (r->coalescer != NULL) {
+        REQUIRE(chmlink_coalescer_send(r->coalescer, segment, (uint32_t)length) || stop_reflector);
+        InterlockedIncrement64(&injected_packets);
+        return 1;
+    }
     if (chmlink_batch_append(&r->out, segment, length) != CHMLINK_OK) {
         inject_all(r, r->fallback, (uint32_t)r->out.length);
         REQUIRE(chmlink_batch_begin(&r->out, r->fallback, CHMLINK_BATCH_MAX_SIZE, CHMLINK_MODE_IP, r->limit) == CHMLINK_OK);
@@ -339,6 +351,20 @@ static void inject_split(reflector *r, const uint8_t *batch)
         REQUIRE(result == CHMLINK_OK || result == CHMLINK_TOO_BIG);   /* too big: dropped, as a link would */
     }
     if (r->out.count != 0) inject_all(r, r->fallback, (uint32_t)r->out.length);
+    if (r->coalescer != NULL) REQUIRE(chmlink_coalescer_flush(r->coalescer) || stop_reflector);
+}
+
+/* Every packet of the rewritten batch through the coalescer, then a flush. */
+static void inject_coalesced(reflector *r, const uint8_t *batch)
+{
+    chmlink_batch_reader reader;
+    const uint8_t *packet;
+    uint32_t size;
+    chmlink_offload descriptor;
+    chmlink_batch_read_begin(&reader, batch);
+    while (chmlink_batch_read_next(&reader, &packet, &size, &descriptor))
+        REQUIRE(chmlink_coalescer_send(r->coalescer, packet, size) || stop_reflector);
+    REQUIRE(chmlink_coalescer_flush(r->coalescer) || stop_reflector);
 }
 
 static DWORD WINAPI reflector_thread(void *arg)
@@ -355,9 +381,19 @@ static DWORD WINAPI reflector_thread(void *arg)
             continue;
         }
         idle = 0;
+        if (g_want_gro && r->coalescer == NULL) REQUIRE((r->coalescer = chmlink_coalescer_create(r->adapter, 0)) != NULL);
+        if (!g_want_gro && r->coalescer != NULL) { chmlink_coalescer_free(r->coalescer); r->coalescer = NULL; }
         if (!rewrite_batch(buffer, bytes, &count, &payload)) continue;
         if (g_split) {
             inject_split(r, buffer);
+            InterlockedAdd64(&reflected_packets, count);
+            InterlockedAdd64(&reflected_bytes, payload);
+            InterlockedIncrement64(&reflected_batches);
+            continue;
+        }
+        if (r->coalescer != NULL && g_eth) {
+            inject_coalesced(r, buffer);
+            InterlockedAdd64(&injected_packets, count);
             InterlockedAdd64(&reflected_packets, count);
             InterlockedAdd64(&reflected_bytes, payload);
             InterlockedIncrement64(&reflected_batches);
@@ -395,6 +431,7 @@ static DWORD WINAPI reflector_thread(void *arg)
         InterlockedAdd64(&reflected_bytes, payload);
         InterlockedIncrement64(&reflected_batches);
     }
+    if (r->coalescer != NULL) chmlink_coalescer_free(r->coalescer);
     printf("{\"event\":\"tcp_fallbacks\",\"batches\":%lu}\n", (unsigned long)fallbacks);
     free(buffer);
     return 0;
@@ -555,11 +592,14 @@ int main(int argc, char **argv)
     {
         char text[8];
         int whole = GetEnvironmentVariableA("CHMLINK_BENCH_NO_SPLIT", text, sizeof(text)) != 0 && text[0] == '1';
+        int gro = GetEnvironmentVariableA("CHMLINK_BENCH_GRO", text, sizeof(text)) != 0 && text[0] == '1';
         if (g_eth) strcpy(g_prefix, "eth_");
         else if (g_split && whole) { g_split = 0; sprintf(g_prefix, "mtu%u_whole_", info.mtu); }
+        else if (g_split && gro) { g_want_gro = 1; sprintf(g_prefix, "mtu%u_gro_", info.mtu); }
         else if (g_split) sprintf(g_prefix, "mtu%u_", info.mtu);
     }
     memcpy(g_mac, info.mac, 6);
+    memset(&r, 0, sizeof(r));
     r.adapter = a; r.limit = info.packet_limit;
     r.fallback = malloc(CHMLINK_BATCH_MAX_SIZE);
     r.scratch = malloc(128 * 1024);
@@ -571,10 +611,15 @@ int main(int argc, char **argv)
         uint32_t granted = 0, offered;
         int m;
         REQUIRE(chmlink_set_offload(a, CHMLINK_OFFLOAD_ALL, &offered));
-        for (m = offered ? 0 : 1; m < 2; ++m) {
-            uint32_t requested = m ? offered : 0;
-            const char *suffix = offered && !m ? "_nooffload" : "";
+        /* Plain, then receive coalescing done by the SDK (Windows sends plain
+         * frames, the reflector merges them), then every offload. */
+        for (m = offered ? 0 : 2; m < 3; ++m) {
+            uint32_t requested = m == 2 ? offered : m == 1 ? offered & (CHMLINK_OFFLOAD_RX_RSC | CHMLINK_OFFLOAD_RX_CHECKSUM) : 0;
+            const char *suffix = !offered ? "" : m == 0 ? "_nooffload" : m == 1 ? "_gro" : "";
+            if (m == 1 && !(offered & CHMLINK_OFFLOAD_RX_RSC)) continue;
+            if (offered) InterlockedExchange(&g_want_gro, 0);
             REQUIRE(chmlink_set_offload(a, requested, &granted));
+            if (offered && m == 1) InterlockedExchange(&g_want_gro, 1);
             printf("{\"event\":\"offload\",\"requested\":%u,\"granted\":%u}\n", requested, granted);
             fflush(stdout);
             Sleep(1500);   /* let the stack apply the new offload indication */

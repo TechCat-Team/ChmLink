@@ -108,8 +108,14 @@ try {
         $env:CHMLINK_BENCH_NO_SPLIT = '1'
         try { Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 4" 'TCP benchmark (IP mode, MTU 65535, unsplit)' ([int]($Seconds * 4 + 60)) }
         finally { Remove-Item Env:CHMLINK_BENCH_NO_SPLIT }
+        # Cut to 1500 and merged again by the SDK's coalescer before injection, as
+        # a receiving tunnel endpoint with software GRO would (tcp_mtu65535_gro_*).
+        $env:CHMLINK_BENCH_GRO = '1'
+        try { Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 4" 'TCP benchmark (IP mode, MTU 65535, split and coalesced)' ([int]($Seconds * 4 + 60)) }
+        finally { Remove-Item Env:CHMLINK_BENCH_GRO }
 
-        # Ethernet mode: without and with offloads. The reflector answers ARP itself.
+        # Ethernet mode: without offloads, with the SDK coalescing plain frames into
+        # RSC (tcp_eth_*_gro), and with every offload. The reflector answers ARP itself.
         $eth = Run-Device @('create', $inf, '--owner', $owner.ToString('B'), '--mode', 'ethernet', '--name', 'ChmLink Bench Ethernet') | ConvertFrom-Json
         $devices += $eth
         if ($deviceRestart) { throw 'Device installation requires a restart; stopping before the benchmark.' }
@@ -142,7 +148,7 @@ try {
             }
         }
         try {
-            Invoke-Bench $tcpBench "$ethIndex $ethLocal $ethPeer $ethAlias $Seconds 4" 'TCP benchmark (Ethernet mode)' ([int]($Seconds * 8 + 90))
+            Invoke-Bench $tcpBench "$ethIndex $ethLocal $ethPeer $ethAlias $Seconds 4" 'TCP benchmark (Ethernet mode)' ([int]($Seconds * 12 + 90))
         } finally {
             $state | Wait-Job -Timeout 30 | Out-Null; $state | Remove-Job -Force
         }

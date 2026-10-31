@@ -300,3 +300,27 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
     SetLastError(wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError());
     return 0;
 }
+
+/* Wintun has no coalescing counterpart; the Wintun benchmarks never ask for it. */
+chmlink_coalescer *chmlink_coalescer_create(chmlink_adapter *a, uint32_t flags)
+{
+    (void)a; (void)flags;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return NULL;
+}
+
+int chmlink_coalescer_send(chmlink_coalescer *c, const uint8_t *packet, uint32_t size)
+{
+    (void)c; (void)packet; (void)size;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+}
+
+int chmlink_coalescer_flush(chmlink_coalescer *c)
+{
+    (void)c;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return 0;
+}
+
+void chmlink_coalescer_free(chmlink_coalescer *c) { (void)c; }

@@ -5,7 +5,7 @@ add_library(chmlink_packet STATIC src/packet/packet.c)
 target_include_directories(chmlink_packet PUBLIC include)
 target_compile_features(chmlink_packet PUBLIC c_std_99)
 
-add_library(chmlink_protocol STATIC src/protocol/batch.c src/protocol/query.c src/protocol/session.c src/packet/offload.c src/packet/split.c)
+add_library(chmlink_protocol STATIC src/protocol/batch.c src/protocol/query.c src/protocol/session.c src/packet/offload.c src/packet/split.c src/packet/gro.c)
 
 # Shared-memory packet ring, used by the SDK and (as source) by the driver.
 add_library(chmlink_ring STATIC src/ring/ring.c)
@@ -21,7 +21,7 @@ if(WIN32)
     # applications, and the same code as a static library for chmlink-device,
     # which must run on its own.
     set(CHMLINK_SDK_SOURCES src/windows/adapter.c src/windows/receive.c src/windows/send.c
-        src/windows/wait.c src/windows/manage.c src/windows/device_config.c src/windows/package.c src/windows/log.c)
+        src/windows/wait.c src/windows/manage.c src/windows/device_config.c src/windows/package.c src/windows/log.c src/windows/coalesce.c)
     set(CHMLINK_SDK_LIBRARIES iphlpapi ole32 setupapi newdev uuid advapi32 bcrypt)
     add_library(chmlink_static STATIC ${CHMLINK_SDK_SOURCES})
     target_link_libraries(chmlink_static PUBLIC chmlink_protocol ${CHMLINK_SDK_LIBRARIES})
@@ -133,6 +133,9 @@ if(BUILD_TESTING)
     add_executable(offload_test tests/unit/offload_test.c)
     target_link_libraries(offload_test PRIVATE chmlink_protocol)
     add_test(NAME offload_test COMMAND offload_test)
+    add_executable(gro_test tests/unit/gro_test.c)
+    target_link_libraries(gro_test PRIVATE chmlink_protocol)
+    add_test(NAME gro_test COMMAND gro_test)
     add_executable(split_test tests/unit/split_test.c)
     target_link_libraries(split_test PRIVATE chmlink_protocol)
     add_test(NAME split_test COMMAND split_test)

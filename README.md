@@ -18,7 +18,7 @@ support. The planned NDIS baseline is 6.60.
 ## Layout
 
 - `include/chmlink/` — shared C interfaces.
-- `src/packet/` — packet validation and the software offload fallbacks (segmentation, checksums), independent of Windows APIs.
+- `src/packet/` — packet validation, flow hashing, software GRO (`gro.c`) and the software offload fallbacks (segmentation, checksums), independent of Windows APIs.
 - `src/protocol/` — batch framing and validation, and the encodings of the device query and session requests.
 - `src/ring/` — the packet ring shared by the driver and the SDK, portable so it can be tested off Windows.
 - `driver/` — NDIS 6.60 miniport (Ethernet and raw IP) and INF package.
@@ -225,6 +225,18 @@ stay in order. `chmlink_receive` and `chmlink_inject` remain batch-shaped
 conveniences over the rings; `chmlink_inject` takes a whole batch or none of it (a full ring returns
 `ERROR_BUFFER_OVERFLOW` and the batch can be retried as is); `chmlink_receive_packet`, `chmlink_release_packet`,
 `chmlink_allocate_packet` and `chmlink_send_packet` are zero copy.
+A tunnel delivers 1500-byte packets, and Windows spends most of its receive
+time per packet. `chmlink_coalescer` (in `api.h`, over the portable
+`chmlink/gro.h`) is software GRO: the application sends each packet of a burst
+through it and flushes before waiting for the next burst, and consecutive TCP
+segments of a flow reach Windows as one packet: a large IP packet on an IP
+adapter with an MTU above 1500, an RSC frame in Ethernet mode when the session
+has `CHMLINK_OFFLOAD_RX_RSC`. Other packets pass through; each flow stays in
+order. In IP mode no payload is read (the merged checksum is derived from the
+segments' checksums, and Windows checks it); in Ethernet mode, where Windows
+takes RSC data as verified, every segment's checksum is verified unless the
+coalescer is created with `CHMLINK_GRO_TRUSTED` (data an authenticated tunnel
+already protects).
 Packet injection honors the Windows packet filter and multicast list. Pausing
 closes the rings, waits for every indicated packet to come back and drains
 active I/O; removing the device invalidates existing sessions.
@@ -466,7 +478,7 @@ cleanup is explicit and separate from upgrade and rollback.
 
 `tools/bench.ps1` runs `bench/packet_bench.c` and `bench/tcp_bench.c` on
 the test VM (AMD Ryzen 9 9950X host, 4 vCPUs, Windows 11 build 26200, package
-0.4.4.0, medians of three runs). These are in-VM figures, not network figures:
+0.5.1.0, medians of three runs). These are in-VM figures, not network figures:
 there is no encryption and no physical NIC.
 
 | scenario | shared rings (v2) | IOCTL batches (v1, 8 vCPUs) |
@@ -481,8 +493,10 @@ there is no encryption and no physical NIC.
 | TCP through the stack, IP mode, one stream | 22.7 Gbps | about 1.6 Gbps (VM slow at the time) |
 | TCP, IP mode, four streams | 24.2 Gbps (17.1 before spreading by flow) | — |
 | TCP, IP mode at MTU 65535, cut to 1500 before injecting | 21.0 Gbps, 19% less CPU | — |
+| TCP, IP mode at MTU 65535, cut to 1500, merged again by `chmlink_coalescer` | 34.6 Gbps | — |
 | TCP, IP mode at MTU 65535, injected whole | 106 Gbps (50 KB per packet) | — |
 | TCP, Ethernet mode, one stream, no offloads | 20.1 Gbps | — |
+| TCP, Ethernet mode, one stream, 1500-byte frames merged into RSC by `chmlink_coalescer` | 33.6 Gbps | — |
 | TCP, Ethernet mode, one stream, LSO + RSC | 117 Gbps (45 KB per packet) | — |
 | TCP, Ethernet mode, four streams, LSO + RSC | 98.6 Gbps (66.2 before spreading by flow) | — |
 
@@ -501,7 +515,10 @@ The TCP benchmark reflects every packet back into the same adapter, so one
 host carries both ends. At MTU 65535 the sending side gets large packets and
 uses less CPU, but when the reflector cuts them to 1500 bytes the receiving
 side still processes 1500-byte packets, and that side is the limit; on two
-hosts the sender keeps the saving. Injecting them whole shows what a tunnel
+hosts the sender keeps the saving. Merging them again with `chmlink_coalescer`
+before injection (what a receiving endpoint does) lifts that side by about two
+thirds; the remaining limit is the reflector, one thread that receives, cuts,
+merges and injects every packet. Injecting them whole shows what a tunnel
 that carries large packets end to end reaches.
 
 `tools/bench-wintun.ps1` runs the same IP-mode benchmarks over Wintun 0.14.1

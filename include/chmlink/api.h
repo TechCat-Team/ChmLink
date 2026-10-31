@@ -7,6 +7,7 @@
 #include "packet.h"
 #include "protocol.h"
 #include "offload.h"
+#include "gro.h"
 #ifdef _WIN32
 #include "manage.h"
 #endif
@@ -155,6 +156,25 @@ int chmlink_receive(chmlink_adapter *adapter, void *buffer, uint32_t capacity,
 /* Copy a validated batch into the sending ring. Delivery to Windows is
  * asynchronous: the stack may not have seen the packets when this returns. */
 int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length);
+
+/* Software GRO in front of the send path (chmlink/gro.h): consecutive TCP
+ * segments of a flow are merged before they reach Windows, which then
+ * processes a few large packets instead of many small ones. It merges into
+ * large IP packets on an IP adapter with an MTU above 1500, and into RSC
+ * frames in Ethernet mode when the session has CHMLINK_OFFLOAD_RX_RSC (set the
+ * offloads before creating it); otherwise packets pass through unchanged.
+ * Typical use: send every packet of a burst received from the tunnel, then
+ * flush before waiting for the next burst; segments are held until then.
+ * One coalescer per sending thread; not thread-safe. Send and flush wait while
+ * the ring is full and fail with the ring's error otherwise (packets of that
+ * call may be lost then). Free flushes, and must come before chmlink_close.
+ * flags: CHMLINK_GRO_TRUSTED (gro.h) when the caller knows the packets are
+ * intact, which spares reading every payload in Ethernet mode. */
+typedef struct chmlink_coalescer chmlink_coalescer;
+chmlink_coalescer *chmlink_coalescer_create(chmlink_adapter *adapter, uint32_t flags);
+int chmlink_coalescer_send(chmlink_coalescer *coalescer, const uint8_t *packet, uint32_t size);
+int chmlink_coalescer_flush(chmlink_coalescer *coalescer);
+void chmlink_coalescer_free(chmlink_coalescer *coalescer);
 
 /* Ask the driver for offloads (CHMLINK_OFFLOAD_* in version.h). granted may
  * be NULL and receives the subset the adapter and Windows allow. Refused

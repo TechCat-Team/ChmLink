@@ -18,6 +18,10 @@ EXPORTS
     chmlink_receive
     chmlink_inject
     chmlink_set_offload
+    chmlink_coalescer_create
+    chmlink_coalescer_send
+    chmlink_coalescer_flush
+    chmlink_coalescer_free
     chmlink_get_sdk_version
     chmlink_get_driver_version
     chmlink_set_logger
@@ -46,3 +50,7 @@ EXPORTS
     chmlink_offload_complete
     chmlink_gso_segment
     chmlink_ip_split
+    ; chmlink/gro.h
+    chmlink_gro_init
+    chmlink_gro_add
+    chmlink_gro_flush

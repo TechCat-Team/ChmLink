@@ -3,157 +3,177 @@
   "profiles": {
     "AMD Ryzen 9 9950X 16-Core Processor|4": {
       "commit": "worktree",
-      "driver": "0.4.4.0",
-      "recorded": "2026-10-31T22:51:00Z",
+      "driver": "0.5.1.0",
+      "recorded": "2026-10-31T23:54:27Z",
       "repeats": 3,
       "scenarios": {
         "duplex_64B": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 616556.0,
+          "rx_pps": 624112.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 481418.0
+          "tx_pps": 457510.0
         },
         "latency": {
           "lost": 0.0,
-          "max_us": 6092.1,
-          "p50_us": 14.4,
-          "p999_us": 294.1,
-          "p99_us": 71.4
+          "max_us": 4437.1,
+          "p50_us": 14.6,
+          "p999_us": 284.4,
+          "p99_us": 69.9
         },
         "loopback_1400B": {
-          "loopback_pps": 289765.0
+          "loopback_pps": 287945.0
         },
         "loopback_512B": {
-          "loopback_pps": 276195.0
+          "loopback_pps": 285430.0
         },
         "loopback_64B": {
-          "loopback_pps": 288412.0
+          "loopback_pps": 282224.0
         },
         "rx_1400B_batch32": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 631508.0
+          "rx_pps": 629763.0
         },
         "rx_512B_batch32": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 642588.0
+          "rx_pps": 643879.0
         },
         "rx_64B_batch1": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 661690.0
+          "rx_pps": 664256.0
         },
         "rx_64B_batch128": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 656805.0
+          "rx_pps": 658765.0
         },
         "rx_64B_batch32": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 622493.0
+          "rx_pps": 615915.0
         },
         "rx_64B_batch32_2injectors": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 1185413.0
+          "rx_pps": 1199214.0
         },
         "rx_64B_batch32_64flows": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 1782287.0
+          "rx_pps": 1778278.0
         },
         "rx_64B_batch8": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 657332.0
+          "rx_pps": 660524.0
         },
         "tcp_1stream": {
           "errors": 0.0,
           "tcp_avg_packet": 1451.0,
-          "tcp_mbps": 22685.5
+          "tcp_mbps": 23567.9
         },
         "tcp_4streams": {
           "errors": 0.0,
-          "tcp_avg_packet": 1445.0,
-          "tcp_mbps": 24233.1
+          "tcp_avg_packet": 1444.0,
+          "tcp_mbps": 26047.4
         },
         "tcp_eth_1stream": {
           "errors": 0.0,
-          "tcp_avg_packet": 43461.0,
-          "tcp_mbps": 117224.1
+          "tcp_avg_packet": 42529.0,
+          "tcp_mbps": 115620.7
+        },
+        "tcp_eth_1stream_gro": {
+          "errors": 0.0,
+          "tcp_avg_packet": 1482.0,
+          "tcp_mbps": 33587.1
         },
         "tcp_eth_1stream_nooffload": {
           "errors": 0.0,
           "tcp_avg_packet": 1466.0,
-          "tcp_mbps": 20094.5
+          "tcp_mbps": 19879.5
         },
         "tcp_eth_4streams": {
           "errors": 0.0,
-          "tcp_avg_packet": 48490.0,
-          "tcp_mbps": 98560.4
+          "tcp_avg_packet": 48476.0,
+          "tcp_mbps": 96431.7
+        },
+        "tcp_eth_4streams_gro": {
+          "errors": 0.0,
+          "tcp_avg_packet": 1496.0,
+          "tcp_mbps": 29358.2
         },
         "tcp_eth_4streams_nooffload": {
           "errors": 0.0,
           "tcp_avg_packet": 1456.0,
-          "tcp_mbps": 23421.3
+          "tcp_mbps": 25331.3
         },
         "tcp_mtu65535_1stream": {
           "errors": 0.0,
-          "tcp_avg_packet": 25139.0,
-          "tcp_mbps": 21688.8
+          "tcp_avg_packet": 25073.0,
+          "tcp_mbps": 20776.1
         },
         "tcp_mtu65535_4streams": {
           "errors": 0.0,
-          "tcp_avg_packet": 10704.0,
-          "tcp_mbps": 21836.4
+          "tcp_avg_packet": 10954.0,
+          "tcp_mbps": 22871.6
+        },
+        "tcp_mtu65535_gro_1stream": {
+          "errors": 0.0,
+          "tcp_avg_packet": 36838.0,
+          "tcp_mbps": 34617.4
+        },
+        "tcp_mtu65535_gro_4streams": {
+          "errors": 0.0,
+          "tcp_avg_packet": 43850.0,
+          "tcp_mbps": 33665.4
         },
         "tcp_mtu65535_whole_1stream": {
           "errors": 0.0,
-          "tcp_avg_packet": 49747.0,
-          "tcp_mbps": 105532.9
+          "tcp_avg_packet": 50038.0,
+          "tcp_mbps": 98106.8
         },
         "tcp_mtu65535_whole_4streams": {
           "errors": 0.0,
-          "tcp_avg_packet": 52751.0,
-          "tcp_mbps": 98302.0
+          "tcp_avg_packet": 52422.0,
+          "tcp_mbps": 105864.1
         },
         "tx_1400B": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 484285.0
+          "tx_pps": 463490.0
         },
         "tx_1400B_stall20ms": {
           "errors": 0.0,
-          "tx_drop_pct": 16.0178,
-          "tx_pps": 402388.0
+          "tx_drop_pct": 15.0307,
+          "tx_pps": 384985.0
         },
         "tx_512B": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 501149.0
+          "tx_pps": 471387.0
         },
         "tx_512B_stall20ms": {
           "errors": 0.0,
-          "tx_drop_pct": 7.8312,
-          "tx_pps": 455927.0
+          "tx_drop_pct": 8.1796,
+          "tx_pps": 432063.0
         },
         "tx_64B": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 500060.0
+          "tx_pps": 475041.0
         },
         "tx_64B_4senders": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 1319415.0
+          "tx_pps": 1257794.0
         },
         "tx_64B_stall20ms": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 504701.0
+          "tx_pps": 476394.0
         }
       }
     },
