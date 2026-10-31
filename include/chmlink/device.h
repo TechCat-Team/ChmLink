@@ -8,23 +8,32 @@
 #define CHMLINK_ETHERNET_LIMIT 1522u
 #define CHMLINK_IP_MTU 1500u
 #define CHMLINK_IP_LIMIT CHMLINK_IP_MTU
-/* Per-adapter transmit queue (Windows -> user mode): a byte ring of
- * CHMLINK_QUEUE_BYTES holding at most CHMLINK_QUEUE_PACKETS packets. Small
- * packets are bounded by the count, large ones by the bytes (about 2700
- * full-size Ethernet frames). QUERY reports the packet bound as capacity. */
-#define CHMLINK_QUEUE_PACKETS 16384u
-#define CHMLINK_QUEUE_BYTES (4u * 1024u * 1024u)
-#define CHMLINK_IOCTL_RECEIVE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_DATA)
-#define CHMLINK_IOCTL_INJECT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_DATA)
+/* Packets move through two shared-memory rings per session (chmlink/ring.h):
+ * one the driver produces for Windows traffic, one the application produces
+ * for injection. The driver registers both with CHMLINK_IOCTL_REGISTER_RINGS
+ * and reports their capacity and the unread bytes in QUERY; there is no
+ * per-batch IOCTL on the data path. */
 #define CHMLINK_IOCTL_QUERY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_DATA)
-#define CHMLINK_IOCTL_REGISTER_READ_EVENT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_WRITE_DATA)
-/* REGISTER_READ_EVENT takes exactly one little-endian uint64 user event
- * handle, no output. One registration per data session, in caller context.
- * The driver validates access/type and references the event until cleanup.
- * The SDK supplies a private manual-reset event; applications must not alter
- * it. Signaled means data available OR a lifecycle transition needs checking.
- * This request itself never waits and does not retain an IRP.
- */
+#define CHMLINK_IOCTL_REGISTER_RINGS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define CHMLINK_IOCTL_SET_OFFLOAD CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_DATA)
+/* REGISTER_RINGS: input is the CHMLINK_SESSION_SIZE-byte request from
+ * chmlink/session.h, no output. Data session handles only, at most once per
+ * handle; a second registration fails with STATUS_INVALID_DEVICE_STATE. The
+ * driver resets both ring headers, keeps the pages locked and the events
+ * referenced until the handle is closed, and reports ring state through the
+ * ring's state field. */
+/* SET_OFFLOAD: input one little-endian uint32 of CHMLINK_OFFLOAD_* bits the
+ * session can handle, output one uint32 of the bits now in effect (a subset:
+ * what the adapter supports and the system has not switched off). Data
+ * session handles only; may be sent again to change the set, and is reset
+ * when the session ends. With any bit in effect:
+ *   The from-Windows ring returns descriptors saying what the session must
+ *     still do: NEEDS_CSUM (TX_CHECKSUM) and GSO (TX_LSO).
+ *   The to-Windows ring accepts descriptors: DATA_VALID marks checksums as
+ *     verified (RX_CHECKSUM); a GSO TCP packet is indicated as one coalesced
+ *     segment (RX_RSC, only while Windows has receive segment coalescing
+ *     enabled for that IP version; otherwise the packet is dropped).
+ * The CHMLINK_OFFLOAD_* bits are in version.h. */
 /* QUERY has no input and returns the CHMLINK_INFO_SIZE-byte little-endian
  * response defined in query.h. Use chmlink_query_encode/decode; never
  * hand-code offsets. Counters are cumulative for the adapter instance.
@@ -34,10 +43,7 @@
 /* Open \\.\ChmLink<interface-index> with read/write access for a data session,
  * or read-only access for inspection; allow read and write sharing. The
  * driver enforces one data session independently of read-only handles.
- * RECEIVE returns a protocol.h batch, or ERROR_NO_MORE_ITEMS (polling).
- * INJECT accepts a validated batch matching the adapter mode. IP packets have
- * no link-layer header. All requests are synchronous;
- * native structures and pointers never cross the device boundary.
- */
+ * All requests are synchronous; native structures and pointers never cross
+ * the device boundary. IP packets have no link-layer header. */
 
 #endif

@@ -25,9 +25,10 @@ extern "C" {
 #define CHMLINK_INFO_INTERFACE_INDEX 20u   /* uint32 */
 #define CHMLINK_INFO_MTU             24u   /* uint32 */
 #define CHMLINK_INFO_PACKET_LIMIT    28u   /* uint32 */
-#define CHMLINK_INFO_QUEUE_CAPACITY  32u   /* uint32 */
-#define CHMLINK_INFO_QUEUED_PACKETS  36u   /* uint32 */
-#define CHMLINK_INFO_PACKET_FILTER   40u   /* uint32; 44..47 reserved */
+#define CHMLINK_INFO_RING_CAPACITY   32u   /* uint32, from-Windows ring bytes */
+#define CHMLINK_INFO_RING_PENDING    36u   /* uint32, unread bytes in that ring */
+#define CHMLINK_INFO_PACKET_FILTER   40u   /* uint32 */
+#define CHMLINK_INFO_OFFLOAD         44u   /* uint32, CHMLINK_OFFLOAD_* in effect */
 #define CHMLINK_INFO_MAC             48u   /* uint8[6]; 54..55 reserved */
 #define CHMLINK_INFO_MAC_SIZE         6u
 #define CHMLINK_INFO_LUID            56u   /* uint64; 64..71 reserved */
@@ -42,8 +43,9 @@ extern "C" {
 /* Decoded QUERY fields, independent of any Windows type. */
 typedef struct chmlink_query_info {
     uint32_t version, capabilities, state, mode;
-    uint32_t interface_index, mtu, packet_limit, queue_capacity, queued_packets;
+    uint32_t interface_index, mtu, packet_limit, ring_capacity, ring_pending_bytes;
     uint32_t packet_filter;
+    uint32_t offload;
     uint8_t mac[CHMLINK_INFO_MAC_SIZE];
     uint64_t luid;
     uint64_t tx_packets, tx_bytes, tx_errors;

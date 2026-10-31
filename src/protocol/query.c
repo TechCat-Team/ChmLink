@@ -37,9 +37,10 @@ void chmlink_query_encode(uint8_t *out, const chmlink_query_info *info)
     put32(out + CHMLINK_INFO_INTERFACE_INDEX, info->interface_index);
     put32(out + CHMLINK_INFO_MTU, info->mtu);
     put32(out + CHMLINK_INFO_PACKET_LIMIT, info->packet_limit);
-    put32(out + CHMLINK_INFO_QUEUE_CAPACITY, info->queue_capacity);
-    put32(out + CHMLINK_INFO_QUEUED_PACKETS, info->queued_packets);
+    put32(out + CHMLINK_INFO_RING_CAPACITY, info->ring_capacity);
+    put32(out + CHMLINK_INFO_RING_PENDING, info->ring_pending_bytes);
     put32(out + CHMLINK_INFO_PACKET_FILTER, info->packet_filter);
+    put32(out + CHMLINK_INFO_OFFLOAD, info->offload);
     memcpy(out + CHMLINK_INFO_MAC, info->mac, CHMLINK_INFO_MAC_SIZE);
     put64(out + CHMLINK_INFO_LUID, info->luid);
     put64(out + CHMLINK_INFO_TX_PACKETS, info->tx_packets);
@@ -84,8 +85,10 @@ static int common_valid(const chmlink_query_info *info)
 {
     return (info->capabilities & CHMLINK_CAP_BATCH) &&
            info->packet_limit <= CHMLINK_PACKET_MAX_SIZE &&
-           info->mtu != 0 && info->queue_capacity != 0 &&
-           info->queued_packets <= info->queue_capacity;
+           info->mtu != 0 &&
+           info->ring_pending_bytes <= info->ring_capacity &&
+           (info->offload & ~CHMLINK_OFFLOAD_ALL) == 0 &&
+           (info->offload == 0 || (info->capabilities & CHMLINK_CAP_OFFLOAD));
 }
 
 chmlink_result chmlink_query_decode(chmlink_query_info *out,
@@ -109,9 +112,10 @@ chmlink_result chmlink_query_decode(chmlink_query_info *out,
     next.interface_index = get32(p + CHMLINK_INFO_INTERFACE_INDEX);
     next.mtu = get32(p + CHMLINK_INFO_MTU);
     next.packet_limit = get32(p + CHMLINK_INFO_PACKET_LIMIT);
-    next.queue_capacity = get32(p + CHMLINK_INFO_QUEUE_CAPACITY);
-    next.queued_packets = get32(p + CHMLINK_INFO_QUEUED_PACKETS);
+    next.ring_capacity = get32(p + CHMLINK_INFO_RING_CAPACITY);
+    next.ring_pending_bytes = get32(p + CHMLINK_INFO_RING_PENDING);
     next.packet_filter = get32(p + CHMLINK_INFO_PACKET_FILTER);
+    next.offload = get32(p + CHMLINK_INFO_OFFLOAD);
     memcpy(next.mac, p + CHMLINK_INFO_MAC, CHMLINK_INFO_MAC_SIZE);
     next.luid = get64(p + CHMLINK_INFO_LUID);
     next.tx_packets = get64(p + CHMLINK_INFO_TX_PACKETS);

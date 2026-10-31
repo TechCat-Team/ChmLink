@@ -144,8 +144,106 @@ static int limits(void)
     return 0;
 }
 
+/* An IPv4 (or IPv6) TCP packet of total length `length` with a 20-byte TCP header. */
+static size_t tcp_packet(uint8_t *p, size_t length, int v6)
+{
+    memset(p, 0, length);
+    if (v6) {
+        p[0] = 0x60; p[4] = (uint8_t)((length - 40) >> 8); p[5] = (uint8_t)(length - 40); p[6] = 6; p[7] = 64;
+        p[40 + 12] = 5 << 4;
+        return 40;
+    }
+    p[0] = 0x45; p[2] = (uint8_t)(length >> 8); p[3] = (uint8_t)length; p[8] = 64; p[9] = 6;
+    p[20 + 12] = 5 << 4;
+    return 20;
+}
+
+static int offload_batches(void)
+{
+    static uint8_t storage[200000], packet[65535];
+    chmlink_batch_writer writer;
+    chmlink_batch_reader reader;
+    chmlink_offload gso = {CHMLINK_OFFLOAD_NEEDS_CSUM, CHMLINK_GSO_TCPV4, 40, 1460, 20, 16}, got, bad;
+    const uint8_t *data;
+    uint32_t count, size, seen = 0;
+    size_t l4;
+
+    l4 = tcp_packet(packet, 30000, 0);
+    CHECK(l4 == 20);
+    CHECK(chmlink_batch_begin_offload(&writer, storage, sizeof(storage), CHMLINK_MODE_IP, 1500) == CHMLINK_OK);
+    CHECK(chmlink_batch_append_offload(&writer, packet, 30000, &gso) == CHMLINK_OK);
+    /* A GSO packet is not held to the MTU; a plain one is. */
+    CHECK(chmlink_batch_append(&writer, packet, 30000) == CHMLINK_INVALID_PACKET);
+    tcp_packet(packet, 1500, 0);
+    CHECK(chmlink_batch_append(&writer, packet, 1500) == CHMLINK_OK);
+    CHECK(writer.length == 24 + 4 + 12 + 30000 + 4 + 12 + 1500);
+    CHECK(chmlink_batch_validate(storage, writer.length, CHMLINK_MODE_IP, 1500, &count) == CHMLINK_OK && count == 2);
+    chmlink_batch_read_begin(&reader, storage);
+    while (chmlink_batch_read_next(&reader, &data, &size, &got)) {
+        if (seen == 0) CHECK(size == 30000 && got.gso_type == CHMLINK_GSO_TCPV4 && got.gso_size == 1460 &&
+                             got.hdr_len == 40 && got.csum_start == 20 && got.csum_offset == 16 &&
+                             got.flags == CHMLINK_OFFLOAD_NEEDS_CSUM && data == storage + 24 + 4 + 12);
+        else CHECK(size == 1500 && got.gso_type == 0 && got.flags == 0);
+        seen++;
+    }
+    CHECK(seen == 2);
+    /* Reserved descriptor bytes must be zero. */
+    storage[24 + 4 + 10] = 1;
+    CHECK(chmlink_batch_validate(storage, writer.length, CHMLINK_MODE_IP, 1500, NULL) == CHMLINK_INVALID_BATCH);
+    storage[24 + 4 + 10] = 0;
+    /* A plain reader of an offload batch would misparse: the flag is required to be known. */
+    storage[16] = 3;
+    CHECK(chmlink_batch_validate(storage, writer.length, CHMLINK_MODE_IP, 1500, NULL) == CHMLINK_INVALID_BATCH);
+    storage[16] = 1;
+
+    /* Descriptor checks. */
+    tcp_packet(packet, 30000, 0);
+    bad = gso; bad.csum_start = 21; CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    bad = gso; bad.csum_offset = 6; CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    bad = gso; bad.hdr_len = 60; CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    bad = gso; bad.gso_size = 0; CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    bad = gso; bad.gso_type = CHMLINK_GSO_TCPV6; CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    bad = gso; bad.gso_type = 3; CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    bad = gso; bad.flags = 4; CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    bad = gso; bad.gso_type |= CHMLINK_GSO_ECN; CHECK(chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &bad));
+    packet[9] = 17;  /* UDP cannot carry TCP segmentation */
+    CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &gso));
+    packet[9] = 6; packet[6] = 0x20;  /* a fragment */
+    CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 30000, 1500, &gso));
+    packet[6] = 0;
+    bad.flags = CHMLINK_OFFLOAD_NEEDS_CSUM; bad.gso_type = 0; bad.gso_size = 0; bad.hdr_len = 0;
+    bad.csum_start = 1498; bad.csum_offset = 0;
+    CHECK(chmlink_offload_valid(CHMLINK_MODE_IP, packet, 1500, 1500, &bad));
+    bad.csum_start = 1499;
+    CHECK(!chmlink_offload_valid(CHMLINK_MODE_IP, packet, 1500, 1500, &bad));
+    /* IPv6, and Ethernet framing. */
+    l4 = tcp_packet(packet, 9000, 1);
+    gso.gso_type = CHMLINK_GSO_TCPV6; gso.csum_start = 40; gso.hdr_len = 60;
+    CHECK(chmlink_offload_valid(CHMLINK_MODE_IP, packet, 9000, 1500, &gso));
+    memmove(packet + 14, packet, 9000); memset(packet, 0, 14); packet[12] = 0x86; packet[13] = 0xdd;
+    gso.csum_start = 54; gso.hdr_len = 74;
+    CHECK(chmlink_offload_valid(CHMLINK_MODE_ETHERNET, packet, 9014, 1514, &gso));
+    packet[13] = 0x00;
+    CHECK(!chmlink_offload_valid(CHMLINK_MODE_ETHERNET, packet, 9014, 1514, &gso));
+
+    /* Plain batches take no descriptors, and read back as zeroed. */
+    CHECK(chmlink_batch_begin(&writer, storage, sizeof(storage), CHMLINK_MODE_IP, 1500) == CHMLINK_OK);
+    tcp_packet(packet, 30000, 0); gso.gso_type = CHMLINK_GSO_TCPV4; gso.csum_start = 20; gso.hdr_len = 40;
+    CHECK(chmlink_batch_append_offload(&writer, packet, 30000, &gso) == CHMLINK_INVALID_ARGUMENT);
+    tcp_packet(packet, 100, 0);
+    CHECK(chmlink_batch_append_offload(&writer, packet, 100, NULL) == CHMLINK_OK);
+    CHECK(chmlink_batch_validate(storage, writer.length, CHMLINK_MODE_IP, 1500, NULL) == CHMLINK_OK);
+    chmlink_batch_read_begin(&reader, storage);
+    memset(&got, 0xff, sizeof(got));
+    CHECK(chmlink_batch_read_next(&reader, &data, &size, &got) && size == 100 && got.gso_type == 0 && got.hdr_len == 0);
+    CHECK(!chmlink_batch_read_next(&reader, &data, &size, &got));
+    (void)l4;
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(offload_batches() == 0);
     CHECK(round_trip() == 0);
     CHECK(malformed_batches() == 0);
     CHECK(limits() == 0);
