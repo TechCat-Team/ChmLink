@@ -4,17 +4,13 @@ ChmLink is a Windows virtual network adapter project for ChmLAN. It aims to
 provide Ethernet and IP adapters through a single driver package, with tunnel
 protocols implemented in the user-mode agent.
 
-The project is at an early development stage. It includes an experimental
-NDIS Ethernet driver, a synchronous C interface, a capture example, and a
-device provisioning utility. IP mode, Rust device I/O, production signing,
-and runtime qualification have not been completed. It cannot replace TAP or
-Wintun in production yet.
-
-An experimental raw-IP path includes a separate device ID, NDIS attributes,
-packet queues, injection and SDK mode negotiation. Initial x64 builds and
-IPv4/IPv6 UDP roundtrips passed in a Windows 11 build 26200 test VM, including
-an Ethernet isolation check and a run with standard Driver Verifier. Broader
-qualification remains incomplete; use a disposable test VM.
+It includes an NDIS 6.60 miniport with Ethernet and raw-IP adapters, a C SDK
+that exchanges packets with the driver through shared-memory rings (with
+LSOv2, checksum and RSC offloads in Ethernet mode), a device provisioning tool,
+examples, and a runtime CI for a Windows test VM. It is unreleased and
+experimental: production signing, minimum-version and ARM64 testing, and the
+Rust device I/O are not done, so it cannot replace TAP or Wintun in production
+yet. Install it only in a disposable test VM.
 
 The compatibility target is Windows 10 version 1607 (build 14393) /
 Windows Server 2016 and later. These are development targets, not verified
@@ -23,15 +19,18 @@ support. The planned NDIS baseline is 6.60.
 ## Layout
 
 - `include/chmlink/` — shared C interfaces.
-- `src/packet/` — packet validation, independent of Windows APIs.
-- `src/protocol/` — experimental batch framing, validation and the device query encoding.
+- `src/packet/` — packet validation and the software offload fallbacks (segmentation, checksums), independent of Windows APIs.
+- `src/protocol/` — batch framing and validation, and the encodings of the device query and session requests.
 - `src/ring/` — the packet ring shared by the driver and the SDK, portable so it can be tested off Windows.
 - `driver/` — NDIS 6.60 miniport (Ethernet and raw IP) and INF package.
-- `src/windows/` — user-mode C interface.
+- `src/windows/` — user-mode C SDK: adapters (`adapter.c`), receiving, sending and waiting, with shared internals in `internal.h`.
 - `examples/` — small programs using the C interface.
 - `tools/` — driver build, provisioning and package maintenance tools.
 - `tools/ci/` — runtime CI for the Windows test VM; see [tools/ci/README.md](tools/ci/README.md).
-- `tests/` — portable C tests, Windows runtime tests and the benchmark.
+- `tests/unit/` — portable C tests (CTest) and the batch fuzzer.
+- `tests/windows/` — runtime tests for a Windows test VM (lifecycle, IP, ARP, power, IOCTL fuzzing).
+- `tests/support/` — helpers shared by tests and benchmarks.
+- `bench/` — packet-rate, latency and TCP benchmarks for the test VM.
 - `rust/chmlink/` — Rust types for the user-mode integration.
 
 ## Test
@@ -53,15 +52,17 @@ baseline driver, runs the lifecycle and IP suites and optionally the benchmark,
 then restores the baseline. It works from a machine that can reach the VM; the
 VM does not need internet access.
 
-The protocol uses explicit little-endian fields and bounded batches. The
-receiver validates the complete batch before submitting packets. Driver code
-must first copy user input into an owned snapshot; parsing a live shared buffer
-does not provide protection against concurrent modification. The current
-packet checks cover Ethernet minimum size and IP header/declared lengths;
-they do not validate checksums or complete protocol semantics. The transport
-format is experimental and may change before release.
+Every format crossing the kernel boundary uses explicit little-endian fields.
+Request buffers (session registration, offload settings) are copied by the I/O
+manager before the driver decodes them. The rings stay in application memory
+while the driver reads them, so the driver reads every index and record size
+once, validates it against the ring before use, and closes the session on any
+inconsistency instead of trusting the application. The SDK validates a whole
+batch before writing any of it. Packet checks cover Ethernet minimum size and
+IP header and declared lengths, not checksums or protocol semantics. The
+formats are experimental and may change before release.
 
-For fuzz testing, build `tests/fuzz_batch.c`, `src/protocol/batch.c`, and
+For fuzz testing, build `tests/unit/fuzz_batch.c`, `src/protocol/batch.c`, and
 `src/packet/packet.c` with Clang using `-Iinclude` and
 `-fsanitize=fuzzer,address,undefined`.
 
@@ -78,7 +79,7 @@ This opt-in runner creates two owned temporary adapters, assigns active-store
 test addresses `169.254.250.1/24` and `169.254.251.1/24`, then removes the adapters
 in cleanup. It refuses addresses already assigned locally. It exercises wait
 timeout/cancel/close races, concurrent waiter rejection, abrupt child-process
-termination, repeated GUID opens, queue saturation and recovery, 1000 uniquely
+termination, repeated GUID opens, ring saturation and recovery, 1000 uniquely
 numbered UDP packets, adapter isolation, waits during disable/removal, SDK handle
 release after concurrent calls from 16 threads, and IOCTL fuzzing (`chmlink-ioctl-fuzz`,
 `-FuzzSeconds`, default 20): strictly on one adapter, and tolerantly on another
@@ -91,14 +92,10 @@ logs distinguish hangs from assertion failures. The mutating suite is not
 registered with CTest. A test failure does not establish a driver defect without
 examining its logs and environment.
 
-On Windows 11 build 26200 x64, initial runs of this suite and the ARP roundtrip
-passed with standard Driver Verifier enabled for the earlier 0.2.0.0 Ethernet
-driver. The 0.3.0.0 development revision also passed an initial Ethernet
-lifecycle run. Broader
-NDIS/WLAN verification, prolonged stress, power transitions, fault injection and
-minimum-version runtime coverage remain outstanding.
+The CI's nightly lane runs this suite under Driver Verifier with NDIS
+verification and under fault injection; see Status for the current result.
 
-## Windows prototype
+## Windows driver and SDK
 
 The current SDK requires device interface version 5 (the shared-ring data path)
 and rejects other drivers instead of silently assuming compatible limits. The
@@ -192,11 +189,11 @@ the same package. Native creation compares the supplied INF, SYS and CAT against
 the packages bound to existing ChmLink instances and refuses different content;
 upgrade the existing instances explicitly before creating additional adapters.
 
-## Experimental IP adapter
+## IP adapter
 
 The same INF describes `Root\ChmLink` (Ethernet) and `Root\ChmLinkIP` (raw IP).
-The prototype uses `NdisMediumIP`, a 1500-byte MTU and one complete IPv4 or
-IPv6 packet per batch record. The API's mode and capability fields identify
+IP mode uses `NdisMediumIP`, a 1500-byte MTU and one complete IPv4 or IPv6
+packet per ring record, without task offloads (see above). The API's mode and capability fields identify
 the data format; IP metadata has a zero MAC. IPv6 jumbograms are not supported.
 IP packet validation checks framing, not IP checksums or transport semantics.
 
@@ -207,8 +204,7 @@ the intended creation command is:
 .\tools\manage-adapter.ps1 -Action Create -InfPath C:\packages\signed\chmlink.inf -Mode ip -Name 'ChmLink IP Test'
 ```
 
-Initial creation and binding passed on Windows 11 build 26200 x64. With IPv4/IPv6 addresses and
-routes explicitly configured on the test adapter, `chmlink-ip-test <ifIndex>
+With IPv4/IPv6 addresses and routes explicitly configured on the test adapter, `chmlink-ip-test <ifIndex>
 <local4> <peer4> <local6> <peer6>` is intended to exercise UDP in both
 directions using simulated peers. An optional final Ethernet interface index
 adds an isolation check. It opens exclusive sessions and does not configure the
@@ -220,15 +216,13 @@ an opt-in test runner for the disposable VM. It creates owned IP and Ethernet ad
 temporarily configures documentation-range IPv4/IPv6 addresses in ActiveStore,
 executes the two UDP roundtrips and an isolation check, then removes both. The addresses and
 peer routes must be isolated from the rest of the test VM. The runner and test
-are not automatically registered in CTest. Initial normal and standard Driver
-Verifier runs passed in the Windows 11 VM.
+are not registered in CTest; the runtime CI runs them in every lane.
 
 Both modes share one service and package, so package upgrades affect all
 instances. Stop clients and use version 4 maintenance tooling for both modes.
 Do not use older management tools while IP devices exist: their inventory does
 not include the IP hardware ID. A downgrade is refused if the target INF lacks
-the IP model. Complete validation must cover mixed instances, interruption,
-rollback, minimum Windows versions, signing and Driver Verifier.
+the IP model.
 
 ## Persistent adapter configuration
 
@@ -254,15 +248,9 @@ ownership is an administrative mistake-prevention check, not a security boundary
 against administrators. Package maintenance still coordinates every instance
 because they share a driver service.
 
-This unreleased version deliberately breaks configuration version 1 and removes
-the old Adopt command. Before replacing an older test package, back up the old
-package and the device identity, address, route and DNS settings. Remove old
-devices using their matching old tool and owner ID, then install the new package
-and create new devices. Recreating a device assigns a new identity and can
-change its Windows interface GUID and network configuration. The new tool does
-not upgrade or remove a device whose configuration it cannot validate. Preserve
-the old signed package and version 3 tool before building into any directory
-that could overwrite them; use a separate build directory for 0.3.0.0.
+Recreating a device assigns a new identity and can change its Windows
+interface GUID and network configuration. The tool does not upgrade or remove a
+device whose configuration it cannot validate.
 
 `manage-adapter.ps1` applies the stored name to the exact Windows interface GUID
 after native creation. Native `create` alone sets the device friendly
@@ -281,17 +269,13 @@ It never removes a successfully created device to undo a naming failure.
 
 ## Package maintenance
 
-`tools/manage-driver.ps1` provides explicit upgrade and recovery. Initial x64
-builds and VM checks have passed on Windows 11 build 26200 with PowerShell 5.1:
-legacy migration, invalid configuration rejection, ownership checks, naming
-retry, upgrades, rollback, ARP traffic and identity persistence across a reboot.
-Those results apply to the earlier 0.2.0.0 Ethernet package. The 0.3.0.0
-prototype separately passed the x64 build, INF and catalog checks, initial
-dual-stack IP roundtrips and an Ethernet lifecycle run. This is initial
-coverage; minimum-version compatibility, Driver Verifier, stress, power and
-fault-injection qualification remain incomplete. Continue using a disposable
-test VM with a snapshot. The script targets Windows PowerShell 5.1 and the same
-Windows baseline as the driver.
+`tools/manage-driver.ps1` provides explicit upgrade and recovery; the runtime CI
+installs every build through it and restores the baseline afterwards. It covers
+invalid configuration rejection, ownership checks, naming retry, upgrades,
+rollback and identity persistence across a reboot. Minimum-version
+compatibility is not tested yet; use a disposable test VM with a snapshot. The
+script targets Windows PowerShell 5.1 and the same Windows baseline as the
+driver.
 
 Windows keys a published driver package on its INF: a new binary with an
 unchanged `DriverVer` is silently not installed, and the upgrade fails its
@@ -370,7 +354,7 @@ cleanup is explicit and separate from upgrade and rollback.
 
 ## Performance
 
-`tools/bench.ps1` runs `tests/windows_bench.c` and `tests/windows_tcp_bench.c` on
+`tools/bench.ps1` runs `bench/packet_bench.c` and `bench/tcp_bench.c` on
 the test VM (AMD Ryzen 9 9950X host, 4 vCPUs, Windows 11 build 26200, package
 0.4.1.0, medians of three runs). These are in-VM figures, not network figures:
 there is no encryption and no physical NIC.
