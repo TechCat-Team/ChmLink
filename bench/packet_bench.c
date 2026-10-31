@@ -98,7 +98,9 @@ static size_t build_udp4(uint8_t *out, const uint8_t *src, const uint8_t *dst,
     return total;
 }
 
-static uint8_t *make_batch(uint32_t packets, size_t payload, uint32_t limit, uint32_t *length)
+/* flows > 1: the packets cycle through that many source ports, as the traffic
+ * of many connections arriving through one tunnel thread does. */
+static uint8_t *make_batch(uint32_t packets, size_t payload, uint32_t limit, uint32_t flows, uint32_t *length)
 {
     uint8_t packet[1600], *buffer = malloc(CHMLINK_BATCH_MAX_SIZE);
     chmlink_batch_writer w;
@@ -106,7 +108,8 @@ static uint8_t *make_batch(uint32_t packets, size_t payload, uint32_t limit, uin
     REQUIRE(buffer != NULL);
     REQUIRE(chmlink_batch_begin(&w, buffer, CHMLINK_BATCH_MAX_SIZE, CHMLINK_MODE_IP, limit) == CHMLINK_OK);
     for (i = 0; i < packets; ++i) {
-        size_t n = build_udp4(packet, peer4, local4, PORT_RX_SRC, PORT_RX, payload, i);
+        size_t n = build_udp4(packet, peer4, local4, flows > 1 ? 40000u + i % flows : PORT_RX_SRC, PORT_RX,
+                              payload, i);
         REQUIRE(chmlink_batch_append(&w, packet, n) == CHMLINK_OK);
     }
     *length = (uint32_t)w.length;
@@ -286,7 +289,7 @@ static void join(HANDLE *threads, int n)
 typedef struct load_config {
     const char *name;
     int tx_senders, tx_payload;
-    int rx_injectors, rx_payload; uint32_t rx_batch;
+    int rx_injectors, rx_payload; uint32_t rx_batch, rx_flows;
     DWORD stall_every_ms, stall_ms;
 } load_config;
 
@@ -327,7 +330,7 @@ static void run_load(chmlink_adapter *a, const chmlink_adapter_info *info, const
     if (cfg->rx_injectors) {
         rx_socket = udp_socket(local4, PORT_RX, NULL, 0, 32 * 1024 * 1024);
         receiver.so = rx_socket; receiver.stop = &stop_consumers;
-        batch = make_batch(cfg->rx_batch, (size_t)cfg->rx_payload, info->packet_limit, &batch_length);
+        batch = make_batch(cfg->rx_batch, (size_t)cfg->rx_payload, info->packet_limit, cfg->rx_flows, &batch_length);
     }
     REQUIRE(chmlink_query(a, &before));
     cpu_take(&c0); QueryPerformanceCounter(&t0);
@@ -558,6 +561,10 @@ int main(int argc, char **argv)
     }
     memset(&cfg, 0, sizeof(cfg)); cfg.name = "rx_64B_batch32_2injectors"; cfg.rx_injectors = 2;
     cfg.rx_payload = 64; cfg.rx_batch = 32;
+    run_load(a, &info, &cfg, seconds);
+    /* One injecting thread, many flows: the driver spreads them over cores. */
+    memset(&cfg, 0, sizeof(cfg)); cfg.name = "rx_64B_batch32_64flows"; cfg.rx_injectors = 1;
+    cfg.rx_payload = 64; cfg.rx_batch = 32; cfg.rx_flows = 64;
     run_load(a, &info, &cfg, seconds);
     memset(&cfg, 0, sizeof(cfg)); cfg.name = "duplex_64B"; cfg.tx_senders = 1; cfg.tx_payload = 64;
     cfg.rx_injectors = 1; cfg.rx_payload = 64; cfg.rx_batch = 32;

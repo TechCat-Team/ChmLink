@@ -40,6 +40,7 @@ EXPORTS
     ; chmlink/packet.h
     chmlink_packet_valid
     chmlink_ip_packet_valid
+    chmlink_flow_hash
     ; chmlink/offload.h
     chmlink_checksum_add
     chmlink_offload_complete

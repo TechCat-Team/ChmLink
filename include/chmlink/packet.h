@@ -28,6 +28,13 @@ int chmlink_packet_valid(chmlink_mode mode, const uint8_t *data,
  * IPv6 jumbograms are not supported. Fragmented IP packets are permitted. */
 int chmlink_ip_packet_valid(const uint8_t *data, size_t length, size_t max_length);
 
+/* A hash of the packet's flow for spreading packets over queues: IPv4/IPv6
+ * addresses, the protocol and, for TCP and UDP outside fragments, the ports.
+ * Packets of one flow hash alike, in both directions; other packets (ARP, short or unknown ones)
+ * hash to 0. Ethernet frames may carry one 802.1Q tag. Reads only what length
+ * covers; no validation beyond that. */
+uint32_t chmlink_flow_hash(chmlink_mode mode, const uint8_t *data, size_t length);
+
 #ifdef __cplusplus
 }
 #endif

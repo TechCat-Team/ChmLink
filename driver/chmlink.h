@@ -42,6 +42,8 @@ typedef char CL_MODE_ETHERNET_CONTRACT_MATCH[(CHMLINK_CONFIG_MODE_ETHERNET == CH
 #define CL_BATCH_QUEUE_SIZE 64
 #define CL_SESSION_BATCH_MAX 64
 #define CL_SESSION_OUTSTANDING_MAX 4096
+/* Receive spreading: at most this many indicating threads per session. */
+#define CL_SPREAD_MAX 4
 
 typedef enum CL_ADAPTER_STATE {
     ClAdapterInitializing, ClAdapterPaused, ClAdapterRunning,
@@ -91,6 +93,21 @@ typedef struct CL_RXQ {
     BOOLEAN Stop;           /* this queue only (a failed ADD_INJECT_RING) */
 } CL_RXQ;
 
+/* Receive spreading, as RSS does on a NIC: the stack processes an indication
+ * on the indicating thread, so a ring thread hands the packets of some flows
+ * to these threads (by chmlink_flow_hash) to run them on more cores. A flow
+ * always maps to one worker, which indicates in arrival order. */
+typedef struct CL_WORKER {
+    struct CL_SESSION *Session;
+    KSPIN_LOCK Lock;
+    PNET_BUFFER_LIST First, Last;   /* queued, protected by Lock */
+    ULONG Count;
+    LONG InFlight;          /* queued or being indicated by this worker */
+    KEVENT Event;           /* auto-reset: work or stop */
+    PETHREAD Thread;
+    BOOLEAN Stop;
+} CL_WORKER;
+
 typedef struct CL_SESSION {
     CL_ADAPTER *Adapter;
     CL_RING From;           /* driver produces packets Windows sent */
@@ -102,6 +119,11 @@ typedef struct CL_SESSION {
      * RxCount changes under the adapter lock and ControlMutex. */
     CL_RXQ Rx[CHMLINK_INJECT_RINGS_MAX];
     ULONG RxCount;
+    /* Flow buckets; with fewer than two (one processor), ring threads indicate
+     * everything themselves. Fixed while ring threads run. */
+    CL_WORKER Workers[CL_SPREAD_MAX];
+    ULONG WorkerCount;
+    BOOLEAN WorkersStop;
     KEVENT StopEvent;
     BOOLEAN Stop;
     BOOLEAN Broken;

@@ -151,6 +151,141 @@ static void wait_idle(CL_RXQ *q, BOOLEAN data)
     chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 0);
 }
 
+/* Indicate a chain, or hand it back when the data path stopped meanwhile. */
+static void deliver(CL_ADAPTER *a, PNET_BUFFER_LIST chain, ULONG count)
+{
+    BOOLEAN acquired = ExAcquireRundownProtection(&a->IoRundown), running = FALSE;
+    KIRQL irql;
+    if (acquired) {
+        KeAcquireSpinLock(&a->Lock, &irql);
+        running = a->State == ClAdapterRunning && a->PowerState == NdisDeviceStateD0 &&
+                  !a->ShuttingDown && !a->SurpriseRemoved;
+        KeReleaseSpinLock(&a->Lock, irql);
+    }
+    if (running) NdisMIndicateReceiveNetBufferLists(a->Handle, chain, NDIS_DEFAULT_PORT_NUMBER, count, 0);
+    else ClSessionReturnLists(a, chain);
+    if (acquired) ExReleaseRundownProtection(&a->IoRundown);
+}
+
+/* Indicate one batch, split into flow buckets. The ring thread indicates the
+ * largest bucket whose worker has nothing in flight itself, so a single flow
+ * costs no hand-off; the others go to their workers. A bucket with packets in
+ * flight always goes to its worker, which keeps every flow in order. Called
+ * with IoRundown held and the data path running. */
+static void spread(CL_SESSION *s, PNET_BUFFER_LIST *first, PNET_BUFFER_LIST *last,
+                   const ULONG *counts, ULONG buckets)
+{
+    ULONG b, own = buckets, most = 0;
+    KIRQL irql;
+    for (b = 0; b < buckets; ++b) {
+        if (counts[b] > most && InterlockedCompareExchange(&s->Workers[b].InFlight, 0, 0) == 0) {
+            own = b;
+            most = counts[b];
+        }
+    }
+    for (b = 0; b < buckets; ++b) {
+        CL_WORKER *w = &s->Workers[b];
+        if (counts[b] == 0 || b == own) continue;
+        InterlockedExchangeAdd(&w->InFlight, (LONG)counts[b]);
+        KeAcquireSpinLock(&w->Lock, &irql);
+        if (w->Last != NULL) NET_BUFFER_LIST_NEXT_NBL(w->Last) = first[b];
+        else w->First = first[b];
+        w->Last = last[b];
+        w->Count += counts[b];
+        KeReleaseSpinLock(&w->Lock, irql);
+        KeSetEvent(&w->Event, IO_NO_INCREMENT, FALSE);
+    }
+    if (own < buckets)
+        NdisMIndicateReceiveNetBufferLists(s->Adapter->Handle, first[own], NDIS_DEFAULT_PORT_NUMBER,
+                                           counts[own], 0);
+}
+
+static KSTART_ROUTINE ClWorkerThread;
+
+_Use_decl_annotations_
+static VOID ClWorkerThread(PVOID context)
+{
+    CL_WORKER *w = context;
+    CL_SESSION *s = w->Session;
+    for (;;) {
+        PNET_BUFFER_LIST chain;
+        ULONG count;
+        KIRQL irql;
+        KeAcquireSpinLock(&w->Lock, &irql);
+        chain = w->First;
+        count = w->Count;
+        w->First = w->Last = NULL;
+        w->Count = 0;
+        KeReleaseSpinLock(&w->Lock, irql);
+        if (chain != NULL) {
+            deliver(s->Adapter, chain, count);
+            InterlockedExchangeAdd(&w->InFlight, -(LONG)count);
+            continue;
+        }
+        /* Ring threads have stopped before the stop flag is set: nothing
+         * can be queued after the empty check above. */
+        if (s->WorkersStop || w->Stop) break;
+        KeWaitForSingleObject(&w->Event, Executive, KernelMode, FALSE, NULL);
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static void stop_workers(CL_SESSION *s);
+
+/* Start up to CL_SPREAD_MAX workers, one per active processor. Spreading is
+ * an optimization: when a thread cannot start, the session runs without it. */
+static void start_workers(CL_SESSION *s)
+{
+    ULONG count = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS), i;
+    if (count > CL_SPREAD_MAX) count = CL_SPREAD_MAX;
+    s->WorkerCount = 0;
+    if (count < 2) return;
+    for (i = 0; i < count; ++i) {
+        CL_WORKER *w = &s->Workers[i];
+        HANDLE handle = NULL;
+        NTSTATUS status;
+        w->Session = s;
+        KeInitializeSpinLock(&w->Lock);
+        KeInitializeEvent(&w->Event, SynchronizationEvent, FALSE);
+        status = PsCreateSystemThread(&handle, THREAD_ALL_ACCESS, NULL, NULL, NULL, ClWorkerThread, w);
+        if (!NT_SUCCESS(status)) break;
+        status = ObReferenceObjectByHandle(handle, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+                                           (PVOID *)&w->Thread, NULL);
+        if (!NT_SUCCESS(status)) {
+            w->Thread = NULL;
+            w->Stop = TRUE;
+            KeSetEvent(&w->Event, IO_NO_INCREMENT, FALSE);
+            ZwWaitForSingleObject(handle, FALSE, NULL);
+            ZwClose(handle);
+            break;
+        }
+        ZwClose(handle);
+        s->WorkerCount = i + 1;
+    }
+    if (s->WorkerCount < count) {
+        /* All or nothing, so the bucket count does not depend on luck. */
+        stop_workers(s);
+        s->WorkersStop = FALSE;
+    }
+}
+
+/* After every ring thread has stopped: the workers indicate or return what
+ * they hold, then end. */
+static void stop_workers(CL_SESSION *s)
+{
+    ULONG i;
+    s->WorkersStop = TRUE;
+    for (i = 0; i < s->WorkerCount; ++i) {
+        PETHREAD thread = s->Workers[i].Thread;
+        KeSetEvent(&s->Workers[i].Event, IO_NO_INCREMENT, FALSE);
+        if (thread == NULL) continue;   /* every counted worker has one */
+        KeWaitForSingleObject(thread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(thread);
+        s->Workers[i].Thread = NULL;
+    }
+    s->WorkerCount = 0;
+}
+
 static KSTART_ROUTINE ClSessionThread;
 
 _Use_decl_annotations_
@@ -161,7 +296,8 @@ static VOID ClSessionThread(PVOID context)
     CL_ADAPTER *a = s->Adapter;
 
     for (;;) {
-        PNET_BUFFER_LIST first = NULL, last = NULL;
+        PNET_BUFFER_LIST first[CL_SPREAD_MAX] = {NULL}, last[CL_SPREAD_MAX] = {NULL};
+        ULONG counts[CL_SPREAD_MAX] = {0}, buckets = s->WorkerCount >= 2 ? s->WorkerCount : 1, b;
         CL_FILTER filter;
         KIRQL irql;
         ULONG fine = 0, count = 0, bytes = 0, batchId, room;
@@ -240,9 +376,11 @@ static VOID ClSessionThread(PVOID context)
                 discards++;
                 continue;
             }
-            if (last != NULL) NET_BUFFER_LIST_NEXT_NBL(last) = nbl;
-            else first = nbl;
-            last = nbl;
+            b = buckets > 1 ? (ULONG)(((ULONG64)chmlink_flow_hash(a->Mode, packet, size) * buckets) >> 32) : 0;
+            if (last[b] != NULL) NET_BUFFER_LIST_NEXT_NBL(last[b]) = nbl;
+            else first[b] = nbl;
+            last[b] = nbl;
+            counts[b]++;
             count++;
             bytes += size;
         }
@@ -251,9 +389,9 @@ static VOID ClSessionThread(PVOID context)
         if (cursor != q->ReadCursor) {
             batchId = ++q->NextBatchId;
             if (batchId == 0) batchId = ++q->NextBatchId;
-            if (count != 0) {
+            for (b = 0; b < buckets; ++b) {
                 PNET_BUFFER_LIST nbl;
-                for (nbl = first; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
+                for (nbl = first[b]; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
                     nbl->MiniportReserved[0] = (PVOID)(ULONG_PTR)batchId;
                     nbl->MiniportReserved[1] = q;
                 }
@@ -276,8 +414,7 @@ static VOID ClSessionThread(PVOID context)
                 a->RxPackets += count;
                 a->RxBytes += bytes;
                 KeReleaseSpinLock(&a->Lock, irql);
-                NdisMIndicateReceiveNetBufferLists(a->Handle, first, NDIS_DEFAULT_PORT_NUMBER,
-                                                   count, 0);
+                spread(s, first, last, counts, buckets);
             } else {
                 pop_batches(q);
             }
@@ -430,11 +567,13 @@ NTSTATUS ClSessionRegister(CL_ADAPTER *a, PIRP irp, ULONG length)
     ClSessionStateLocked(a);
     KeReleaseSpinLock(&a->Lock, irql);
 
+    start_workers(s);
     status = start_queue(&s->Rx[0]);
     if (!NT_SUCCESS(status)) {
         KeAcquireSpinLock(&a->Lock, &irql);
         if (a->Session == s) a->Session = NULL;
         KeReleaseSpinLock(&a->Lock, irql);
+        stop_workers(s);
         goto fail;
     }
     return STATUS_SUCCESS;
@@ -521,6 +660,7 @@ void ClSessionTeardown(CL_ADAPTER *a, CL_SESSION *s)
         if (s->Rx[i].Thread != NULL)
             KeWaitForSingleObject(s->Rx[i].Thread, Executive, KernelMode, FALSE, NULL);
     }
+    stop_workers(s);
     /* Every indicated NBL must be back before the pages are unlocked. */
     if (InterlockedCompareExchange(&a->RxOutstanding, 0, 0) != 0)
         KeWaitForSingleObject(&a->RxDrained, Executive, KernelMode, FALSE, NULL);

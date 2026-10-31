@@ -212,9 +212,16 @@ of shared-memory rings (`include/chmlink/ring.h`), 4 MiB per direction by
 default: the driver produces Windows traffic into one, and injects packets the
 application produces into the other, without a copy or a per-batch IOCTL. A
 packet that does not fit is dropped and counted in `tx_queue_drops`.
-Each thread that injects gets its own to-Windows ring, up to four per session,
-so the driver indicates several threads' packets on several cores; order holds
-per thread. `chmlink_receive` and `chmlink_inject` remain batch-shaped
+The driver spreads injected packets over cores by flow, as RSS does on a
+physical NIC: the stack processes a packet on the thread that indicates it, so
+each session has up to four indicating threads (one per processor), and
+`chmlink_flow_hash` (addresses, protocol and TCP/UDP ports, the same for both
+directions of a connection) picks one for each packet. A ring's own thread
+indicates the largest group whose thread is idle, so a single flow costs no
+hand-off; a flow with packets still in flight always goes to its thread, so
+every flow stays in order. Each thread that injects also gets its own
+to-Windows ring, up to four per session; packets of one flow from one thread
+stay in order. `chmlink_receive` and `chmlink_inject` remain batch-shaped
 conveniences over the rings; `chmlink_inject` takes a whole batch or none of it (a full ring returns
 `ERROR_BUFFER_OVERFLOW` and the batch can be retried as is); `chmlink_receive_packet`, `chmlink_release_packet`,
 `chmlink_allocate_packet` and `chmlink_send_packet` are zero copy.
@@ -459,7 +466,7 @@ cleanup is explicit and separate from upgrade and rollback.
 
 `tools/bench.ps1` runs `bench/packet_bench.c` and `bench/tcp_bench.c` on
 the test VM (AMD Ryzen 9 9950X host, 4 vCPUs, Windows 11 build 26200, package
-0.4.2.0, medians of three runs). These are in-VM figures, not network figures:
+0.4.4.0, medians of three runs). These are in-VM figures, not network figures:
 there is no encryption and no physical NIC.
 
 | scenario | shared rings (v2) | IOCTL batches (v1, 8 vCPUs) |
@@ -469,20 +476,23 @@ there is no encryption and no physical NIC.
 | UDP to Windows, one injector, batches of 1 | 663k pps | 184k pps |
 | UDP to Windows, one injector, batches of 32 | 634k pps | 536k pps |
 | UDP to Windows, two injector threads | 1.19M pps | 1.06M pps |
+| UDP to Windows, one injector, 64 flows | 1.78M pps | — |
 | 64 B round trip, median / 99th percentile | 15 / 69 µs | 59 / 299 µs |
-| TCP through the stack, IP mode, one stream | 20.6 Gbps | about 1.6 Gbps (VM slow at the time) |
+| TCP through the stack, IP mode, one stream | 22.7 Gbps | about 1.6 Gbps (VM slow at the time) |
+| TCP, IP mode, four streams | 24.2 Gbps (17.1 before spreading by flow) | — |
 | TCP, IP mode at MTU 65535, cut to 1500 before injecting | 21.0 Gbps, 19% less CPU | — |
-| TCP, IP mode at MTU 65535, injected whole | 96 Gbps (50 KB per packet) | — |
-| TCP, Ethernet mode, one stream, no offloads | 19.3 Gbps | — |
+| TCP, IP mode at MTU 65535, injected whole | 106 Gbps (50 KB per packet) | — |
+| TCP, Ethernet mode, one stream, no offloads | 20.1 Gbps | — |
 | TCP, Ethernet mode, one stream, LSO + RSC | 117 Gbps (45 KB per packet) | — |
-| TCP, Ethernet mode, four streams, LSO + RSC | 66.5 Gbps | — |
+| TCP, Ethernet mode, four streams, LSO + RSC | 98.6 Gbps (66.2 before spreading by flow) | — |
 
 The stack processes a receive indication on the indicating thread, so one
-to-Windows ring is indicated at about one core's worth (650k pps). The SDK
-gives each injecting thread its own ring, up to four per session
-(`CHMLINK_IOCTL_ADD_INJECT_RING`), each indicated by its own driver thread:
-two injecting threads reach 1.19M pps. Packets from one thread stay in order;
-packets from different threads are not ordered against each other. A consumer
+thread indicates about one core's worth (650k pps). A single flow stays on one
+core; many flows from one injecting thread are spread over up to four (64
+flows: 1.78M pps, 2.9 times one flow), and several injecting threads each get
+their own ring (`CHMLINK_IOCTL_ADD_INJECT_RING`): two reach 1.19M pps with one
+flow each. Packets of a flow from one thread stay in order; packets from
+different threads are not ordered against each other. A consumer
 stalled for 20 ms every 100 ms still receives 84% to 100% of the offered rate,
 depending on packet size, with the default 4 MiB ring. `tools/ci/vm-run.sh run
 full` gates a build against the recorded baseline for the machine profile.
@@ -495,12 +505,13 @@ hosts the sender keeps the saving. Injecting them whole shows what a tunnel
 that carries large packets end to end reaches.
 
 `tools/bench-wintun.ps1` runs the same IP-mode benchmarks over Wintun 0.14.1
-(`bench/wintun_shim.c`) on the same VM. With both at MTU 1500, ChmLink
+(`bench/wintun_shim.c`) on the same VM (measured with package 0.4.2.0, before
+spreading by flow). With both at MTU 1500, ChmLink
 injects about 1.9 times as many packets per second from one thread and 3.5
 times from two, carries TCP about 5 times as fast, uses about half the CPU per
 injected packet, and matches Wintun for packets from Windows and round-trip
 latency. At Wintun's default MTU of 65535 with packets passed whole, Wintun
-reaches 52 Gbps of TCP against ChmLink's 96 Gbps above.
+reaches 52 Gbps of TCP against ChmLink's 106 Gbps above.
 
 ## Status
 
