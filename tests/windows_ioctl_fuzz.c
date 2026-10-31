@@ -28,7 +28,7 @@
  * Usage: chmlink-ioctl-fuzz <interface-index> <seconds> [--seed N] [--tolerant]
  *        [--ops MASK]
  * MASK selects request kinds by bit (default all): 0 query, 1 set_offload,
- * 2 register_rings, 3 foreign codes, 4 bad buffers, 5 ring tampering,
+ * 2 register_rings and add_inject_ring, 3 foreign codes, 4 bad buffers, 5 ring tampering,
  * 6 read/write/cancel, 7 session churn (without it one session lasts the run).
  */
 
@@ -52,6 +52,13 @@ static volatile LONG64 g_requests, g_registered, g_broken;
  * when that failed (tolerant runs under low resources), by the first worker
  * whose registration the driver accepts. Only one can succeed. */
 static volatile LONG g_round_registered;
+/* Spare to-Windows rings for ADD_INJECT_RING, one set per round. */
+#define EXTRA_RINGS (CHMLINK_INJECT_RINGS_MAX - 1)
+#define EXTRA_CAPACITY (128u * 1024u)
+static uint8_t *g_extra[EXTRA_RINGS];
+static HANDLE g_extra_event[EXTRA_RINGS];
+static volatile LONG g_extra_next, g_extra_added;
+static volatile LONG64 g_added_total;
 static uint8_t *g_readonly_page, *g_guard_edge;
 static uint8_t *g_from, *g_to;
 static HANDLE g_from_event, g_to_event;
@@ -154,7 +161,7 @@ static DWORD code_with(DWORD function, DWORD method, DWORD access)
 static int is_contract_code(DWORD code)
 {
     return code == CHMLINK_IOCTL_QUERY || code == CHMLINK_IOCTL_REGISTER_RINGS ||
-           code == CHMLINK_IOCTL_SET_OFFLOAD;
+           code == CHMLINK_IOCTL_SET_OFFLOAD || code == CHMLINK_IOCTL_ADD_INJECT_RING;
 }
 
 static void tamper(rng *r)
@@ -218,7 +225,51 @@ static void one_request(worker *w, int session)
         if (got == 0 && !valid) FAIL("SET_OFFLOAD accepted a malformed request");
         break;
     }
-    case 2: {
+    case 2:
+        if (below(r, 3) == 0) {
+            /* ADD_INJECT_RING: a fresh spare ring, possibly with one field broken. */
+            chmlink_inject_ring q;
+            uint8_t raw[CHMLINK_INJECT_RING_SIZE];
+            int valid;
+            LONG slot = InterlockedIncrement(&g_extra_next) - 1;
+            memset(&q, 0, sizeof(q));
+            q.version = CHMLINK_INJECT_RING_VERSION;
+            q.capacity = EXTRA_CAPACITY;
+            if (slot < (LONG)EXTRA_RINGS) {
+                q.ring = (uint64_t)(ULONG_PTR)g_extra[slot];
+                q.event = (uint64_t)(ULONG_PTR)g_extra_event[slot];
+            } else {   /* spares used up: memory the session already uses */
+                q.ring = (uint64_t)(ULONG_PTR)g_extra[0];
+                q.event = (uint64_t)(ULONG_PTR)g_extra_event[0];
+            }
+            chmlink_inject_ring_encode(raw, &q);
+            in_size = CHMLINK_INJECT_RING_SIZE;
+            if (below(r, 3) == 0) raw[below(r, CHMLINK_INJECT_RING_SIZE)] ^= (uint8_t)(1u << below(r, 8));
+            if (below(r, 8) == 0) in_size = below(r, 2) ? in_size - 1 - below(r, 8) : in_size + 1 + below(r, 8);
+            out_size = below(r, 6) == 0 ? 4 : 0;
+            memcpy(w->in, raw, CHMLINK_INJECT_RING_SIZE);
+            valid = in_size == CHMLINK_INJECT_RING_SIZE && out_size == 0 &&
+                    chmlink_inject_ring_decode(&q, w->in, in_size) == CHMLINK_OK;
+            got = issue(w->handle, w->event, CHMLINK_IOCTL_ADD_INJECT_RING, w->in, in_size,
+                        out_size ? w->out : NULL, out_size, &returned);
+            if (!session) {
+                expect(got, ERROR_ACCESS_DENIED, "ADD_INJECT_RING on inspection handle", in_size, out_size);
+            } else if (got == 0) {
+                if (!valid) FAIL("ADD_INJECT_RING accepted a malformed request");
+                InterlockedIncrement64(&g_added_total);
+                if (InterlockedIncrement(&g_extra_added) > (LONG)EXTRA_RINGS)
+                    FAIL("ADD_INJECT_RING accepted more than %u rings", (unsigned)CHMLINK_INJECT_RINGS_MAX);
+            } else if (!valid) {
+                expect(got, ERROR_INVALID_PARAMETER, "ADD_INJECT_RING", in_size, out_size);
+            } else if (!g_tolerant && got != ERROR_BAD_COMMAND && got != ERROR_NOACCESS &&
+                       got != ERROR_ACCESS_DENIED && got != ERROR_INVALID_HANDLE) {
+                /* A decodable request may name a mutated address or handle. */
+                FAIL("ADD_INJECT_RING valid request: error %lu", got);
+            }
+            break;
+        }
+        /* otherwise REGISTER_RINGS */
+    {
         chmlink_session_rings rings;
         int valid;
         in_size = register_input(r, w->in);   /* up to BIG bytes */
@@ -365,6 +416,17 @@ static int create_rings(void)
     g_from_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_to_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!g_from || !g_to || !g_from_event || !g_to_event) return 0;
+    {
+        unsigned i;
+        for (i = 0; i < EXTRA_RINGS; ++i) {
+            g_extra[i] = VirtualAlloc(NULL, CHMLINK_RING_HEADER_SIZE + EXTRA_CAPACITY, MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_READWRITE);
+            g_extra_event[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
+            if (!g_extra[i] || !g_extra_event[i]) return 0;
+        }
+        InterlockedExchange(&g_extra_next, 0);
+        InterlockedExchange(&g_extra_added, 0);
+    }
     memset(&g_rings, 0, sizeof(g_rings));
     g_rings.version = CHMLINK_SESSION_VERSION;
     g_rings.from_windows_ring = (uint64_t)(ULONG_PTR)g_from;
@@ -383,6 +445,13 @@ static void destroy_rings(void)
     if (g_to) { VirtualFree(g_to, 0, MEM_RELEASE); g_to = NULL; }
     if (g_from_event) { CloseHandle(g_from_event); g_from_event = NULL; }
     if (g_to_event) { CloseHandle(g_to_event); g_to_event = NULL; }
+    {
+        unsigned i;
+        for (i = 0; i < EXTRA_RINGS; ++i) {
+            if (g_extra[i]) { VirtualFree(g_extra[i], 0, MEM_RELEASE); g_extra[i] = NULL; }
+            if (g_extra_event[i]) { CloseHandle(g_extra_event[i]); g_extra_event[i] = NULL; }
+        }
+    }
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -484,7 +553,7 @@ int wmain(int argc, wchar_t **argv)
     }
     InterlockedExchange(&g_stop, 1);
     REQUIRE(WaitForSingleObject(inspect_thread, 30000) == WAIT_OBJECT_0);
-    printf("PASS ioctl fuzz: %lu rounds, %lld requests, %lld registrations, %lld broken sessions\n",
-           rounds, (long long)g_requests, (long long)g_registered, (long long)g_broken);
+    printf("PASS ioctl fuzz: %lu rounds, %lld requests, %lld registrations, %lld added rings, %lld broken sessions\n",
+           rounds, (long long)g_requests, (long long)g_registered, (long long)g_added_total, (long long)g_broken);
     return 0;
 }

@@ -39,6 +39,22 @@ typedef struct chmlink_tx_entry {
     BOOL published;
 } chmlink_tx_entry;
 
+/* One to-Windows ring with its producer state. The driver indicates each ring
+ * from its own thread, so threads injecting into different rings are
+ * processed by the stack in parallel; order holds within a ring. */
+typedef struct chmlink_txq {
+    void *memory;
+    chmlink_ring ring;
+    HANDLE event;
+    SRWLOCK lock;
+    uint32_t cursor;               /* next free record position */
+    chmlink_tx_entry *entries;
+    uint32_t count, entries_capacity, head;
+} chmlink_txq;
+
+/* Injecting threads remembered for queue assignment; later ones share. */
+#define CHMLINK_TXQ_THREADS 64u
+
 struct chmlink_adapter {
     HANDLE device;
     uint32_t packet_limit;
@@ -53,20 +69,26 @@ struct chmlink_adapter {
     ULONG cached;
     HANDLE events[CHMLINK_EVENT_CACHE];
 
-    void *from_memory, *to_memory;
+    void *from_memory;
     uint32_t from_capacity, to_capacity;
-    chmlink_ring from, to;
-    HANDLE from_event, to_event;
+    chmlink_ring from;
+    HANDLE from_event;
 
     SRWLOCK rx_lock;
     uint32_t rx_cursor;            /* next record to read */
     chmlink_rx_entry *rx_entries;
     uint32_t rx_count, rx_entries_capacity, rx_head;
 
-    SRWLOCK tx_lock;
-    uint32_t tx_cursor;            /* next free record position */
-    chmlink_tx_entry *tx_entries;
-    uint32_t tx_count, tx_entries_capacity, tx_head;
+    /* txq[0] is registered with the session; the first injecting thread
+     * uses it, each further one gets a new ring (ADD_INJECT_RING) up to
+     * CHMLINK_INJECT_RINGS_MAX, after which threads share. txq_count only
+     * grows, after the new queue is complete. */
+    chmlink_txq txq[CHMLINK_INJECT_RINGS_MAX];
+    volatile LONG txq_count;
+    SRWLOCK txq_gate;              /* the thread table and queue creation */
+    DWORD txq_threads[CHMLINK_TXQ_THREADS];
+    uint8_t txq_of[CHMLINK_TXQ_THREADS];
+    uint32_t txq_mapped;
 };
 
 static HANDLE new_request_event(void)
@@ -230,14 +252,16 @@ static void release_resources(chmlink_adapter *adapter)
         adapter->device = INVALID_HANDLE_VALUE;
     }
     if (adapter->from_memory != NULL) VirtualFree(adapter->from_memory, 0, MEM_RELEASE);
-    if (adapter->to_memory != NULL) VirtualFree(adapter->to_memory, 0, MEM_RELEASE);
     if (adapter->from_event != NULL) CloseHandle(adapter->from_event);
-    if (adapter->to_event != NULL) CloseHandle(adapter->to_event);
+    for (i = 0; i < CHMLINK_INJECT_RINGS_MAX; ++i) {
+        if (adapter->txq[i].memory != NULL) VirtualFree(adapter->txq[i].memory, 0, MEM_RELEASE);
+        if (adapter->txq[i].event != NULL) CloseHandle(adapter->txq[i].event);
+        HeapFree(GetProcessHeap(), 0, adapter->txq[i].entries);
+    }
     if (adapter->cancel_event != NULL) CloseHandle(adapter->cancel_event);
     if (adapter->close_event != NULL) CloseHandle(adapter->close_event);
     for (i = 0; i < adapter->cached; ++i) CloseHandle(adapter->events[i]);
     HeapFree(GetProcessHeap(), 0, adapter->rx_entries);
-    HeapFree(GetProcessHeap(), 0, adapter->tx_entries);
     HeapFree(GetProcessHeap(), 0, adapter);
 }
 
@@ -251,9 +275,9 @@ static int register_rings(chmlink_adapter *adapter, HANDLE event)
     rings.from_windows_ring = (uint64_t)(ULONG_PTR)adapter->from_memory;
     rings.from_windows_capacity = adapter->from_capacity;
     rings.from_windows_event = (uint64_t)(ULONG_PTR)adapter->from_event;
-    rings.to_windows_ring = (uint64_t)(ULONG_PTR)adapter->to_memory;
+    rings.to_windows_ring = (uint64_t)(ULONG_PTR)adapter->txq[0].memory;
     rings.to_windows_capacity = adapter->to_capacity;
-    rings.to_windows_event = (uint64_t)(ULONG_PTR)adapter->to_event;
+    rings.to_windows_event = (uint64_t)(ULONG_PTR)adapter->txq[0].event;
     chmlink_session_encode(bytes, &rings);
     return device_ioctl(adapter->device, event, CHMLINK_IOCTL_REGISTER_RINGS, bytes,
                         sizeof(bytes), NULL, 0, &received) != 0;
@@ -322,28 +346,30 @@ chmlink_adapter *chmlink_open_ex(uint32_t index, const chmlink_open_options *opt
     adapter->to_capacity = capacity;
     InitializeSRWLock(&adapter->gate);
     InitializeSRWLock(&adapter->rx_lock);
-    InitializeSRWLock(&adapter->tx_lock);
+    InitializeSRWLock(&adapter->txq_gate);
+    InitializeSRWLock(&adapter->txq[0].lock);
     InitializeConditionVariable(&adapter->drained);
     adapter->cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     adapter->close_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     adapter->from_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    adapter->to_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    adapter->txq[0].event = CreateEventW(NULL, FALSE, FALSE, NULL);
     adapter->rx_entries_capacity = CHMLINK_RX_ENTRIES_MIN;
-    adapter->tx_entries_capacity = CHMLINK_TX_ENTRIES_MIN;
+    adapter->txq[0].entries_capacity = CHMLINK_TX_ENTRIES_MIN;
     adapter->rx_entries = HeapAlloc(GetProcessHeap(), 0,
         adapter->rx_entries_capacity * sizeof(*adapter->rx_entries));
-    adapter->tx_entries = HeapAlloc(GetProcessHeap(), 0,
-        adapter->tx_entries_capacity * sizeof(*adapter->tx_entries));
+    adapter->txq[0].entries = HeapAlloc(GetProcessHeap(), 0,
+        adapter->txq[0].entries_capacity * sizeof(*adapter->txq[0].entries));
     if (adapter->cancel_event == NULL || adapter->close_event == NULL ||
-        adapter->from_event == NULL || adapter->to_event == NULL ||
-        adapter->rx_entries == NULL || adapter->tx_entries == NULL) {
+        adapter->from_event == NULL || adapter->txq[0].event == NULL ||
+        adapter->rx_entries == NULL || adapter->txq[0].entries == NULL) {
         error = GetLastError(); release_resources(adapter); SetLastError(error); return NULL;
     }
     if (!create_ring(&adapter->from_memory, &adapter->from, capacity) ||
-        !create_ring(&adapter->to_memory, &adapter->to, capacity)) {
+        !create_ring(&adapter->txq[0].memory, &adapter->txq[0].ring, capacity)) {
         error = GetLastError() ? GetLastError() : ERROR_NOT_ENOUGH_MEMORY;
         release_resources(adapter); SetLastError(error); return NULL;
     }
+    adapter->txq_count = 1;
     if (!register_rings(adapter, event)) {
         error = GetLastError();
         /* release_resources closes the device, which is what unlocks the
@@ -670,66 +696,151 @@ int chmlink_receive(chmlink_adapter *adapter, void *buffer, uint32_t capacity,
 
 /* ---- sending ---- */
 
-static int tx_push(chmlink_adapter *a, uint32_t start, uint32_t end)
+static int tx_push(chmlink_txq *q, uint32_t start, uint32_t end)
 {
-    if (a->tx_count == a->tx_entries_capacity) {
+    if (q->count == q->entries_capacity) {
         uint32_t capacity;
         chmlink_tx_entry *grown;
-        if (a->tx_head != 0) {
-            memmove(a->tx_entries, a->tx_entries + a->tx_head,
-                    (a->tx_count - a->tx_head) * sizeof(*a->tx_entries));
-            a->tx_count -= a->tx_head;
-            a->tx_head = 0;
+        if (q->head != 0) {
+            memmove(q->entries, q->entries + q->head, (q->count - q->head) * sizeof(*q->entries));
+            q->count -= q->head;
+            q->head = 0;
         } else {
-            capacity = a->tx_entries_capacity * 2;
-            grown = HeapReAlloc(GetProcessHeap(), 0, a->tx_entries,
-                                capacity * sizeof(*a->tx_entries));
+            capacity = q->entries_capacity * 2;
+            grown = HeapReAlloc(GetProcessHeap(), 0, q->entries, capacity * sizeof(*q->entries));
             if (grown == NULL) return 0;
-            a->tx_entries = grown;
-            a->tx_entries_capacity = capacity;
+            q->entries = grown;
+            q->entries_capacity = capacity;
         }
     }
-    a->tx_entries[a->tx_count].start = start;
-    a->tx_entries[a->tx_count].end = end;
-    a->tx_entries[a->tx_count].published = FALSE;
-    a->tx_count++;
+    q->entries[q->count].start = start;
+    q->entries[q->count].end = end;
+    q->entries[q->count].published = FALSE;
+    q->count++;
     return 1;
 }
 
 /* Publish the contiguous published prefix and wake the driver if it sleeps. */
-static void tx_advance(chmlink_adapter *a, BOOL *wake)
+static void tx_advance(chmlink_txq *q, BOOL *wake)
 {
     uint32_t end = 0;
     BOOL advanced = FALSE;
-    while (a->tx_head < a->tx_count && a->tx_entries[a->tx_head].published) {
-        end = a->tx_entries[a->tx_head].end;
-        a->tx_head++;
+    while (q->head < q->count && q->entries[q->head].published) {
+        end = q->entries[q->head].end;
+        q->head++;
         advanced = TRUE;
     }
-    if (advanced) *wake = chmlink_ring_publish(&a->to, end) != 0;
-    if (a->tx_head == a->tx_count) a->tx_head = a->tx_count = 0;
+    if (advanced) *wake = chmlink_ring_publish(&q->ring, end) != 0;
+    if (q->head == q->count) q->head = q->count = 0;
+}
+
+/* txq_gate held exclusively. Registers txq[txq_count] with the driver; on
+ * failure the queue is left empty and the caller shares an existing one. */
+static int add_txq(chmlink_adapter *a)
+{
+    uint8_t bytes[CHMLINK_INJECT_RING_SIZE];
+    chmlink_inject_ring request;
+    chmlink_txq *q = &a->txq[a->txq_count];
+    HANDLE event = new_request_event();
+    DWORD received;
+    int ok = 0;
+    if (event == NULL) return 0;
+    InitializeSRWLock(&q->lock);
+    q->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    q->entries_capacity = CHMLINK_TX_ENTRIES_MIN;
+    q->entries = HeapAlloc(GetProcessHeap(), 0, q->entries_capacity * sizeof(*q->entries));
+    if (q->event != NULL && q->entries != NULL && create_ring(&q->memory, &q->ring, a->to_capacity)) {
+        memset(&request, 0, sizeof(request));
+        request.version = CHMLINK_INJECT_RING_VERSION;
+        request.capacity = a->to_capacity;
+        request.ring = (uint64_t)(ULONG_PTR)q->memory;
+        request.event = (uint64_t)(ULONG_PTR)q->event;
+        chmlink_inject_ring_encode(bytes, &request);
+        ok = device_ioctl(a->device, event, CHMLINK_IOCTL_ADD_INJECT_RING, bytes, sizeof(bytes),
+                          NULL, 0, &received) != 0;
+    }
+    CloseHandle(event);
+    if (!ok) {
+        /* Not registered, so nothing in the driver refers to it. */
+        if (q->memory != NULL) VirtualFree(q->memory, 0, MEM_RELEASE);
+        if (q->event != NULL) CloseHandle(q->event);
+        HeapFree(GetProcessHeap(), 0, q->entries);
+        memset(q, 0, sizeof(*q));
+        return 0;
+    }
+    InterlockedIncrement(&a->txq_count);   /* publishes the complete queue */
+    return 1;
+}
+
+/* The calling thread's queue. A new thread gets txq[0] if nobody uses it
+ * yet, else a new queue while there is room, else shares round-robin. */
+static chmlink_txq *pick_txq(chmlink_adapter *a)
+{
+    DWORD self = GetCurrentThreadId();
+    uint32_t i, index;
+    AcquireSRWLockShared(&a->txq_gate);
+    for (i = 0; i < a->txq_mapped; ++i) {
+        if (a->txq_threads[i] == self) {
+            index = a->txq_of[i];
+            ReleaseSRWLockShared(&a->txq_gate);
+            return &a->txq[index];
+        }
+    }
+    ReleaseSRWLockShared(&a->txq_gate);
+    AcquireSRWLockExclusive(&a->txq_gate);
+    for (i = 0; i < a->txq_mapped; ++i) {
+        if (a->txq_threads[i] == self) {
+            index = a->txq_of[i];
+            ReleaseSRWLockExclusive(&a->txq_gate);
+            return &a->txq[index];
+        }
+    }
+    if (a->txq_mapped == 0) index = 0;
+    else if ((uint32_t)a->txq_count < CHMLINK_INJECT_RINGS_MAX && add_txq(a)) index = (uint32_t)a->txq_count - 1;
+    else index = a->txq_mapped % (uint32_t)a->txq_count;
+    if (a->txq_mapped < CHMLINK_TXQ_THREADS) {
+        a->txq_threads[a->txq_mapped] = self;
+        a->txq_of[a->txq_mapped] = (uint8_t)index;
+        a->txq_mapped++;
+    }
+    ReleaseSRWLockExclusive(&a->txq_gate);
+    return &a->txq[index];
+}
+
+/* The queue whose ring holds `packet`, or NULL. */
+static chmlink_txq *txq_of_packet(chmlink_adapter *a, const uint8_t *packet)
+{
+    LONG i, count = a->txq_count;
+    for (i = 0; i < count; ++i) {
+        const chmlink_txq *q = &a->txq[i];
+        if ((uintptr_t)packet >= (uintptr_t)(q->ring.data + CHMLINK_RING_RECORD_HEADER) &&
+            (uintptr_t)packet < (uintptr_t)(q->ring.data + q->ring.capacity))
+            return &a->txq[i];
+    }
+    return NULL;
 }
 
 uint8_t *chmlink_allocate_packet(chmlink_adapter *adapter, uint32_t size,
                                  const chmlink_offload *offload)
 {
     chmlink_ring_status status;
+    chmlink_txq *q;
     uint8_t *packet = NULL;
     uint32_t saved;
     if (adapter == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
     if (!enter(adapter, NULL)) return NULL;
-    AcquireSRWLockExclusive(&adapter->tx_lock);
-    saved = adapter->tx_cursor;
-    status = chmlink_ring_reserve(&adapter->to, &adapter->tx_cursor, size, offload, &packet);
+    q = pick_txq(adapter);
+    AcquireSRWLockExclusive(&q->lock);
+    saved = q->cursor;
+    status = chmlink_ring_reserve(&q->ring, &q->cursor, size, offload, &packet);
     if (status == CHMLINK_RING_OK) {
-        if (!tx_push(adapter, (uint32_t)(packet - adapter->to.data) - CHMLINK_RING_RECORD_HEADER,
-                     adapter->tx_cursor)) {
-            adapter->tx_cursor = saved;
+        if (!tx_push(q, (uint32_t)(packet - q->ring.data) - CHMLINK_RING_RECORD_HEADER, q->cursor)) {
+            q->cursor = saved;
             packet = NULL;
             status = CHMLINK_RING_FULL;
         }
     }
-    ReleaseSRWLockExclusive(&adapter->tx_lock);
+    ReleaseSRWLockExclusive(&q->lock);
     if (packet == NULL) {
         SetLastError(status == CHMLINK_RING_FULL ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA);
         leave(adapter, NULL, 0);
@@ -742,24 +853,23 @@ uint8_t *chmlink_allocate_packet(chmlink_adapter *adapter, uint32_t size,
 void chmlink_send_packet(chmlink_adapter *adapter, uint8_t *packet)
 {
     uint32_t start, i;
+    chmlink_txq *q;
     BOOL wake = FALSE;
     if (adapter == NULL || packet == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return; }
-    if ((uintptr_t)packet < (uintptr_t)(adapter->to.data + CHMLINK_RING_RECORD_HEADER) ||
-        (uintptr_t)packet >= (uintptr_t)(adapter->to.data + adapter->to.capacity)) {
-        SetLastError(ERROR_INVALID_PARAMETER); return;
-    }
     if (!enter(adapter, NULL)) return;
-    AcquireSRWLockExclusive(&adapter->tx_lock);
-    start = (uint32_t)(packet - adapter->to.data) - CHMLINK_RING_RECORD_HEADER;
-    for (i = adapter->tx_head; i < adapter->tx_count; ++i) {
-        if (adapter->tx_entries[i].start == start && !adapter->tx_entries[i].published) {
-            adapter->tx_entries[i].published = TRUE;
+    q = txq_of_packet(adapter, packet);
+    if (q == NULL) { leave(adapter, NULL, 0); SetLastError(ERROR_INVALID_PARAMETER); return; }
+    AcquireSRWLockExclusive(&q->lock);
+    start = (uint32_t)(packet - q->ring.data) - CHMLINK_RING_RECORD_HEADER;
+    for (i = q->head; i < q->count; ++i) {
+        if (q->entries[i].start == start && !q->entries[i].published) {
+            q->entries[i].published = TRUE;
             break;
         }
     }
-    tx_advance(adapter, &wake);
-    ReleaseSRWLockExclusive(&adapter->tx_lock);
-    if (wake) SetEvent(adapter->to_event);
+    tx_advance(q, &wake);
+    ReleaseSRWLockExclusive(&q->lock);
+    if (wake) SetEvent(q->event);
     leave(adapter, NULL, 1);
 }
 
@@ -793,32 +903,33 @@ int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length)
      * where it was, so the caller can retry the whole batch. */
     {
         chmlink_ring_status status = CHMLINK_RING_OK;
+        chmlink_txq *q = pick_txq(adapter);
         uint32_t saved, start = 0;
         int first = 1;
         BOOL wake = FALSE;
-        AcquireSRWLockExclusive(&adapter->tx_lock);
-        saved = adapter->tx_cursor;
+        AcquireSRWLockExclusive(&q->lock);
+        saved = q->cursor;
         chmlink_batch_read_begin(&reader, batch);
         while (chmlink_batch_read_next(&reader, &packet, &size, &descriptor)) {
             chmlink_offload *described = descriptor.flags != 0 || descriptor.gso_type != 0 ? &descriptor : NULL;
             uint8_t *slot;
-            status = chmlink_ring_reserve(&adapter->to, &adapter->tx_cursor, size, described, &slot);
+            status = chmlink_ring_reserve(&q->ring, &q->cursor, size, described, &slot);
             if (status != CHMLINK_RING_OK) break;
-            if (first) { start = (uint32_t)(slot - adapter->to.data) - CHMLINK_RING_RECORD_HEADER; first = 0; }
+            if (first) { start = (uint32_t)(slot - q->ring.data) - CHMLINK_RING_RECORD_HEADER; first = 0; }
             memcpy(slot, packet, size);
         }
         if (status == CHMLINK_RING_OK && !first) {
-            if (tx_push(adapter, start, adapter->tx_cursor)) {
-                adapter->tx_entries[adapter->tx_count - 1].published = TRUE;
-                tx_advance(adapter, &wake);
+            if (tx_push(q, start, q->cursor)) {
+                q->entries[q->count - 1].published = TRUE;
+                tx_advance(q, &wake);
                 result = 1;
             } else {
                 status = CHMLINK_RING_FULL;
             }
         }
-        if (!result) adapter->tx_cursor = saved;
-        ReleaseSRWLockExclusive(&adapter->tx_lock);
-        if (wake) SetEvent(adapter->to_event);
+        if (!result) q->cursor = saved;
+        ReleaseSRWLockExclusive(&q->lock);
+        if (wake) SetEvent(q->event);
         if (!result) SetLastError(status == CHMLINK_RING_CORRUPT ? ERROR_INVALID_DATA : ERROR_BUFFER_OVERFLOW);
     }
     return leave(adapter, NULL, result);
