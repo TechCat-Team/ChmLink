@@ -1,16 +1,15 @@
 # ChmLink
 
-ChmLink is a Windows virtual network adapter project for ChmLAN. It aims to
-provide Ethernet and IP adapters through a single driver package, with tunnel
-protocols implemented in the user-mode agent.
+ChmLink is a Windows virtual network adapter: one driver package provides
+Ethernet (TAP-like) and raw IP (TUN-like) adapters, and applications exchange
+packets with them through a C library, `chmlink.dll`. MIT licensed.
 
 It includes an NDIS 6.60 miniport with Ethernet and raw-IP adapters, a C SDK
-that exchanges packets with the driver through shared-memory rings (with
+(`chmlink.dll`) that creates adapters and exchanges packets with the driver through shared-memory rings (with
 LSOv2, checksum and RSC offloads in Ethernet mode), a device provisioning tool,
 examples, and a runtime CI for a Windows test VM. It is unreleased and
-experimental: production signing, minimum-version and ARM64 testing, and the
-Rust device I/O are not done, so it cannot replace TAP or Wintun in production
-yet. Install it only in a disposable test VM.
+experimental: production signing and minimum-version and ARM64 testing are
+not done, so it cannot replace TAP or Wintun in production yet. Install it only in a disposable test VM.
 
 The compatibility target is Windows 10 version 1607 (build 14393) /
 Windows Server 2016 and later. These are development targets, not verified
@@ -23,7 +22,7 @@ support. The planned NDIS baseline is 6.60.
 - `src/protocol/` — batch framing and validation, and the encodings of the device query and session requests.
 - `src/ring/` — the packet ring shared by the driver and the SDK, portable so it can be tested off Windows.
 - `driver/` — NDIS 6.60 miniport (Ethernet and raw IP) and INF package.
-- `src/windows/` — user-mode C SDK: adapters (`adapter.c`), receiving, sending and waiting, with shared internals in `internal.h`.
+- `src/windows/` — user-mode C SDK, built as `chmlink.dll` (exports in `chmlink.def`): sessions (`adapter.c`), receiving, sending and waiting, with shared internals in `internal.h`; adapter management (`manage.c`, `include/chmlink/manage.h`) over the stored configuration (`device_config.c`).
 - `examples/` — small programs using the C interface.
 - `tools/` — driver build, provisioning and package maintenance tools.
 - `tools/ci/` — runtime CI for the Windows test VM; see [tools/ci/README.md](tools/ci/README.md).
@@ -31,13 +30,12 @@ support. The planned NDIS baseline is 6.60.
 - `tests/windows/` — runtime tests for a Windows test VM (lifecycle, IP, ARP, power, IOCTL fuzzing).
 - `tests/support/` — helpers shared by tests and benchmarks.
 - `bench/` — packet-rate, latency and TCP benchmarks for the test VM.
-- `rust/chmlink/` — Rust types for the user-mode integration.
 
 ## Test
 
 Run `cmake -S . -B build`, `cmake --build build`, and
-`ctest --test-dir build --output-on-failure`. Run `cargo test --workspace` for
-the Rust crate. `python3 -m unittest discover -s tools/ci` tests the CI scripts.
+`ctest --test-dir build --output-on-failure`. `python3 -m unittest discover -s tools/ci`
+tests the CI scripts.
 
 Every push runs the portable tests on Linux and Windows, a fuzz pass, an x64
 driver build with `/W4 /WX`, and a rule that a changed driver needs a higher INF
@@ -94,6 +92,47 @@ examining its logs and environment.
 
 The CI's nightly lane runs this suite under Driver Verifier with NDIS
 verification and under fault injection; see Status for the current result.
+
+## Quick start
+
+An application ships `chmlink.dll` alone: built with `CHMLINK_DRIVER_DIR`
+pointing at a signed `chmlink.inf`, `chmlink.sys` and `chmlink.cat`, the DLL
+carries the driver package and installs it when it creates the first adapter.
+
+```powershell
+cmake -S . -B build -DCHMLINK_DRIVER_DIR=C:\path\to\signed
+cmake --build build --config Release
+.\build\Release\chmlink-quickstart.exe   # as administrator; then: ping 192.0.2.2
+```
+
+`examples/quickstart.c` is the whole lifecycle in about a hundred lines:
+
+```c
+chmlink_create_options options = {sizeof(options)};
+chmlink_device device;
+options.mode = CHMLINK_MODE_IP;            /* or CHMLINK_MODE_ETHERNET */
+options.name = L"My VPN";                  /* the Windows connection name */
+chmlink_create_adapter(&options, &device); /* installs the driver if needed */
+chmlink_adapter *adapter = chmlink_open(device.interface_index);
+/* add addresses with CreateUnicastIpAddressEntry, then move packets:
+ * chmlink_receive_packet / chmlink_release_packet (from Windows),
+ * chmlink_allocate_packet / chmlink_send_packet (to Windows) */
+chmlink_close(adapter);
+chmlink_delete_adapter(device.instance_id, NULL);
+```
+
+`include/chmlink/manage.h` creates, lists, changes and deletes adapters;
+`include/chmlink/api.h` (which includes it) runs the data session. All calls
+return nonzero on success and report errors through `GetLastError()`.
+
+All adapters share one driver package. When a DLL creates an adapter, the
+newer of its embedded package and the one the existing adapters run wins: an
+older package is upgraded on every adapter, unless one has a data session
+open, in which case the existing package is kept when it supports creation.
+`chmlink_delete_driver` removes packages that no adapter uses, for
+uninstallers. Every adapter records an owner GUID (`options.owner`); deleting
+it or changing its MTU requires the same owner, so applications do not remove
+each other's adapters.
 
 ## Windows driver and SDK
 
@@ -176,9 +215,10 @@ Configure a test IP address on that adapter and generate traffic to observe
 outgoing frames. `chmlink_inject` accepts the batch format for the opposite
 direction; `chmlink-inject.exe <ifIndex> <frame.bin>` submits a raw Ethernet
 frame from a file. Close capture before running this separate example because
-the session is exclusive. The provisioning utility restricts driver selection
-to the supplied INF and installs it only on the newly created device. It does
-not upgrade other matching adapters. It prints JSON containing the device instance
+the session is exclusive. `chmlink-device`, the command-line form of
+`manage.h` used by the PowerShell managers, takes an explicit INF: it restricts
+driver selection to that INF and installs it only on the newly created device,
+which it also names. It does not upgrade other matching adapters. It prints JSON containing the device instance
 ID and persistent configuration. To remove a device, stop capture and pass the
 exact instance ID to `chmlink-device.exe remove <instance-id>`. Supply the same
 `--owner <GUID>` used at creation when using a custom owner.
@@ -444,8 +484,7 @@ reaches 52 Gbps of TCP against ChmLink's 96 Gbps above.
 
 Not production ready. Open work: signing and installation outside a test-signed
 VM, minimum-version and ARM64 testing, running the sleep/resume test on a
-platform with sleep states, surprise-removal testing, and the Rust device I/O
-and agent integration. Sleep is reported to a session as
+platform with sleep states, and surprise-removal testing. Sleep is reported to a session as
 `CHMLINK_STATE_LOW_POWER`, a system power-off as `CHMLINK_STATE_SHUTDOWN`
 (`ERROR_SHUTDOWN_IN_PROGRESS` from a wait), and a surprise removal as
 `CHMLINK_STATE_REMOVING`. Package 0.4.1.0 (shared rings, per-thread injection rings and offloads) passed
