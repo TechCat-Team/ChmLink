@@ -52,6 +52,20 @@ typedef DWORD (WINAPI *nci_set_connection_name)(const GUID *guid, const wchar_t 
 
 /* Wait until the new device has a network interface and give it its name.
  * Windows may take a moment to bind NDIS after the driver installed. */
+/* Give the name back from an interface left behind by a removed adapter
+ * (see ClIsStaleInterface); the creation check has already let it through. */
+static void release_stale_name(nci_set_connection_name set_name, const wchar_t *name)
+{
+    NET_LUID luid;
+    GUID stale;
+    wchar_t renamed[IF_MAX_STRING_SIZE + 1];
+    if (ConvertInterfaceAliasToLuid(name, &luid) != NO_ERROR ||
+        ConvertInterfaceLuidToGuid(&luid, &stale) != NO_ERROR || !ClIsStaleInterface(&stale)) return;
+    swprintf(renamed, IF_MAX_STRING_SIZE + 1, L"%.200ls (removed %08lx)", name, stale.Data1);
+    if (set_name(&stale, renamed) == ERROR_SUCCESS)
+        sdk_log(CHMLINK_LOG_INFO, L"Renamed the interface of a removed adapter to '%ls'.", renamed);
+}
+
 static BOOL name_interface(HDEVINFO set, SP_DEVINFO_DATA *device, const wchar_t *name)
 {
     HMODULE nci = LoadLibraryExW(L"nci.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -67,6 +81,7 @@ static BOOL name_interface(HDEVINFO set, SP_DEVINFO_DATA *device, const wchar_t 
         if (ClInterfaceOf(set, device, &guid, &index)) {
             error = set_name(&guid, name);
             if (error == ERROR_SUCCESS) break;
+            if (error == ERROR_DUP_NAME) release_stale_name(set_name, name);
         } else {
             error = GetLastError();
         }

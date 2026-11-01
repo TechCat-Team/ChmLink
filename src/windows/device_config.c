@@ -21,6 +21,7 @@
 #include <string.h>
 #include <wchar.h>
 #include "device_config.h"
+#include "log.h"
 
 const wchar_t ClHardwareId[] = L"Root\\ChmLink";
 const wchar_t ClIpHardwareId[] = L"Root\\ChmLinkIP";
@@ -149,6 +150,23 @@ BOOL ClInterfaceOf(HDEVINFO set, SP_DEVINFO_DATA *device, GUID *guid, uint32_t *
     if (error != NO_ERROR) { SetLastError(error); return FALSE; }
     *index = found;
     return TRUE;
+}
+
+/* Windows keeps the network configuration of a removed adapter, and with it
+ * an interface row that still carries the adapter's name, when the removal
+ * was not finished (for example after the adapter failed to start). Such a
+ * row belongs to no device, so its name is free to take. */
+BOOL ClIsStaleInterface(const GUID *guid)
+{
+    wchar_t path[160], text[39], instance[MAX_DEVICE_ID_LEN];
+    DWORD bytes = sizeof(instance), type;
+    DEVINST node;
+    LSTATUS error;
+    if (StringFromGUID2(guid, text, 39) != 39) return FALSE;
+    swprintf(path, 160, L"SYSTEM\\CurrentControlSet\\Control\\Network\\{4D36E972-E325-11CE-BFC1-08002BE10318}\\%ls\\Connection", text);
+    error = RegGetValueW(HKEY_LOCAL_MACHINE, path, L"PnPInstanceId", RRF_RT_REG_SZ, &type, instance, &bytes);
+    if (error != ERROR_SUCCESS || instance[0] == 0) return FALSE;
+    return CM_Locate_DevNodeW(&node, instance, CM_LOCATE_DEVNODE_PHANTOM) == CR_NO_SUCH_DEVNODE;
 }
 
 /* An abandoned lock means a change was interrupted halfway: refuse once so
@@ -295,10 +313,15 @@ BOOL ClCheckUnique(const CL_DEVICE_CONFIG *config)
     if (error != NO_ERROR) { SetLastError(error); return FALSE; }
     for (i = 0; i < table->NumEntries; ++i) {
         MIB_IF_ROW2 *row = &table->Table[i];
-        if (chmlink_config_mode(config->Bytes) == CHMLINK_CONFIG_MODE_ETHERNET &&
-            row->PhysicalAddressLength == 6 && memcmp(row->PhysicalAddress, config->Bytes + CHMLINK_CONFIG_MAC, CHMLINK_CONFIG_MAC_SIZE) == 0) break;
-        if (_wcsicmp(row->Alias, config->Name) == 0) break;
+        if (!(chmlink_config_mode(config->Bytes) == CHMLINK_CONFIG_MODE_ETHERNET && row->PhysicalAddressLength == 6 &&
+              memcmp(row->PhysicalAddress, config->Bytes + CHMLINK_CONFIG_MAC, CHMLINK_CONFIG_MAC_SIZE) == 0) &&
+            _wcsicmp(row->Alias, config->Name) != 0) continue;
+        if (!ClIsStaleInterface(&row->InterfaceGuid)) break;
+        sdk_log(CHMLINK_LOG_INFO, L"Ignoring interface '%ls' left behind by a removed adapter.", row->Alias);
     }
+    if (i != table->NumEntries)
+        sdk_log(CHMLINK_LOG_WARNING, L"Interface '%ls' (%ls, status %d) already uses this name or MAC.",
+                table->Table[i].Alias, table->Table[i].Description, (int)table->Table[i].OperStatus);
     error = i == table->NumEntries ? ERROR_SUCCESS : ERROR_DUP_NAME;
     FreeMibTable(table);
     if (error != ERROR_SUCCESS) { SetLastError(error); return FALSE; }
@@ -317,7 +340,15 @@ BOOL ClCheckUnique(const CL_DEVICE_CONFIG *config)
              chmlink_config_mode(config->Bytes) == CHMLINK_CONFIG_MODE_ETHERNET &&
              memcmp(other.Bytes + CHMLINK_CONFIG_MAC, config->Bytes + CHMLINK_CONFIG_MAC,
                     CHMLINK_CONFIG_MAC_SIZE) == 0) ||
-            _wcsicmp(other.Name, config->Name) == 0) { SetLastError(ERROR_DUP_NAME); goto fail; }
+            _wcsicmp(other.Name, config->Name) == 0) {
+            wchar_t id[MAX_DEVICE_ID_LEN];
+            ULONG status = 0, problem = 0;
+            if (!SetupDiGetDeviceInstanceIdW(all, &device, id, MAX_DEVICE_ID_LEN, NULL)) id[0] = 0;
+            CM_Get_DevNode_Status(&status, &problem, device.DevInst, 0);
+            sdk_log(CHMLINK_LOG_WARNING, L"Adapter %ls ('%ls', devnode status 0x%lx, problem %lu) already uses this name, MAC or identity.",
+                    id, other.Name, status, problem);
+            SetLastError(ERROR_DUP_NAME); goto fail;
+        }
     }
     error = GetLastError(); SetupDiDestroyDeviceInfoList(all);
     if (error != ERROR_NO_MORE_ITEMS) { SetLastError(error); return FALSE; }

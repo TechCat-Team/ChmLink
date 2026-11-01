@@ -26,9 +26,12 @@ function Log([string]$Message) {
 }
 function Run-Device([string[]]$Arguments) {
     $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $text = & $tool @Arguments | Out-String; $code = $LASTEXITCODE }
+    $errors = [IO.Path]::GetTempFileName()
+    try { $text = & $tool @Arguments 2>$errors | Out-String; $code = $LASTEXITCODE }
     finally { $ErrorActionPreference = $previous }
-    [pscustomobject]@{ Code = $code; Text = $text }
+    $message = (Get-Content -LiteralPath $errors -Raw -ErrorAction SilentlyContinue)
+    Remove-Item -LiteralPath $errors -ErrorAction SilentlyContinue
+    [pscustomobject]@{ Code = $code; Text = $text; Error = if ($message) { $message.Trim() } else { '' } }
 }
 # Every PnP-level step runs in a job with a deadline: a hang is the failure this suite looks for.
 function Invoke-Bounded([scriptblock]$Block, [object[]]$Arguments, [int]$Seconds, [string]$What) {
@@ -76,7 +79,7 @@ try {
     while ((Get-Date) -lt $deadline) {
         $stats.Cycles++
         $created = Run-Device @('create', $InfPath, '--owner', $owner.ToString('B'), '--name', 'ChmLink LowRes')
-        if ($created.Code -ne 0 -and $created.Code -ne 3010) { Log "create exited $($created.Code); retrying"; Start-Sleep 2; continue }
+        if ($created.Code -ne 0 -and $created.Code -ne 3010) { Log "create exited $($created.Code): $($created.Error); retrying"; Start-Sleep 2; continue }
         $device = $created.Text | ConvertFrom-Json
         $devices.Add($device); $stats.Created++
         $adapter = Find-Interface $device 20

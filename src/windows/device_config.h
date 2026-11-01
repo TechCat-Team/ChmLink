@@ -55,6 +55,8 @@ BOOL ClInstallOnDevice(HDEVINFO set, SP_DEVINFO_DATA *device, const wchar_t *inf
 /* The network interface of a device: its GUID once the class installer has
  * assigned one, and (index not NULL) its index once NDIS has bound it. */
 BOOL ClInterfaceOf(HDEVINFO set, SP_DEVINFO_DATA *device, GUID *guid, uint32_t *index);
+/* Whether an interface belongs to an adapter that no longer exists. */
+BOOL ClIsStaleInterface(const GUID *guid);
 
 /* package.c */
 /* Every ChmLink device runs exactly this package (identical INF, SYS, CAT). */

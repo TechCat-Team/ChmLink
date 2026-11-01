@@ -16,9 +16,16 @@
 #include <string.h>
 #include <wchar.h>
 #include <errno.h>
-#include "chmlink/manage.h"
+#include "chmlink/api.h"
 #include "chmlink/packet.h"
 #include "device_config.h"
+
+/* The SDK's warnings and errors say which step failed and why. */
+static void log_problem(chmlink_log_level level, const wchar_t *message, void *context)
+{
+    (void)context;
+    if (level != CHMLINK_LOG_INFO) fwprintf(stderr, L"%ls\n", message);
+}
 
 static void json_string(const wchar_t *text)
 {
@@ -172,6 +179,7 @@ int wmain(int argc, wchar_t **argv)
     unsigned long mtu_value = 0;
     int i;
     if (argc == 2 && wcscmp(argv[1], L"version") == 0) { puts("5"); return 0; }
+    chmlink_set_logger(log_problem, NULL);
     if (argc == 3 && wcscmp(argv[1], L"show") == 0) return show(argv[2]);
     if (argc == 4 && wcscmp(argv[1], L"install") == 0) return install_existing(argv[2], argv[3]);
     if (argc == 3 && wcscmp(argv[1], L"package-remove") == 0) return remove_package(argv[2]);
