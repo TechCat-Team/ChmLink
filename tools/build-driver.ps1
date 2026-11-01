@@ -119,6 +119,18 @@ Invoke-Checked 'link.exe' (@('/nologo', '/driver', '/subsystem:native,10.00',
     '/debug', "/pdb:$Output/chmlink.pdb", '/opt:ref', '/opt:icf',
     "/out:$Output/chmlink.sys", "/libpath:$wdk/Lib/$kitVersion/km/x64",
     'ntoskrnl.lib', 'hal.lib', 'ndis.lib', 'ntstrsafe.lib', 'BufferOverflowK.lib') + $objects)
+# Test-only upper filter for the surprise-removal test (tests/windows/surprise_filter.c).
+# It goes next to the package, never into it.
+$testOutput = Join-Path (Split-Path $Output -Parent) 'driver-test'
+New-Item -ItemType Directory -Force $testOutput | Out-Null
+Write-Host 'Compiling tests/windows/surprise_filter.c'
+Invoke-Checked 'cl.exe' (@('/nologo', '/c', '/kernel', '/Zl', '/GS', '/O2', '/Z7', '/W4', '/WX',
+    '/D_AMD64_', '/D_WIN32_WINNT=0x0A00', '/DNTDDI_VERSION=0x0A000002',
+    "/I$wdk/Include/$kitVersion/km", "/I$sdk/Include/$kitVersion/shared", "/I$sdk/Include/$kitVersion/ucrt",
+    "/Fo$testOutput/surprise_filter.obj") + $analysis + @("$repo/tests/windows/surprise_filter.c"))
+Invoke-Checked 'link.exe' @('/nologo', '/driver', '/subsystem:native,10.00', '/entry:GsDriverEntry', '/machine:x64',
+    '/nodefaultlib', '/integritycheck', "/out:$testOutput/chmlink-surprise.sys", "/libpath:$wdk/Lib/$kitVersion/km/x64",
+    'ntoskrnl.lib', 'hal.lib', 'wdmsec.lib', 'BufferOverflowK.lib', "$testOutput/surprise_filter.obj")
 # Inf2Cat refuses a postdated DriverVer by the build machine's clock, and hosted
 # runners use UTC: a date taken in a later time zone fails there but not here.
 $driverDate = [regex]::Match((Get-Content -Raw "$repo/driver/chmlink.inf"), '(?m)^\s*DriverVer\s*=\s*(\d{1,2}/\d{1,2}/\d{4})\s*,')

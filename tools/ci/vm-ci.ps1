@@ -192,7 +192,8 @@ function Get-Preflight($Config, [bool]$Quiet) {
 # adapters) is never removed by CI.
 $testOwners = @('9AB3CDB8-3693-4C1F-89B3-4062BB57BE83',   # tools/test-lifecycle.ps1
                 'A9206A62-5C94-4CBC-B23E-FB3A891DE058',   # tools/test-ip.ps1
-                '3F6B2D7E-91A4-4C58-B0E2-7A1D5C9E4B36')   # tools/bench.ps1
+                '3F6B2D7E-91A4-4C58-B0E2-7A1D5C9E4B36',   # tools/bench.ps1
+                '5F1C2A7E-3B4D-4E8F-9A10-6C2D7E41883B')   # tools/test-package.ps1
 
 # Remove adapters left behind by a suite that was killed. Returns the instance ids removed.
 function Remove-LeftoverTestDevices([string]$DeviceTool, $Config) {
@@ -615,6 +616,16 @@ function New-SuiteRunner([string]$InfPath, [string]$BuildDir) {
     }
 }
 
+# Upgrades with and without open sessions, chmlink_delete_driver, concurrent creation and surprise
+# removal, through chmlink.dll (tools/test-package.ps1). Uses what the sign and build-embedded stages
+# left in the source tree, so it also runs after a reboot. Leaves the anchor on the candidate.
+function Invoke-PackageSuite([string]$Directory, [string]$BuildDir) {
+    Invoke-Process 'package tests' 'powershell.exe' ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -OldInfPath "{1}" -EmbeddedDirectory "{2}" -BuildDirectory "{3}" -OutputDirectory "{4}" -FilterPath "{5}"' -f `
+        (Join-Path $script:srcDir 'tools\test-package.ps1'), (Join-Path $script:srcDir 'build\signed-old\chmlink.inf'),
+        (Join-Path $script:srcDir 'build\embedded\Release'), $BuildDir, $Directory,
+        (Join-Path $script:srcDir 'build\driver-test\chmlink-surprise.sys')) 900
+}
+
 # Take the lock again after a reboot, for a run that already owns this VM.
 function Enter-Lock-For([string]$Id) {
     $holder = Get-LockHolder
@@ -821,6 +832,7 @@ function Invoke-Resume {
                 }
                 Invoke-Stage 'verifier-lifecycle' { & $suite 'lifecycle' (Join-Path $out 'verifier-lifecycle') 1500 }
                 Invoke-Stage 'verifier-ip' { & $suite 'ip' (Join-Path $out 'verifier-ip') 900 }
+                Invoke-Stage 'verifier-package' { Invoke-PackageSuite (Join-Path $out 'verifier-package') $build }
                 # Verifier slows the data path several times over, so the benchmark here proves behaviour
                 # under concurrency, not speed. Its numbers are never compared with the baseline.
                 Invoke-Stage 'verifier-duplex' { & $suite 'bench' (Join-Path $out 'verifier-duplex') 900 'duplex' }
@@ -1024,11 +1036,24 @@ function Invoke-Run {
             Invoke-Process 'inf2cat' $inf2cat ("/driver:`"$signed`" /os:10_X64,Server10_X64 /uselocaltime") 300
             Invoke-Process 'sign cat' $signtool ("sign /q $sign `"$signed\chmlink.cat`"") 120
             Invoke-Process 'verify catalog' $signtool ("verify /q /pa /c `"$signed\chmlink.cat`" `"$signed\chmlink.sys`"") 120
+            # For the package test: the same driver under a lower DriverVer (at least the SDK's
+            # minimum, 0.4.3.0), and the test-only surprise-removal filter. Neither is shipped.
+            $oldPackage = Join-Path $script:srcDir 'build\signed-old'
+            New-Item -ItemType Directory -Force $oldPackage | Out-Null
+            Copy-Item (Join-Path $signed 'chmlink.sys') $oldPackage -Force
+            $inf = [IO.File]::ReadAllText((Join-Path $signed 'chmlink.inf'))
+            $driverVer = [regex]::Match($inf, '(?m)^(\s*DriverVer\s*=\s*[^,]+,\s*)([0-9.]+)')
+            if ([version]$driverVer.Groups[2].Value -le [version]'0.4.3.99') { throw 'The candidate must be newer than 0.4.3.99 for the package test.' }
+            [IO.File]::WriteAllText((Join-Path $oldPackage 'chmlink.inf'), $inf.Replace($driverVer.Value, $driverVer.Groups[1].Value + '0.4.3.99'), (New-Object Text.UTF8Encoding($false)))
+            Invoke-Process 'inf2cat (older)' $inf2cat ("/driver:`"$($oldPackage)`" /os:10_X64,Server10_X64 /uselocaltime") 300
+            Invoke-Process 'sign cat (older)' $signtool ("sign /q $sign `"$($oldPackage)\chmlink.cat`"") 120
+            $filter = Join-Path $script:srcDir 'build\driver-test\chmlink-surprise.sys'
+            Invoke-Process 'sign test filter' $signtool ("sign /q $sign `"$filter`"") 120
         }
         Invoke-Stage 'build-embedded' {
             # chmlink.dll with the signed candidate inside, as applications ship it.
             Invoke-Process 'cmake configure (embedded)' 'cmake.exe' ('-S . -B build/embedded -G "Visual Studio 17 2022" -A x64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBUILD_TESTING=OFF "-DCHMLINK_DRIVER_DIR={0}"' -f $signed) 300 $script:srcDir
-            Invoke-Process 'cmake build (embedded)' 'cmake.exe' '--build build/embedded --config Release --target chmlink-quickstart -- /m /v:minimal /nologo' 600 $script:srcDir
+            Invoke-Process 'cmake build (embedded)' 'cmake.exe' '--build build/embedded --config Release --target chmlink-quickstart chmlink-package-test -- /m /v:minimal /nologo' 600 $script:srcDir
         }
         $candidateInf = Join-Path $signed 'chmlink.inf'
         $candidateSys = Get-Sha256 (Join-Path $signed 'chmlink.sys')
@@ -1062,6 +1087,7 @@ function Invoke-Run {
             # Creation from the embedded package, naming, a ping round trip and deletion.
             Invoke-Process 'quickstart self-test' (Join-Path $script:srcDir 'build\embedded\Release\chmlink-quickstart.exe') '--self-test' 120 $script:srcDir
         }
+        Invoke-Stage 'package' { Invoke-PackageSuite (Join-Path $out 'package') $build }
         if ($Lane -eq 'full') {
             for ($i = 1; $i -le $config.BenchRepeats; $i++) {
                 Invoke-Stage "bench-$i" {

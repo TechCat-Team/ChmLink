@@ -82,6 +82,7 @@ disposable VM with the signed package:
 | `tools\test-lowres.ps1` | adapter churn and fuzzing under low-resources simulation (used by the nightly lane) |
 | `chmlink-arp-test <ifIndex> <local-ipv4> <peer-ipv4>` | both directions on an Ethernet adapter via ARP |
 | `chmlink-quickstart --self-test` | creation from the embedded package, a ping round trip, deletion |
+| `tools\test-package.ps1` | through `chmlink.dll`: driver upgrades with and without open sessions and from a mix of packages, `chmlink_delete_driver`, eight processes creating at once, surprise removal under an open session (with the test-only filter `tests/windows/surprise_filter.c`) |
 
 `tools/ci/vm-run.sh` drives all of them from a Linux or macOS machine: it
 builds a commit on the VM, signs it with the VM's test certificate, installs it

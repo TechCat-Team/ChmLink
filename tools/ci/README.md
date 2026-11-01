@@ -51,7 +51,7 @@ A run keeps going on the VM if your connection drops, because it is started deta
 
 `preflight` (disk, tools, signing certificate, no reboot pending, only the expected adapters) →
 `build-user` → `ctest` → `build-driver` (with `-Analyze`) → `sign` → `build-embedded` (chmlink.dll carrying the signed package) → `clean-store` → `install` →
-`lifecycle` → `ip` → `quickstart` (creation from the embedded package, a ping, deletion) → [`bench-1..3`] → `restore`. `restore` runs whatever happened before it. If the
+`lifecycle` → `ip` → `quickstart` (creation from the embedded package, a ping, deletion) → `package` (upgrades with and without sessions, `chmlink_delete_driver`, concurrent creation, surprise removal; again as `verifier-package` in the nightly lane) → [`bench-1..3`] → `restore`. `restore` runs whatever happened before it. If the
 previous run was killed, the next one notices (wrong driver image, leftover adapters owned by the test
 suites) and repairs it first.
 

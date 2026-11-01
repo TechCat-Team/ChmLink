@@ -73,6 +73,13 @@ if(WIN32)
     target_compile_definitions(chmlink-inject PRIVATE _CRT_SECURE_NO_WARNINGS)
     add_executable(chmlink-quickstart examples/quickstart.c)
     target_link_libraries(chmlink-quickstart PRIVATE chmlink iphlpapi ws2_32)
+    # Driver-package, concurrency and surprise-removal tests, through chmlink.dll
+    # with the driver embedded as applications ship it (tools/test-package.ps1).
+    add_executable(chmlink-package-test tests/windows/package_test.c)
+    target_link_libraries(chmlink-package-test PRIVATE chmlink setupapi)
+    if(MINGW)
+        target_link_options(chmlink-package-test PRIVATE -municode)
+    endif()
     add_executable(chmlink-device tools/device.c)
     target_include_directories(chmlink-device PRIVATE src/windows)
     target_compile_definitions(chmlink-device PRIVATE _WIN32_WINNT=0x0A00)
