@@ -130,17 +130,21 @@ BOOL ClCheckPackage(const wchar_t *source)
     SetLastError(error); return FALSE;
 }
 
-/* Newest package wins: a package of existing adapters at least as new as the
- * embedded one is used as it is; an older one is first upgraded to the
- * embedded package, unless an adapter has an open data session; then the
- * existing package is used if it supports creation. */
+/* Newest package wins. The target is the embedded package, or the package of
+ * existing adapters when that is at least as new. Adapters that run anything else
+ * (older packages, or a mix left by an interrupted upgrade) are moved to the
+ * target, unless one of them has a data session open: then the existing
+ * package is kept if every adapter runs the same one and this SDK can talk to
+ * it, and creation fails with ERROR_BUSY otherwise. */
 BOOL ClSelectPackage(const wchar_t *embedded, wchar_t chosen[MAX_PATH], BOOL *reboot)
 {
     HDEVINFO all;
     SP_DEVINFO_DATA device = {sizeof(device)};
     unsigned long long embedded_version, version, newest = 0;
-    wchar_t store[MAX_PATH], newest_inf[MAX_PATH];
-    BOOL busy = FALSE, outdated = FALSE;
+    wchar_t store[MAX_PATH], newest_inf[MAX_PATH], first_inf[MAX_PATH] = L"";
+    const wchar_t *target;
+    unsigned long long target_version;
+    BOOL busy = FALSE, outdated = FALSE, uniform = TRUE;
     DWORD i, error;
     if (!ClPackageVersion(embedded, &embedded_version)) return FALSE;
     if (embedded_version < CL_PACKAGE_SDK) { SetLastError(ERROR_REVISION_MISMATCH); return FALSE; }
@@ -150,43 +154,51 @@ BOOL ClSelectPackage(const wchar_t *embedded, wchar_t chosen[MAX_PATH], BOOL *re
         if (!ClIsDevice(all, &device)) continue;
         if (!device_package(all, &device, store) || !ClPackageVersion(store, &version)) goto fail;
         if (version > newest) { newest = version; wcscpy_s(newest_inf, MAX_PATH, store); }
-        if (!same_package(store, embedded)) {
-            if (GetLastError() != ERROR_REVISION_MISMATCH) goto fail;
-            outdated = TRUE;
-            if (!device_idle(all, &device)) busy = TRUE;
-        }
+        if (!first_inf[0]) wcscpy_s(first_inf, MAX_PATH, store);
+        else if (_wcsicmp(first_inf, store) != 0) uniform = FALSE;
+    }
+    if (GetLastError() != ERROR_NO_MORE_ITEMS) goto fail;
+    /* At an equal version Windows would reuse the published package anyway. */
+    target = newest >= embedded_version ? newest_inf : embedded;
+    target_version = newest >= embedded_version ? newest : embedded_version;
+    for (i = 0; SetupDiEnumDeviceInfo(all, i, &device); ++i) {
+        if (!ClIsDevice(all, &device)) continue;
+        if (!device_package(all, &device, store)) goto fail;
+        if (same_package(store, target)) continue;
+        if (GetLastError() != ERROR_REVISION_MISMATCH) goto fail;
+        outdated = TRUE;
+        if (!device_idle(all, &device)) busy = TRUE;
     }
     if (GetLastError() != ERROR_NO_MORE_ITEMS) goto fail;
     if (!outdated) {
-        wcscpy_s(chosen, MAX_PATH, embedded);
-    } else if (newest >= embedded_version || busy) {
+        wcscpy_s(chosen, MAX_PATH, target);
+    } else if (busy) {
         /* Keep what runs; creation checks that every adapter runs it. */
-        if (newest < CL_PACKAGE_SDK) {
-            sdk_log(CHMLINK_LOG_ERROR, L"Adapters run driver %u.%u.%u.%u, too old for this SDK, and one has a data session "
-                    L"open, so it cannot be upgraded to %u.%u.%u.%u now.", CL_PACKAGE_PARTS(newest),
-                    CL_PACKAGE_PARTS(embedded_version));
-            SetLastError(busy ? ERROR_BUSY : ERROR_REVISION_MISMATCH); goto fail;
+        if (!uniform || newest < CL_PACKAGE_SDK) {
+            sdk_log(CHMLINK_LOG_ERROR, L"Adapters run %ls, and one has a data session open, so they cannot be moved to "
+                    L"driver %u.%u.%u.%u now.", uniform ? L"a driver too old for this SDK" : L"different driver packages",
+                    CL_PACKAGE_PARTS(target_version));
+            SetLastError(ERROR_BUSY); goto fail;
         }
-        if (newest < embedded_version)
-            sdk_log(CHMLINK_LOG_WARNING, L"Keeping driver %u.%u.%u.%u instead of the embedded %u.%u.%u.%u: an adapter "
-                    L"has a data session open.", CL_PACKAGE_PARTS(newest), CL_PACKAGE_PARTS(embedded_version));
-        wcscpy_s(chosen, MAX_PATH, newest_inf);
+        sdk_log(CHMLINK_LOG_WARNING, L"Keeping driver %u.%u.%u.%u instead of %u.%u.%u.%u: an adapter has a data "
+                L"session open.", CL_PACKAGE_PARTS(newest), CL_PACKAGE_PARTS(target_version));
+        wcscpy_s(chosen, MAX_PATH, first_inf);
     } else {
         for (i = 0; SetupDiEnumDeviceInfo(all, i, &device); ++i) {
             BOOL restart = FALSE;
             if (!ClIsDevice(all, &device)) continue;
-            if (!device_package(all, &device, store)) goto fail;
-            if (same_package(store, embedded)) continue;
-            sdk_log(CHMLINK_LOG_INFO, L"Upgrading driver %u.%u.%u.%u to the embedded %u.%u.%u.%u on an existing adapter.",
-                    CL_PACKAGE_PARTS(newest), CL_PACKAGE_PARTS(embedded_version));
-            if (!ClInstallOnDevice(all, &device, embedded, &restart)) {
+            if (!device_package(all, &device, store) || !ClPackageVersion(store, &version)) goto fail;
+            if (same_package(store, target)) continue;
+            sdk_log(CHMLINK_LOG_INFO, L"Moving an existing adapter from driver %u.%u.%u.%u to %u.%u.%u.%u.",
+                    CL_PACKAGE_PARTS(version), CL_PACKAGE_PARTS(target_version));
+            if (!ClInstallOnDevice(all, &device, target, &restart)) {
                 sdk_log_error(L"Upgrading an existing adapter failed");
                 goto fail;
             }
             if (restart) *reboot = TRUE;
         }
         if (GetLastError() != ERROR_NO_MORE_ITEMS) goto fail;
-        wcscpy_s(chosen, MAX_PATH, embedded);
+        wcscpy_s(chosen, MAX_PATH, target);
     }
     SetupDiDestroyDeviceInfoList(all);
     return TRUE;

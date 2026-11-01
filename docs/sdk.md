@@ -135,7 +135,12 @@ creation failed and so did removing the half-created device; it shows up in
 Common failures: `ERROR_DUP_NAME` (the name, MAC or identity is in use),
 `ERROR_REVISION_MISMATCH` (an unusable driver package, see
 [Driver compatibility](#driver-compatibility)), `ERROR_BUSY` (another process
-is changing adapters for more than ten seconds), `ERROR_INVALID_PARAMETER`.
+is changing adapters for more than ten seconds, or the driver cannot be
+changed now: see below), `ERROR_INVALID_PARAMETER`.
+
+A name stays taken until its adapter is deleted. Windows can keep the name of
+a deleted adapter that never started until the next restart; the SDK
+recognizes such leftovers and reuses the name.
 
 Creating an adapter does not configure addresses or routes; use the IP Helper
 API (`CreateUnicastIpAddressEntry`, `CreateIpForwardEntry2`) or `netsh` on
@@ -152,7 +157,10 @@ run, and the newer one wins:
 - the existing package is as new or newer: it is used as it is;
 - the embedded package is newer: every existing adapter is upgraded to it
   first (their sessions end), unless one of them has a session open; then the
-  existing package is kept, provided this SDK can talk to it.
+  existing package is kept, provided this SDK can talk to it;
+- adapters run different packages (an upgrade that was interrupted): they are
+  all moved to the newest one; while one of them has a session open, creation
+  fails with `ERROR_BUSY` and nothing changes.
 
 With `driver_inf` set, the existing adapters must already run exactly that
 package (same INF, SYS and CAT); nothing else is changed.
