@@ -100,11 +100,14 @@ low-resources simulation, leak checks and reboots). See
 .\tools\bench.ps1 -InfPath <signed-inf> -BuildDirectory build\Release -OutputDirectory <new>
 .\tools\bench-wintun.ps1 -WintunDll <official wintun.dll> -BuildDirectory build\Release -OutputDirectory <new>
 .\tools\bench-tap.ps1 -BuildDirectory build\Release -OutputDirectory <new>   # needs one TAP-Windows Adapter V9
+.\tools\bench-resources.ps1 -InfPath <signed-inf> -WintunDll <official wintun.dll> -OutputDirectory <new> [-SoakMinutes 60]
 ```
 
 The same benchmark programs run on all three drivers through
-`bench/wintun_shim.c` and `bench/tap_shim.c`. Results and method:
-[performance.md](performance.md).
+`bench/wintun_shim.c` and `bench/tap_shim.c`. `bench-resources.ps1` measures
+CPU at fixed packet rates and memory per session on ChmLink and Wintun, and
+with `-SoakMinutes` repeats create, open, traffic, close and delete to watch
+the SDK for leaks. Results and method: [performance.md](performance.md).
 
 ## Versioning rules
 

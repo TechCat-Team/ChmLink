@@ -47,7 +47,10 @@ typedef BYTE *(WINAPI *allocate_fn)(WINTUN_SESSION_HANDLE, DWORD);
 typedef void(WINAPI *send_fn)(WINTUN_SESSION_HANDLE, const BYTE *);
 
 #define RING_CAPACITY (4u * 1024u * 1024u)
-#define WAIT_SPIN 2048u               /* as CHMLINK_WAIT_SPIN in the SDK */
+/* Polls before sleeping in chmlink_wait_readable: as CHMLINK_WAIT_SPIN in the
+ * SDK by default; CHMLINK_WINTUN_SPIN=0 waits on the event at once, as
+ * Wintun's own example does (the resource benchmark measures both). */
+static unsigned wait_spin = 2048u;
 
 static uint32_t packet_limit = 1500;  /* the interface MTU set below */
 
@@ -90,6 +93,10 @@ static int load(void)
     GET(allocate_packet, allocate_fn, "WintunAllocateSendPacket");
     GET(send_packet, send_fn, "WintunSendPacket");
 #undef GET
+    {
+        char text[16];
+        if (GetEnvironmentVariableA("CHMLINK_WINTUN_SPIN", text, sizeof(text)) != 0) wait_spin = (unsigned)atoi(text);
+    }
     return create_adapter && close_adapter && get_luid && start_session && end_session && read_event &&
            receive_packet && release_packet && allocate_packet && send_packet;
 }
@@ -284,7 +291,7 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
     p = a->held;
     ReleaseSRWLockShared(&a->lock);
     if (p != NULL) return 1;
-    for (spin = 0; spin < WAIT_SPIN; ++spin) {
+    for (spin = 0; spin < wait_spin; ++spin) {
         p = receive_packet(a->session, &size);
         if (p != NULL) {
             AcquireSRWLockExclusive(&a->lock);

@@ -90,10 +90,12 @@ PowerShell 语法检查，以及下文的版本规则检查。
 .\tools\bench.ps1 -InfPath <signed-inf> -BuildDirectory build\Release -OutputDirectory <new>
 .\tools\bench-wintun.ps1 -WintunDll <official wintun.dll> -BuildDirectory build\Release -OutputDirectory <new>
 .\tools\bench-tap.ps1 -BuildDirectory build\Release -OutputDirectory <new>   # needs one TAP-Windows Adapter V9
+.\tools\bench-resources.ps1 -InfPath <signed-inf> -WintunDll <official wintun.dll> -OutputDirectory <new> [-SoakMinutes 60]
 ```
 
 `bench-tap.ps1` 需要已安装一块 TAP-Windows Adapter V9。同样的基准程序通过 `bench/wintun_shim.c` 和
-`bench/tap_shim.c` 在三种驱动上运行。结果和方法见 [performance.md](performance.md)。
+`bench/tap_shim.c` 在三种驱动上运行。`bench-resources.ps1` 在 ChmLink 和 Wintun 上测量固定包速下的 CPU 和每个会话的内存，
+加上 `-SoakMinutes` 时会反复创建、打开、收发、关闭、删除，观察 SDK 是否泄漏。结果和方法见 [performance.md](performance.md)。
 
 ## 版本规则
 

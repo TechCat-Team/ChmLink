@@ -36,17 +36,17 @@ sets `alertable`, checks again and waits on an event; a producer sets the event
 only when `alertable` is set. Both sides can poll before sleeping: the SDK's
 wait (up to 64 µs) and the driver's to-Windows threads (up to 100 µs,
 yielding). At high packet rates and in request-response traffic the next
-packet usually arrives within that time, which spares a wake-up per packet; it
-took the 64-byte round trip from 35/191 µs (median/99th) to 15/69 µs.
+packet usually arrives within that time, which spares a wake-up per packet and
+roughly halves the 64-byte round trip (15 µs instead of about 35 µs at the
+median).
 
 Polling is adaptive, because at moderate rates it would only keep a core busy.
 Each side keeps a smoothed estimate of how long its ring stays empty before
 the next packet (wake-ups without data do not count) and polls only while that
 is under 64 µs; otherwise it sleeps at once. A request-response exchange stays
 under the threshold even without polling, so it turns polling back on. With
-10,000 evenly spaced packets per second each way this took the CPU cost from
-1.4 cores to 0.27; the round trip's median stayed at 15 µs and its 99th
-percentile rose from 67 to about 100 µs ([performance.md](performance.md#resource-use)).
+10,000 evenly spaced packets per second each way a session then costs 0.27
+cores instead of a core or more ([performance.md](performance.md#resource-use)).
 
 **From Windows.** `MiniportSend` reserves space under a spin lock, copies the
 packet outside it and publishes in reservation order, so senders on many CPUs

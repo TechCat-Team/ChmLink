@@ -2,10 +2,12 @@
 
 **English** | [简体中文](zh-CN/performance.md)
 
-All figures come from one test VM: an AMD Ryzen 9 9950X host, 4 vCPUs and
-32 GB for the guest, Windows 11 build 26200, package 0.5.1.0, medians of three
-runs. They measure the adapter and the Windows stack on one machine; there is
-no encryption and no physical NIC, so a real tunnel adds its own costs.
+All figures come from one test VM on an AMD Ryzen 9 9950X host with Windows
+11 build 26200: the throughput and latency tables with 4 vCPUs and 32 GB for
+the guest and package 0.5.1.0, medians of three runs; the resource figures
+with 8 vCPUs and 16 GB and package 0.5.1.3. They measure the adapter and the
+Windows stack on one machine; there is no encryption and no physical NIC, so a
+real tunnel adds its own costs.
 
 ## Method
 
@@ -44,6 +46,12 @@ ChmLink indicates batches without copying, on several cores by flow and by
 sending thread; Wintun indicates from one thread. tap-windows6 moves one
 packet per read or write request and stays an order of magnitude behind.
 
+Wintun's round trip above comes from an application loop that polls the ring
+before it waits, as the ChmLink SDK does when packets come quickly. Waiting on
+Wintun's event at once, as its example does, the round trip took 28 µs at the
+median and 113 µs at the 99th percentile, and varied widely from run to run
+(8 vCPUs, median of three runs).
+
 ## ChmLink in detail
 
 | scenario | result |
@@ -65,6 +73,52 @@ packet per read or write request and stays an order of magnitude behind.
 
 A consumer that stalls for 20 ms every 100 ms still receives 85% to 100% of the
 offered rate with the default 4 MiB ring, depending on packet size.
+
+## Resource use
+
+`tools/bench-resources.ps1` (`bench/resource_bench.c`) sends 64-byte UDP
+packets both ways at fixed rates through an open session and reports the CPU
+the whole machine spends above idle, without the pacing threads that stand in
+for the network. Rates above 1000 per second run twice: in bursts every
+millisecond, as a NIC's interrupt moderation delivers traffic, and evenly
+spaced, the worst case for polling. Wintun runs twice: with the application
+polling the ring before it waits, and waiting on its event at once, as
+Wintun's example does. One run each; differences under 0.05 cores are noise.
+
+| packets per second, each way | ChmLink | Wintun, application polls | Wintun, application waits |
+|---|---|---|---|
+| idle session, 100, 1000 | ≤ 0.03 cores | ≤ 0.03 | ≤ 0.03 |
+| 10,000 in 1 ms bursts | 0.06 | 0.10 | 0.04 |
+| 10,000 evenly spaced | **0.27** | 1.88 | 1.09 |
+| 50,000 in 1 ms bursts | 0.21 | 0.22 | 0.26 |
+| 50,000 evenly spaced | 2.06 | 2.09 | 1.18 |
+
+Polling an empty ring before sleeping keeps latency low, but with packets
+100 µs apart it would only keep a core busy. ChmLink's SDK and driver
+therefore poll only while packets have recently come within 64 µs
+([architecture.md](architecture.md#data-path)). Wintun's driver keeps a core
+busy in both evenly spaced cases, however the application waits. With
+packets 20 µs apart ChmLink still polls on both sides; an application that
+wants the fewest cores there and accepts more latency can wait on
+`chmlink_get_read_event` itself, as Wintun's example does with its event. On
+this VM the 64-byte round trip through ChmLink 0.5.1.3 took 14.5 µs at the
+median and about 100 µs at the 99th percentile (three runs).
+
+Memory and threads per session:
+
+| | ChmLink | Wintun |
+|---|---|---|
+| locked ring memory | 8 MiB with the default 4 MiB rings; 4 MiB more per additional sending thread, up to 20 MiB | 8 MiB with the 4 MiB rings used here |
+| kernel threads | one per sending ring, plus up to four flow workers (5 to 8) | 1 to 2 |
+| kernel pool | under 1 MiB | under 1 MiB |
+
+**Soak.** One process created an IP adapter, gave it an address, opened a
+session, moved traffic both ways, closed it and deleted the adapter, over and
+over for an hour: 1081 cycles without a failure. Its handles stayed at 249 and
+its threads at 6 to 8; private memory went from 6.6 to 7.4 MiB in the first 45
+minutes and stayed there, which is the heap and system caches settling rather
+than a leak per cycle. The driver's own allocations are checked for leaks
+under Driver Verifier in the nightly lane.
 
 ## Notes
 
