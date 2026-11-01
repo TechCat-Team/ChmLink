@@ -108,11 +108,13 @@ cmake --install build --config Release --prefix C:\sdk\chmlink   # bin\chmlink.d
 
 Done: both adapter kinds, the shared-ring data path with spreading by flow,
 offloads, configurable MTU, software GRO, adapter management and driver
-installation in the SDK, version negotiation, and validation under Driver
-Verifier and fault injection on Windows 11.
+installation in the SDK (upgrades with open sessions, concurrent creation,
+clean uninstall), version negotiation, surprise removal, and validation under
+Driver Verifier and fault injection. Tested on Windows 11 and on Windows 10
+1607, the minimum target, without the Visual C++ Redistributable.
 
-Before 1.0: production signing, testing on Windows 10 1607 (the minimum
-target) and on hardware with sleep states, ARM64 and x86 builds.
+Before 1.0: production signing, sleep and resume on hardware with sleep states
+(the test VMs have none), ARM64 and x86 builds.
 
 ## Contributing
 
