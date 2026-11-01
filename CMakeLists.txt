@@ -57,6 +57,13 @@ if(WIN32)
             OBJECT_DEPENDS "${CHMLINK_DRIVER_FILES}")
         target_sources(chmlink PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/driver.rc)
     endif()
+    # cmake --install: what an application needs, chmlink.dll (bin), its
+    # import library (lib) and the public headers (include/chmlink).
+    install(TARGETS chmlink RUNTIME DESTINATION bin LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
+    install(FILES include/chmlink/api.h include/chmlink/manage.h include/chmlink/version.h
+                  include/chmlink/packet.h include/chmlink/protocol.h include/chmlink/offload.h
+                  include/chmlink/gro.h
+            DESTINATION include/chmlink)
     add_executable(chmlink-list examples/list.c)
     target_link_libraries(chmlink-list PRIVATE chmlink)
     add_executable(chmlink-capture examples/capture.c)
