@@ -218,7 +218,9 @@ chmlink_delete_driver();   /* in an uninstaller, after the last adapter */
 Deleting ends the adapter's session. `chmlink_delete_driver` removes every
 ChmLink driver package from the Driver Store that no adapter uses; it fails
 with `ERROR_INF_IN_USE_BY_DEVICES` while adapters still exist (after removing
-the unused packages).
+the unused packages). After the last adapter it leaves nothing behind: with the
+packages it removes the driver service and, on Windows versions that copy the
+driver to `System32\drivers` (before build 25319), that copy.
 
 Adapter changes are serialized across processes: a call waits up to ten
 seconds for another to finish, then fails with `ERROR_BUSY`.

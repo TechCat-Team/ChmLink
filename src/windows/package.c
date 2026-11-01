@@ -288,12 +288,84 @@ BOOL ClIsOwnPackage(const wchar_t *path)
     return owned;
 }
 
+/* Whether any ChmLink device exists, present or not. */
+static BOOL any_device(BOOL *found)
+{
+    HDEVINFO all = SetupDiGetClassDevsW(&GUID_DEVCLASS_NET, NULL, NULL, 0);
+    SP_DEVINFO_DATA device = {sizeof(device)};
+    DWORD i, error;
+    *found = FALSE;
+    if (all == INVALID_HANDLE_VALUE) return FALSE;
+    for (i = 0; SetupDiEnumDeviceInfo(all, i, &device); ++i)
+        if (ClIsDevice(all, &device)) { *found = TRUE; break; }
+    error = *found ? ERROR_NO_MORE_ITEMS : GetLastError();
+    SetupDiDestroyDeviceInfoList(all);
+    if (error != ERROR_NO_MORE_ITEMS) { SetLastError(error); return FALSE; }
+    return TRUE;
+}
+
+/* Removing the last package leaves the driver service registered, and before
+ * Windows 10 build 25319, which runs drivers from the Driver Store, also the
+ * copy of chmlink.sys in System32\drivers that the INF made. Both go once no
+ * adapter and no package is left. Only a stopped kernel driver service named
+ * chmlink whose image is chmlink.sys is touched. */
+static BOOL remove_service(void)
+{
+    SC_HANDLE manager, service;
+    QUERY_SERVICE_CONFIGW *config = NULL;
+    SERVICE_STATUS status;
+    wchar_t copy[MAX_PATH];
+    const wchar_t *image, *tail;
+    DWORD bytes = 0, error = ERROR_SUCCESS, length;
+    BOOL legacy;
+    manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (manager == NULL) return FALSE;
+    service = OpenServiceW(manager, L"chmlink", SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | DELETE);
+    if (service == NULL) {
+        error = GetLastError(); CloseServiceHandle(manager);
+        if (error == ERROR_SERVICE_DOES_NOT_EXIST) return TRUE;
+        SetLastError(error); return FALSE;
+    }
+    if (!QueryServiceConfigW(service, NULL, 0, &bytes) && GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
+        (config = HeapAlloc(GetProcessHeap(), 0, bytes)) != NULL && QueryServiceConfigW(service, config, bytes, &bytes)) {
+        image = config->lpBinaryPathName ? config->lpBinaryPathName : L"";
+        tail = wcsrchr(image, L'\\');
+        legacy = _wcsicmp(image, L"\\SystemRoot\\System32\\drivers\\chmlink.sys") == 0 ||
+                 _wcsicmp(image, L"System32\\drivers\\chmlink.sys") == 0;
+        if (config->dwServiceType != SERVICE_KERNEL_DRIVER || tail == NULL || _wcsicmp(tail, L"\\chmlink.sys") != 0) {
+            sdk_log(CHMLINK_LOG_WARNING, L"Leaving the service 'chmlink': it is not this driver (%ls).", image);
+        } else if (!QueryServiceStatus(service, &status) || status.dwCurrentState != SERVICE_STOPPED) {
+            sdk_log(CHMLINK_LOG_WARNING, L"Leaving the driver service: it is still running.");
+        } else if (!DeleteService(service) && GetLastError() != ERROR_SERVICE_MARKED_FOR_DELETE) {
+            error = GetLastError();
+        } else {
+            sdk_log(CHMLINK_LOG_INFO, L"Removed the driver service.");
+            length = GetSystemDirectoryW(copy, MAX_PATH);
+            if (legacy && length && length + 22 < MAX_PATH) {
+                wcscat_s(copy, MAX_PATH, L"\\drivers\\chmlink.sys");
+                if (DeleteFileW(copy)) sdk_log(CHMLINK_LOG_INFO, L"Removed %ls.", copy);
+                else if (GetLastError() != ERROR_FILE_NOT_FOUND &&
+                         MoveFileExW(copy, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
+                    sdk_log(CHMLINK_LOG_INFO, L"%ls is removed at the next restart.", copy);
+                else if (GetLastError() != ERROR_FILE_NOT_FOUND) error = GetLastError();
+            }
+        }
+    } else {
+        error = GetLastError();
+    }
+    if (config) HeapFree(GetProcessHeap(), 0, config);
+    CloseServiceHandle(service); CloseServiceHandle(manager);
+    SetLastError(error);
+    return error == ERROR_SUCCESS;
+}
+
 int chmlink_delete_driver(void)
 {
     WIN32_FIND_DATAW found;
     wchar_t pattern[MAX_PATH], path[MAX_PATH];
     HANDLE search, lock;
     DWORD length, error = ERROR_SUCCESS;
+    BOOL devices;
     length = GetWindowsDirectoryW(pattern, MAX_PATH);
     if (!length || length + 16 >= MAX_PATH) { SetLastError(ERROR_FILENAME_EXCED_RANGE); return 0; }
     wcscat_s(pattern, MAX_PATH, L"\\INF\\oem*.inf");
@@ -301,19 +373,25 @@ int chmlink_delete_driver(void)
     search = FindFirstFileW(pattern, &found);
     if (search == INVALID_HANDLE_VALUE) {
         error = GetLastError();
-        ClUnlock(lock);
-        if (error == ERROR_FILE_NOT_FOUND) return 1;
-        SetLastError(error); return 0;
+        if (error == ERROR_FILE_NOT_FOUND) error = ERROR_SUCCESS;
+    } else {
+        do {
+            if (!ClIsOemName(found.cFileName) ||
+                swprintf(path, MAX_PATH, L"%.*ls%ls", (int)(length + 5), pattern, found.cFileName) < 0 ||
+                !ClIsOwnPackage(path)) continue;
+            /* Flags zero: Windows refuses packages of present or phantom devices. */
+            if (!SetupUninstallOEMInfW(found.cFileName, 0, NULL)) error = GetLastError();
+            else sdk_log(CHMLINK_LOG_INFO, L"Removed driver package %ls.", found.cFileName);
+        } while (FindNextFileW(search, &found));
+        FindClose(search);
     }
-    do {
-        if (!ClIsOemName(found.cFileName) ||
-            swprintf(path, MAX_PATH, L"%.*ls%ls", (int)(length + 5), pattern, found.cFileName) < 0 ||
-            !ClIsOwnPackage(path)) continue;
-        /* Flags zero: Windows refuses packages of present or phantom devices. */
-        if (!SetupUninstallOEMInfW(found.cFileName, 0, NULL)) error = GetLastError();
-        else sdk_log(CHMLINK_LOG_INFO, L"Removed driver package %ls.", found.cFileName);
-    } while (FindNextFileW(search, &found));
-    FindClose(search);
+    if (error == ERROR_SUCCESS) {
+        if (!any_device(&devices)) error = GetLastError();
+        else if (!devices && !remove_service()) {
+            error = GetLastError();
+            sdk_log_error(L"Removing the driver service failed");
+        }
+    }
     ClUnlock(lock);
     SetLastError(error);
     return error == ERROR_SUCCESS;

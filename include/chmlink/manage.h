@@ -90,7 +90,8 @@ int chmlink_get_device(const wchar_t *instance_id, chmlink_device *device);
 /* Remove every ChmLink driver package from the Driver Store that no adapter
  * uses, for example when uninstalling. Fails with the error of the last
  * package Windows refused (ERROR_INF_IN_USE_BY_DEVICES while adapters exist),
- * after removing the others. */
+ * after removing the others. Once no adapter and no package is left, the
+ * driver service and any copy of chmlink.sys in System32\drivers go too. */
 int chmlink_delete_driver(void);
 
 typedef int (*chmlink_device_callback)(const chmlink_device *device, void *context);
