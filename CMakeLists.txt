@@ -90,6 +90,13 @@ if(WIN32)
     add_executable(wintun-tcp-bench bench/tcp_bench.c bench/wintun_shim.c tests/support/arp_peer.c)
     target_include_directories(wintun-tcp-bench PRIVATE tests/support)
     target_link_libraries(wintun-tcp-bench PRIVATE chmlink_protocol iphlpapi ws2_32)
+    # The same benchmarks over tap-windows6 (bench/tap_shim.c) in TUN mode;
+    # they need one installed TAP-Windows Adapter V9.
+    add_executable(tap-bench bench/packet_bench.c bench/tap_shim.c)
+    target_link_libraries(tap-bench PRIVATE chmlink_protocol iphlpapi ws2_32 ole32)
+    add_executable(tap-tcp-bench bench/tcp_bench.c bench/tap_shim.c tests/support/arp_peer.c)
+    target_include_directories(tap-tcp-bench PRIVATE tests/support)
+    target_link_libraries(tap-tcp-bench PRIVATE chmlink_protocol iphlpapi ws2_32 ole32)
     add_executable(chmlink-lifecycle-test tests/windows/lifecycle_test.c tests/windows/queue_test.c tests/windows/sdk_test.c)
     target_link_libraries(chmlink-lifecycle-test PRIVATE chmlink iphlpapi ws2_32)
     if(MINGW)

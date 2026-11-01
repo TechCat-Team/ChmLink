@@ -521,14 +521,35 @@ thirds; the remaining limit is the reflector, one thread that receives, cuts,
 merges and injects every packet. Injecting them whole shows what a tunnel
 that carries large packets end to end reaches.
 
-`tools/bench-wintun.ps1` runs the same IP-mode benchmarks over Wintun 0.14.1
-(`bench/wintun_shim.c`) on the same VM (measured with package 0.4.2.0, before
-spreading by flow). With both at MTU 1500, ChmLink
-injects about 1.9 times as many packets per second from one thread and 3.5
-times from two, carries TCP about 5 times as fast, uses about half the CPU per
-injected packet, and matches Wintun for packets from Windows and round-trip
-latency. At Wintun's default MTU of 65535 with packets passed whole, Wintun
-reaches 52 Gbps of TCP against ChmLink's 106 Gbps above.
+### Against Wintun and tap-windows6
+
+`tools/bench-wintun.ps1` and `tools/bench-tap.ps1` run the same IP-mode
+benchmarks over Wintun 0.14.1 (the official signed `wintun.dll`,
+`bench/wintun_shim.c`) and tap-windows6 9.27.0 in TUN mode (the official
+signed driver, `bench/tap_shim.c`, 64 reads kept posted). The three ran in
+turn, three rounds each, on the same VM at the same time (package 0.5.1.0,
+medians), all at MTU 1500 unless noted:
+
+| scenario | ChmLink | Wintun | tap-windows6 |
+|---|---|---|---|
+| 64 B round trip, median / 99th percentile | 14.6 / 77 µs | 14.7 / 56 µs | 41 / 178 µs |
+| UDP from Windows, one sender, 64 B | 479k pps | 473k pps | 45k pps |
+| UDP from Windows, four senders, 64 B | 1.24M pps | 1.23M pps | 148k pps |
+| UDP to Windows, one thread, one flow, 64 B | 550k pps | 350k pps | 72k pps |
+| UDP to Windows, one thread, 64 flows, 64 B | 1.75M pps | 348k pps | 74k pps |
+| UDP to Windows, two threads, 64 B | 1.18M pps | 352k pps | 72k pps |
+| CPU per packet to Windows (one flow) | 2.3 µs | 3.8 µs | 16.4 µs |
+| TCP, one stream / four streams | 21.0 / 23.9 Gbps | 4.2 / 4.2 Gbps | 0.89 / 0.90 Gbps |
+| TCP at MTU 65535, packets passed whole | 97 Gbps | 52 Gbps | — |
+
+Packets from Windows and the round trip are on par with Wintun: there the
+Windows stack and the sending application set the pace. Towards Windows,
+ChmLink's batch indication without a copy, its parallel indication by flow and
+by thread, and its per-session rings make the difference. tap-windows6 moves
+one packet per read or write request and stays an order of magnitude behind
+both. Beyond this table ChmLink also offers what the others lack: Ethernet
+mode with LSO/RSC (102 Gbps TCP), and software GRO for tunnels that deliver
+1500-byte packets (32–34 Gbps where 18–21 without).
 
 ## Status
 
