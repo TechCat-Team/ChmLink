@@ -52,7 +52,9 @@ that indicates it, so one indicating thread tops out at one core (about 650k
 packets per second here). Each session therefore starts one worker per active
 processor, up to four (none on a single processor). The ring thread puts every
 packet into a bucket by `chmlink_flow_hash` (addresses, protocol and TCP/UDP
-ports; symmetric, so both directions of a connection share a bucket). Per
+ports, past IPv6 extension headers; symmetric, so both directions of a
+connection share a bucket; fragments without ports, so all fragments of a
+packet share one). Per
 batch it indicates the largest bucket whose worker is idle itself, which costs
 a single flow no hand-off, and queues the others to their workers. A bucket
 with packets still in flight always goes to its worker, which keeps every flow
@@ -117,7 +119,9 @@ sequence number; only ACK and PSH; every segment but the last as large as the
 first) into a large IP packet or an RSC frame. In IP mode the merged checksum
 is derived from the segments' checksum fields, so no payload is read; in
 Ethernet mode, where Windows trusts RSC data, each segment is verified unless
-the caller says the data is intact.
+the caller says the data is intact. TCP that does not show its ports (behind IPv6 extension
+headers, or an IPv4 fragment) is not merged; whatever is held for the same
+hosts goes out before it, so no flow is reordered.
 
 ## Configuration
 

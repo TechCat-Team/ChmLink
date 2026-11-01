@@ -30,8 +30,11 @@ int chmlink_ip_packet_valid(const uint8_t *data, size_t length, size_t max_lengt
 
 /* A hash of the packet's flow for spreading packets over queues: IPv4/IPv6
  * addresses, the protocol and, for TCP and UDP outside fragments, the ports.
- * Packets of one flow hash alike, in both directions; other packets (ARP, short or unknown ones)
- * hash to 0. Ethernet frames may carry one 802.1Q tag. Reads only what length
+ * IPv6 extension headers (Hop-by-Hop, Routing, Destination Options,
+ * Authentication) are skipped, so a flow hashes alike with and without them;
+ * all fragments of a packet hash alike, without ports. Packets of one flow hash
+ * alike, in both directions; other packets (ARP, short or unknown ones) hash
+ * to 0. Ethernet frames may carry one 802.1Q tag. Reads only what length
  * covers; no validation beyond that. */
 uint32_t chmlink_flow_hash(chmlink_mode mode, const uint8_t *data, size_t length);
 

@@ -284,6 +284,36 @@ int main(void)
     CHECK(o.count == 2 && o.length[0] == len[0] && o.length[1] == len[1]);
     reset(&o);
 
+    /* 9. TCP that does not show its ports here (behind an IPv6 extension
+     *    header, or an IPv4 fragment) may belong to a held flow: what is held
+     *    between those hosts goes out first, then the packet, unchanged. */
+    {
+        int v6;
+        for (v6 = 0; v6 < 2; ++v6) {
+            uint8_t odd[2048];
+            size_t n;
+            CHECK(chmlink_gro_init(&g, CHMLINK_MODE_IP, 65535, 0, memory, sizeof(memory), collect, &o) == CHMLINK_OK);
+            len[0] = tcp_segment(seg[0], v6, 40000, 0, 1000, 0x10, 1, 0);
+            len[1] = tcp_segment(seg[1], v6, 40000, 1000, 1000, 0x10, 2, 0);
+            CHECK(chmlink_gro_add(&g, seg[0], len[0]) == CHMLINK_OK && chmlink_gro_add(&g, seg[1], len[1]) == CHMLINK_OK);
+            n = tcp_segment(odd, v6, 40000, 2000, 1000, 0x10, 3, 0);
+            if (v6) {
+                /* insert an 8-byte Hop-by-Hop header after the IPv6 header */
+                memmove(odd + 48, odd + 40, n - 40);
+                memset(odd + 40, 0, 8); odd[40] = 6; odd[6] = 0;
+                n += 8; odd[4] = (uint8_t)((n - 40) >> 8); odd[5] = (uint8_t)(n - 40);
+            } else {
+                odd[6] = 0x20;   /* more fragments */
+            }
+            CHECK(chmlink_gro_add(&g, odd, n) == CHMLINK_OK);
+            CHECK(o.count == 2 && o.length[0] == (v6 ? 40u : 20u) + 20 + 2000 && o.length[1] == n &&
+                  memcmp(o.packet[1], odd, n) == 0);
+            chmlink_gro_flush(&g);
+            CHECK(o.count == 2);
+            reset(&o);
+        }
+    }
+
     CHECK(chmlink_gro_init(&g, CHMLINK_MODE_IP, 65535, 0, memory, 100, collect, &o) == CHMLINK_BUFFER_TOO_SMALL);
     CHECK(chmlink_gro_init(&g, CHMLINK_MODE_IP, 65535, 2, memory, sizeof(memory), collect, &o) == CHMLINK_INVALID_ARGUMENT);
     CHECK(chmlink_gro_add(&g, NULL, 10) == CHMLINK_INVALID_ARGUMENT);

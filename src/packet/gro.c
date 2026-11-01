@@ -28,6 +28,7 @@ typedef struct segment {
     uint16_t payload_sum;
     int eligible;   /* may merge */
     int tcp;        /* has a flow identity */
+    int related;    /* may carry TCP of a held flow without showing its ports */
 } segment;
 
 /* Pseudo-header sum for a TCP length. */
@@ -62,11 +63,17 @@ static void parse(const chmlink_gro *g, const uint8_t *p, size_t length, segment
     ip = p + s->l3;
     s->version = ip[0] >> 4;
     if (s->version == 4) {
+        /* A TCP fragment, or TCP behind IP options, may belong to a held flow. */
+        s->related = ip[9] == 6;
         if ((ip[0] & 15) != 5 || ip[9] != 6 || be16(ip + 2) != length - s->l3) return;
         if ((ip[6] & 0x3f) || ip[7]) return;                  /* fragments have no ports */
         s->l4 = s->l3 + 20;
     } else if (s->version == 6) {
-        if (length < s->l3 + 40 || ip[6] != 6 || be16(ip + 4) != length - s->l3 - 40) return;
+        if (length < s->l3 + 40) return;
+        /* TCP behind extension headers (or a fragment of it) may belong to a
+         * held flow; such packets are not merged. */
+        s->related = ip[6] == 0 || ip[6] == 43 || ip[6] == 44 || ip[6] == 60 || ip[6] == 51;
+        if (ip[6] != 6 || be16(ip + 4) != length - s->l3 - 40) return;
         s->l4 = s->l3 + 40;
     } else {
         return;
@@ -103,6 +110,15 @@ static int same_flow(const chmlink_gro_flow *f, const uint8_t *p, const segment 
     if (s->l3 && memcmp(f->buffer, p, 14) != 0) return 0;
     return memcmp(f->buffer + f->l3 + at, p + s->l3 + at, addresses) == 0 &&
            memcmp(f->buffer + f->l4, p + s->l4, 4) == 0;
+}
+
+/* Same addresses (and link header): the flows a related packet may belong to. */
+static int same_hosts(const chmlink_gro_flow *f, const uint8_t *p, const segment *s)
+{
+    size_t addresses = s->version == 4 ? 8 : 32, at = s->version == 4 ? 12 : 8;
+    if (f->l3 != s->l3 || (f->buffer[f->l3] >> 4) != s->version) return 0;
+    if (s->l3 && memcmp(f->buffer, p, 14) != 0) return 0;
+    return memcmp(f->buffer + f->l3 + at, p + s->l3 + at, addresses) == 0;
 }
 
 /* The segment continues the held packet exactly. */
@@ -192,6 +208,14 @@ chmlink_result chmlink_gro_add(chmlink_gro *g, const uint8_t *p, size_t length)
     g->packets_in++;
     g->clock++;
     parse(g, p, length, &s);
+    if (!s.tcp && s.related) {
+        /* It may be TCP of a held flow in a form that does not show the ports:
+         * let out everything between these hosts first, to keep the order. */
+        for (i = 0; i < CHMLINK_GRO_FLOWS; ++i)
+            if (g->flows[i].length != 0 && same_hosts(&g->flows[i], p, &s)) flush_flow(g, &g->flows[i]);
+        emit(g, p, length, NULL);
+        return CHMLINK_OK;
+    }
     if (s.tcp) {
         for (i = 0; i < CHMLINK_GRO_FLOWS; ++i) {
             chmlink_gro_flow *c = &g->flows[i];

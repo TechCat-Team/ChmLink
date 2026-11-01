@@ -39,6 +39,44 @@ int chmlink_packet_valid(chmlink_mode mode, const uint8_t *data,
     return chmlink_ip_packet_valid(data, length, max_length);
 }
 
+/* Walk at most a few IPv6 extension headers (Hop-by-Hop, Routing,
+ * Destination Options, Authentication) to the upper-layer header, so a flow
+ * hashes alike with and without them. A Fragment header ends the walk: all
+ * fragments of a packet carry the same Next Header there, and none but the
+ * first carries the ports, so fragments hash without ports, as in IPv4. An
+ * atomic fragment (offset 0, no more fragments) is a whole packet and the walk
+ * goes on. Where the chain is cut short or unknown, the protocol is the last
+ * header type reached and *ports is cleared: stable for every packet of that
+ * shape. Returns the offset of the upper-layer header. */
+static size_t ipv6_upper_layer(const uint8_t *ip, size_t available, unsigned int *protocol, int *ports)
+{
+    size_t offset = 40;
+    unsigned int next = ip[6], hops;
+    for (hops = 0; hops < 8; ++hops) {
+        size_t length;
+        if (next == 0 || next == 43 || next == 60 || next == 51) {
+            if (available < offset + 8) break;
+            length = next == 51 ? ((size_t)ip[offset + 1] + 2) * 4 : ((size_t)ip[offset + 1] + 1) * 8;
+        } else if (next == 44) {
+            if (available < offset + 8) break;
+            if (((ip[offset + 2] << 8 | ip[offset + 3]) & 0xfff9u) != 0) {   /* offset or more fragments */
+                *protocol = ip[offset];
+                *ports = 0;
+                return offset + 8;
+            }
+            length = 8;
+        } else {
+            *protocol = next;
+            return offset;
+        }
+        next = ip[offset];
+        offset += length;
+    }
+    *protocol = next;
+    *ports = 0;
+    return offset;
+}
+
 /* One round of a multiplicative mix per 32-bit word. */
 static uint32_t mix(uint32_t hash, uint32_t word)
 {
@@ -105,10 +143,9 @@ uint32_t chmlink_flow_hash(chmlink_mode mode, const uint8_t *data, size_t length
         ports = (ip[6] & 0x3f) == 0 && ip[7] == 0;
     } else if (ip[0] >> 4 == 6) {
         if (available < 40) return 0;
-        header = 40;
-        protocol = ip[6];
         source = ip + 8; destination = ip + 24; size = 16;
         ports = 1;
+        header = ipv6_upper_layer(ip, available, &protocol, &ports);
     } else {
         return 0;
     }

@@ -454,7 +454,7 @@ session:
 |---|---|
 | `chmlink_packet_valid(mode, data, length, limit)` | the framing checks the driver applies |
 | `chmlink_ip_packet_valid(data, length, limit)` | one complete IPv4 or IPv6 packet |
-| `chmlink_flow_hash(mode, data, length)` | the flow hash the driver spreads by (symmetric; 0 for non-IP) |
+| `chmlink_flow_hash(mode, data, length)` | the flow hash the driver spreads by (symmetric, past IPv6 extension headers; fragments without ports; 0 for non-IP) |
 | `chmlink_checksum_add(data, length, seed)` | one's complement sum |
 | `chmlink_offload_complete(mode, packet, length, &offload)` | fill in a `NEEDS_CSUM` checksum |
 | `chmlink_gso_segment(...)` | cut a GSO packet into wire segments |
