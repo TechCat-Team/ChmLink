@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.16)
 project(chmlink LANGUAGES C)
 
+if(MSVC)
+    # VCRUNTIME linked in, the UCRT taken from Windows (in every Windows 10 and later):
+    # the binaries need only system DLLs, not the Visual C++ Redistributable.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_link_options("$<$<NOT:$<CONFIG:Debug>>:/NODEFAULTLIB:libucrt.lib>" "$<$<NOT:$<CONFIG:Debug>>:ucrt.lib>")
+endif()
+
 add_library(chmlink_packet STATIC src/packet/packet.c)
 target_include_directories(chmlink_packet PUBLIC include)
 target_compile_features(chmlink_packet PUBLIC c_std_99)

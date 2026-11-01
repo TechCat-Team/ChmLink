@@ -35,7 +35,8 @@ cmake --install build --config Release --prefix C:\sdk\chmlink
 `chmlink.sys` and `chmlink.cat` (see [development.md](development.md) for
 building and signing the driver). The DLL then carries the package as
 resources and installs it itself, so an application ships `chmlink.dll` and
-nothing else. Without it the DLL works the same, but
+nothing else: the C runtime is linked in except for the Universal CRT, which
+every Windows 10 has, so no Visual C++ Redistributable is needed. Without it the DLL works the same, but
 `chmlink_create_adapter` needs the path of an INF.
 
 The install step produces:
