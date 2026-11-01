@@ -3,7 +3,7 @@ Signature = "$WINDOWS NT$"
 Class = Net
 ClassGuid = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider = %Provider%
-DriverVer = 10/31/2026,0.5.1.0
+DriverVer = 11/01/2026,0.5.1.1
 CatalogFile = chmlink.cat
 PnpLockdown = 1
 
@@ -107,7 +107,7 @@ LoadOrderGroup = NDIS
 
 [Strings]
 Provider = "QZhua Team"
-DeviceDescription = "ChmLAN Link"
-IpDeviceDescription = "ChmLAN Link IP"
-ServiceDescription = "ChmLink Virtual Ethernet Adapter"
+DeviceDescription = "ChmLink Ethernet Adapter"
+IpDeviceDescription = "ChmLink IP Adapter"
+ServiceDescription = "ChmLink Virtual Network Adapter"
 DiskName = "ChmLink Driver Package"
