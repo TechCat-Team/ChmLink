@@ -582,7 +582,11 @@ function Register-ResumeTask {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Action Resume -RunId {1}' -f $frozen, $RunId)
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $trigger = New-ScheduledTaskTrigger -AtStartup
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 3) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    # Task Scheduler ends a task that runs past its limit, silently and with all its children. The lane's
+    # own deadline bounds every phase, so the limit follows it, with room for the restore after it.
+    # A fixed limit (3 h) once cut a long stress phase off in the middle.
+    $hours = [math]::Max(3, [math]::Ceiling((($script:deadline - (Get-Date)).TotalMinutes + 60) / 60))
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours $hours) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $resumeTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
 

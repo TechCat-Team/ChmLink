@@ -59,7 +59,8 @@ Only one run at a time; a second is refused with the id of the one holding the V
 
 ### The nightly lane (Driver Verifier)
 
-Phase A is the smoke lane. It then registers a startup task (`ChmLinkCiResume`, SYSTEM), turns on the
+Phase A is the smoke lane. It then registers a startup task (`ChmLinkCiResume`, SYSTEM; its run-time limit
+follows the lane's deadline, since Task Scheduler silently ends a task past its limit), turns on the
 **persistent** verifier setting for `chmlink.sys` (the standard options plus NDIS/WiFi verification,
 `0x2209BB`) and reboots. The fault-injection phases below use the standard options only: with NDIS
 verification the injection also fails NDIS's own allocations for the miniport, and AddDevice then fails
