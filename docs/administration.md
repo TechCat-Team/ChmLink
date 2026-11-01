@@ -1,5 +1,7 @@
 # Administration
 
+**English** | [简体中文](zh-CN/administration.md)
+
 Managing adapters and driver packages without writing code: for scripts,
 operations and recovery. Applications normally use the SDK instead
 ([sdk.md](sdk.md)). Everything here needs an elevated prompt.

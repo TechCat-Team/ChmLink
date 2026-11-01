@@ -1,5 +1,7 @@
 # Performance
 
+**English** | [简体中文](zh-CN/performance.md)
+
 All figures come from one test VM: an AMD Ryzen 9 9950X host, 4 vCPUs and
 32 GB for the guest, Windows 11 build 26200, package 0.5.1.0, medians of three
 runs. They measure the adapter and the Windows stack on one machine; there is

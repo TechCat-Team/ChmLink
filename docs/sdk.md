@@ -1,5 +1,7 @@
 # ChmLink SDK
 
+**English** | [简体中文](zh-CN/sdk.md)
+
 The SDK is a C library, `chmlink.dll`, with headers in `include/chmlink/`. It
 creates and deletes virtual adapters, installs the driver they need, and moves
 packets between your application and the Windows network stack.
@@ -35,8 +37,9 @@ cmake --install build --config Release --prefix C:\sdk\chmlink
 `chmlink.sys` and `chmlink.cat` (see [development.md](development.md) for
 building and signing the driver). The DLL then carries the package as
 resources and installs it itself, so an application ships `chmlink.dll` and
-nothing else: the C runtime is linked in except for the Universal CRT, which
-every Windows 10 has, so no Visual C++ Redistributable is needed. Without it the DLL works the same, but
+nothing else. The C runtime is linked in, except for the Universal CRT that
+every Windows 10 has, so no Visual C++ Redistributable is needed. Built
+without `CHMLINK_DRIVER_DIR`, the DLL works the same, but
 `chmlink_create_adapter` needs the path of an INF.
 
 The install step produces:
@@ -535,7 +538,7 @@ and a driver keeps speaking older contracts within a major version, so:
 | `ERROR_SHUTDOWN_IN_PROGRESS` | the system shuts down |
 | `ERROR_REVISION_MISMATCH` | the driver and SDK do not share a contract, or the package is unusable |
 | `ERROR_DUP_NAME` | the name, MAC or identity is in use |
-| `ERROR_BUSY` | another process is changing adapters; or a second waiter |
+| `ERROR_BUSY` | another process is changing adapters; an adapter with an open session blocks a driver change; or a second waiter |
 | `ERROR_INSTALL_FAILURE` | a change was only partly applied; inspect the adapter |
 | `ERROR_RESOURCE_NAME_NOT_FOUND` | no INF given and the DLL embeds no driver |
 | `ERROR_INF_IN_USE_BY_DEVICES` | `chmlink_delete_driver` while adapters exist |

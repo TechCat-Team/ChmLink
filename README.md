@@ -1,5 +1,7 @@
 # ChmLink
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![Check](https://github.com/TechCat-Team/ChmLink/actions/workflows/check.yml/badge.svg)](https://github.com/TechCat-Team/ChmLink/actions/workflows/check.yml)
 [![Driver](https://github.com/TechCat-Team/ChmLink/actions/workflows/driver.yml/badge.svg)](https://github.com/TechCat-Team/ChmLink/actions/workflows/driver.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

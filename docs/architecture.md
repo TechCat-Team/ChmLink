@@ -1,5 +1,7 @@
 # Architecture
 
+**English** | [简体中文](zh-CN/architecture.md)
+
 How the driver and the SDK work. For using the SDK, see [sdk.md](sdk.md).
 
 ## Components

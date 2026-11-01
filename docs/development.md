@@ -1,5 +1,7 @@
 # Development
 
+**English** | [简体中文](zh-CN/development.md)
+
 Building, testing and changing ChmLink.
 
 ## Layout
