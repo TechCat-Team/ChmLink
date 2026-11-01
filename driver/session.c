@@ -8,8 +8,13 @@ NTSYSAPI NTSTATUS NTAPI ZwYieldExecution(VOID);
 /* How long a queue thread polls an empty ring before it sleeps: a wake-up
  * costs the application a system call and the packet a thread switch, and at
  * high rates or in a request-response exchange the next record usually comes
- * within this time. Yielding while polling leaves the core to other threads. */
-#define CL_RX_POLL_DIVISOR 10000   /* 1/10000 s = 100 microseconds */
+ * within this time. Yielding while polling leaves the core to other threads.
+ * Polling is skipped while packets have recently taken longer than
+ * CL_RX_POLL_WORTH_US to come: with packets that far apart polling would only
+ * keep a core busy. A request-response exchange stays under it even without
+ * polling, so it turns polling back on. */
+#define CL_RX_POLL_US 100
+#define CL_RX_POLL_WORTH_US 64
 
 /* A session owns shared-memory rings (chmlink/ring.h): one the driver
  * produces into from ClSend, and one to CHMLINK_INJECT_RINGS_MAX the
@@ -119,29 +124,51 @@ void ClSessionReturnLists(CL_ADAPTER *a, PNET_BUFFER_LIST lists)
         KeSetEvent(&a->RxDrained, IO_NO_INCREMENT, FALSE);
 }
 
+/* A packet came: how long the ring had been empty, smoothed. Wake-ups without
+ * data (a return of indicated packets, a state change) do not count. */
+static void learn_gap(CL_RXQ *q, LONGLONG now, LONGLONG window)
+{
+    LONGLONG sample = now - q->EmptySince;
+    if (sample > 16 * window) sample = 16 * window;
+    q->IdleGap += (sample - q->IdleGap) / 8;
+    q->EmptySince = 0;
+}
+
+/* An empty ring: poll it first, while packets have recently come within
+ * CL_RX_POLL_WORTH_US of the ring going empty, then sleep until the
+ * application publishes. */
 static void wait_idle(CL_RXQ *q, BOOLEAN data)
 {
     CL_SESSION *s = q->Session;
     PVOID objects[3];
+    LARGE_INTEGER frequency, start, now;
+    LONGLONG window, threshold;
     if (!data) {
         objects[0] = &s->StopEvent;
         objects[1] = &q->StateEvent;
         KeWaitForMultipleObjects(2, objects, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
         return;
     }
-    {
-        LARGE_INTEGER frequency, start = KeQueryPerformanceCounter(&frequency), now;
+    start = KeQueryPerformanceCounter(&frequency);
+    window = frequency.QuadPart * CL_RX_POLL_US / 1000000;
+    threshold = frequency.QuadPart * CL_RX_POLL_WORTH_US / 1000000;
+    if (q->EmptySince == 0) q->EmptySince = start.QuadPart;
+    if (q->IdleGap < threshold) {
         for (;;) {
-            if (chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET) != q->ReadCursor) return;
-            if (s->Stop || q->Stop) return;
             now = KeQueryPerformanceCounter(NULL);
-            if (now.QuadPart - start.QuadPart >= frequency.QuadPart / CL_RX_POLL_DIVISOR) break;
+            if (chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET) != q->ReadCursor) {
+                learn_gap(q, now.QuadPart, window);
+                return;
+            }
+            if (s->Stop || q->Stop) return;
+            if (now.QuadPart - start.QuadPart >= window) break;
             ZwYieldExecution();
         }
     }
     chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 1);
     if (chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET) != q->ReadCursor) {
         chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 0);
+        learn_gap(q, KeQueryPerformanceCounter(NULL).QuadPart, window);
         return;
     }
     objects[0] = q->Ring.Event;
@@ -149,6 +176,8 @@ static void wait_idle(CL_RXQ *q, BOOLEAN data)
     objects[2] = &q->StateEvent;
     KeWaitForMultipleObjects(3, objects, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
     chmlink_ring_store(&q->Ring.View, CHMLINK_RING_WAIT_OFFSET, 0);
+    if (chmlink_ring_load(&q->Ring.View, CHMLINK_RING_TAIL_OFFSET) != q->ReadCursor)
+        learn_gap(q, KeQueryPerformanceCounter(NULL).QuadPart, window);
 }
 
 /* Indicate a chain, or hand it back when the data path stopped meanwhile. */

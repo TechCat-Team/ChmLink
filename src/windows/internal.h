@@ -78,6 +78,7 @@ struct chmlink_adapter {
 
     SRWLOCK rx_lock;
     uint32_t rx_cursor;            /* next record to read */
+    LONGLONG wait_gap;             /* smoothed time from a wait's start to data, QPC ticks (wait.c) */
     chmlink_rx_entry *rx_entries;
     uint32_t rx_count, rx_entries_capacity, rx_head;
 

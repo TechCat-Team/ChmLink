@@ -251,6 +251,11 @@ chmlink_close(adapter);
 | `chmlink_inspect(index, &info)` | the same without opening a session |
 | `chmlink_enumerate(callback, context)` | `chmlink_adapter_info` of every adapter |
 
+A session locks its rings in memory: 8 MiB with the default 4 MiB rings, plus
+one more ring for each additional sending thread (up to 20 MiB). The driver
+runs one thread per sending ring and up to four flow workers per session; the
+SDK starts no threads in your process.
+
 Opening fails with `ERROR_SHARING_VIOLATION` when another session is open,
 `ERROR_ACCESS_DENIED` without administrator rights, and
 `ERROR_REVISION_MISMATCH` when the driver cannot serve this SDK.
@@ -355,8 +360,9 @@ for (;;) {
 
 - `chmlink_wait_readable(adapter, timeout_ms)` returns when packets from
   Windows are available. `0` polls; `CHMLINK_WAIT_INFINITE` has no limit.
-  It polls the ring briefly before sleeping, which keeps latency low at high
-  packet rates.
+  While packets have recently come within 64 µs, it polls the ring that long
+  before sleeping, which keeps latency low at high packet rates and in
+  request-response traffic; with packets further apart it sleeps at once.
 - One waiter per session (`ERROR_BUSY` for a second one).
 - Failures: `ERROR_TIMEOUT`; `ERROR_OPERATION_ABORTED` (cancelled, closed, or
   the session ended); `ERROR_NOT_READY` (paused or asleep); device removal

@@ -14,14 +14,22 @@ int chmlink_cancel_wait(chmlink_adapter *a)
     return 1;
 }
 
-/* About 20-50 microseconds of PAUSE on current x86 cores. */
-#define CHMLINK_WAIT_SPIN 2048u
+/* Before sleeping, a wait polls the ring for up to CHMLINK_WAIT_POLL_US, but
+ * only while packets have recently come within that time of a wait's start
+ * (CHMLINK_WAIT_POLL_US is also the threshold): at high rates and in
+ * request-response traffic polling spares a sleep and a wake-up per packet and
+ * keeps latency low; with packets further apart it would only keep the core
+ * busy. A request-response exchange stays under the threshold even without
+ * polling, so it turns polling back on. */
+#define CHMLINK_WAIT_POLL_US 64
 
 int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
 {
     HANDLE events[3];
     ULONGLONG started = GetTickCount64();
-    int result = 0;
+    LARGE_INTEGER frequency, entered, now;
+    LONGLONG window, sample;
+    int result = 0, poll;
     DWORD error = ERROR_SUCCESS, remaining = timeout_ms;
     if (!sdk_enter(a, NULL)) return 0;
     AcquireSRWLockExclusive(&a->gate);
@@ -34,6 +42,10 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
     ResetEvent(a->cancel_event);
     ReleaseSRWLockExclusive(&a->gate);
     events[0] = a->close_event; events[1] = a->cancel_event; events[2] = a->from_event;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&entered);
+    window = frequency.QuadPart * CHMLINK_WAIT_POLL_US / 1000000;
+    poll = a->wait_gap < window;
     for (;;) {
         uint32_t state;
         ULONGLONG elapsed;
@@ -54,13 +66,21 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
         /* Poll briefly first: at high packet rates the next record arrives
          * within microseconds, and staying out of the alertable state spares
          * the driver a KeSetEvent and us a sleep and wake per few packets. */
-        {
+        if (poll) {
+            LARGE_INTEGER spun;
             unsigned spin;
-            for (spin = 0; spin < CHMLINK_WAIT_SPIN; ++spin) {
-                if (chmlink_ring_load(&a->from, CHMLINK_RING_TAIL_OFFSET) != a->rx_cursor) break;
-                YieldProcessor();
+            BOOL arrived = FALSE;
+            QueryPerformanceCounter(&spun);
+            for (;;) {
+                for (spin = 0; spin < 32; ++spin) {
+                    if (chmlink_ring_load(&a->from, CHMLINK_RING_TAIL_OFFSET) != a->rx_cursor) { arrived = TRUE; break; }
+                    YieldProcessor();
+                }
+                QueryPerformanceCounter(&now);
+                if (arrived || now.QuadPart - spun.QuadPart >= window) break;
             }
-            if (spin < CHMLINK_WAIT_SPIN) continue;
+            poll = FALSE;   /* once per wait */
+            if (arrived) continue;
         }
         /* Announce that a wake-up is needed before re-reading the tail, so a
          * publish cannot slip between the check and the wait. */
@@ -76,6 +96,11 @@ int chmlink_wait_readable(chmlink_adapter *a, uint32_t timeout_ms)
         }
         if (wait == WAIT_FAILED) { error = GetLastError(); break; }
     }
+    /* How long packets took to come, smoothed; only the one waiter updates it. */
+    QueryPerformanceCounter(&now);
+    sample = now.QuadPart - entered.QuadPart;
+    if (sample > 16 * window) sample = 16 * window;
+    a->wait_gap += (sample - a->wait_gap) / 8;
     AcquireSRWLockExclusive(&a->gate);
     a->waiting = FALSE;
     ReleaseSRWLockExclusive(&a->gate);

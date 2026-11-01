@@ -88,6 +88,8 @@ typedef struct CL_RXQ {
     KSPIN_LOCK BatchLock;
     uint32_t NextBatchId;
     LONG Outstanding;       /* this queue's NBLs not yet returned */
+    LONGLONG IdleGap;       /* smoothed time the ring stays empty before data, QPC ticks */
+    LONGLONG EmptySince;    /* QPC time the ring was found empty; 0 while it has data */
     KEVENT StateEvent;      /* auto-reset: state change or a return */
     PETHREAD Thread;
     BOOLEAN Stop;           /* this queue only (a failed ADD_INJECT_RING) */

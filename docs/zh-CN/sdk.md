@@ -222,6 +222,9 @@ chmlink_close(adapter);
 | `chmlink_inspect(index, &info)` | 同上，但不打开会话 |
 | `chmlink_enumerate(callback, context)` | 每块网卡的 `chmlink_adapter_info` |
 
+会话会把环形队列锁定在内存中：使用默认的 4 MiB 环形队列时为 8 MiB，每多一个发送线程再加一个环形队列（最多 20 MiB）。
+驱动为每个发送环形队列运行一个线程，每个会话另有最多四个按流分发的工作线程；SDK 不会在你的进程中创建线程。
+
 打开会话失败的情况：已有其他会话打开时为 `ERROR_SHARING_VIOLATION`，没有管理员权限时为
 `ERROR_ACCESS_DENIED`，驱动无法为本 SDK 提供服务时为 `ERROR_REVISION_MISMATCH`。
 
@@ -312,7 +315,8 @@ for (;;) {
 ```
 
 - `chmlink_wait_readable(adapter, timeout_ms)` 在有来自 Windows 的数据包时返回。`0` 表示只检查不等待；
-  `CHMLINK_WAIT_INFINITE` 表示不限时。它在休眠前会先短暂轮询环形队列，使高包速下的延迟保持很低。
+  `CHMLINK_WAIT_INFINITE` 表示不限时。如果最近的包都在 64 µs 内到达，它会在休眠前轮询环形队列这么长时间，
+  使高包速和请求-响应式流量下的延迟保持很低；包间隔更长时则立即休眠。
 - 每个会话只能有一个等待者（第二个会得到 `ERROR_BUSY`）。
 - 失败情况：`ERROR_TIMEOUT`；`ERROR_OPERATION_ABORTED`（被取消、会话关闭或会话结束）；
   `ERROR_NOT_READY`（暂停或睡眠）；设备移除相关的错误；`ERROR_SHUTDOWN_IN_PROGRESS`。
