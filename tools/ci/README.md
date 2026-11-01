@@ -26,8 +26,8 @@ not `~\.ssh`; it must be writable only by Administrators and SYSTEM).
 ```sh
 tools/ci/vm-run.sh init --baseline-dir 'C:\path\on\vm\to\signed'   # once; see "VM prerequisites"
 tools/ci/vm-run.sh doctor                    # is the VM ready?
-tools/ci/vm-run.sh run smoke                 # HEAD: build, ctest, install, lifecycle, IP   (~70 s)
-tools/ci/vm-run.sh run full                  # smoke + 3x benchmark gated on the baseline    (~6.5 min)
+tools/ci/vm-run.sh run smoke                 # HEAD: build, ctest, install, lifecycle, IP   (~1.5 min)
+tools/ci/vm-run.sh run full                  # smoke + 3x benchmark gated on the baseline    (~8.5 min)
 tools/ci/vm-run.sh run nightly               # smoke + Driver Verifier + two kinds of fault injection, four reboots
 tools/ci/vm-run.sh run nightly --stress-minutes 1 --lowres-minutes 2 --systematic-minutes 3   # quick (~18 min)
 #   defaults: 20 stress, 10 randomized and 5 systematic fault-injection minutes (0 skips a phase), or

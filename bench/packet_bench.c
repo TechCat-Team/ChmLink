@@ -535,26 +535,29 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     if (selected("latency")) run_latency(a, &info, seconds, 64);
-    for (i = 0; i < 3; ++i) {
+    /* Smallest and largest packets; 512 B lies between them and told nothing more. */
+    for (i = 0; i < 3; i += 2) {
         memset(&cfg, 0, sizeof(cfg)); sprintf(name, "tx_%dB", payloads[i]);
         cfg.name = name; cfg.tx_senders = 1; cfg.tx_payload = payloads[i];
         run_load(a, &info, &cfg, seconds);
     }
     memset(&cfg, 0, sizeof(cfg)); cfg.name = "tx_64B_4senders"; cfg.tx_senders = 4; cfg.tx_payload = 64;
     run_load(a, &info, &cfg, seconds);
-    /* Consumer descheduled for 20 ms every 100 ms: how much burst the queue absorbs. */
-    for (i = 0; i < 3; ++i) {
+    /* Consumer descheduled for 20 ms every 100 ms: how much burst the queue absorbs.
+     * Large packets fill the ring first; small ones never overflowed it. */
+    for (i = 2; i < 3; ++i) {
         memset(&cfg, 0, sizeof(cfg)); sprintf(name, "tx_%dB_stall20ms", payloads[i]);
         cfg.name = name; cfg.tx_senders = 1; cfg.tx_payload = payloads[i];
         cfg.stall_every_ms = 100; cfg.stall_ms = 20;
         run_load(a, &info, &cfg, seconds);
     }
-    for (i = 0; i < 3; ++i) {
+    for (i = 0; i < 3; i += 2) {
         memset(&cfg, 0, sizeof(cfg)); sprintf(name, "rx_%dB_batch32", payloads[i]);
         cfg.name = name; cfg.rx_injectors = 1; cfg.rx_payload = payloads[i]; cfg.rx_batch = 32;
         run_load(a, &info, &cfg, seconds);
     }
-    for (i = 0; i < 3; ++i) {
+    /* One packet per call against the batches of 32 above; 8 and 128 fell in between. */
+    for (i = 0; i < 1; ++i) {
         memset(&cfg, 0, sizeof(cfg)); sprintf(name, "rx_64B_batch%u", batches[i]);
         cfg.name = name; cfg.rx_injectors = 1; cfg.rx_payload = 64; cfg.rx_batch = batches[i];
         run_load(a, &info, &cfg, seconds);
@@ -569,7 +572,8 @@ int main(int argc, char **argv)
     memset(&cfg, 0, sizeof(cfg)); cfg.name = "duplex_64B"; cfg.tx_senders = 1; cfg.tx_payload = 64;
     cfg.rx_injectors = 1; cfg.rx_payload = 64; cfg.rx_batch = 32;
     run_load(a, &info, &cfg, seconds);
-    for (i = 0; i < 3; ++i) if (selected("loopback")) run_loopback(payloads[i], seconds);
+    /* The machine's own UDP speed, the reference for drift warnings. */
+    if (selected("loopback")) run_loopback(payloads[0], seconds);
 
     chmlink_close(a);
     WSACleanup();

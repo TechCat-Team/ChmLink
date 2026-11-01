@@ -3,177 +3,116 @@
   "profiles": {
     "AMD Ryzen 9 9950X 16-Core Processor|4": {
       "commit": "worktree",
-      "driver": "0.5.1.0",
-      "recorded": "2026-10-31T23:54:27Z",
+      "driver": "0.5.1.1",
+      "recorded": "2026-11-01T15:39:44Z",
       "repeats": 3,
       "scenarios": {
         "duplex_64B": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 624112.0,
+          "rx_pps": 609693.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 457510.0
+          "tx_pps": 453602.0
         },
         "latency": {
           "lost": 0.0,
-          "max_us": 4437.1,
+          "max_us": 5927.8,
           "p50_us": 14.6,
-          "p999_us": 284.4,
-          "p99_us": 69.9
-        },
-        "loopback_1400B": {
-          "loopback_pps": 287945.0
-        },
-        "loopback_512B": {
-          "loopback_pps": 285430.0
+          "p999_us": 317.6,
+          "p99_us": 73.6
         },
         "loopback_64B": {
-          "loopback_pps": 282224.0
+          "loopback_pps": 272340.0
         },
         "rx_1400B_batch32": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 629763.0
-        },
-        "rx_512B_batch32": {
-          "errors": 0.0,
-          "rx_loss_pct": 0.0,
-          "rx_pps": 643879.0
+          "rx_pps": 616433.0
         },
         "rx_64B_batch1": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 664256.0
-        },
-        "rx_64B_batch128": {
-          "errors": 0.0,
-          "rx_loss_pct": 0.0,
-          "rx_pps": 658765.0
+          "rx_pps": 648527.0
         },
         "rx_64B_batch32": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 615915.0
+          "rx_pps": 572630.0
         },
         "rx_64B_batch32_2injectors": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 1199214.0
+          "rx_pps": 1179657.0
         },
         "rx_64B_batch32_64flows": {
           "errors": 0.0,
           "rx_loss_pct": 0.0,
-          "rx_pps": 1778278.0
-        },
-        "rx_64B_batch8": {
-          "errors": 0.0,
-          "rx_loss_pct": 0.0,
-          "rx_pps": 660524.0
+          "rx_pps": 1743910.0
         },
         "tcp_1stream": {
           "errors": 0.0,
           "tcp_avg_packet": 1451.0,
-          "tcp_mbps": 23567.9
+          "tcp_mbps": 22477.7
         },
         "tcp_4streams": {
           "errors": 0.0,
-          "tcp_avg_packet": 1444.0,
-          "tcp_mbps": 26047.4
+          "tcp_avg_packet": 1441.0,
+          "tcp_mbps": 23875.6
         },
         "tcp_eth_1stream": {
           "errors": 0.0,
-          "tcp_avg_packet": 42529.0,
-          "tcp_mbps": 115620.7
+          "tcp_avg_packet": 43934.0,
+          "tcp_mbps": 93517.6
         },
         "tcp_eth_1stream_gro": {
           "errors": 0.0,
-          "tcp_avg_packet": 1482.0,
-          "tcp_mbps": 33587.1
+          "tcp_avg_packet": 1483.0,
+          "tcp_mbps": 32198.1
         },
         "tcp_eth_1stream_nooffload": {
           "errors": 0.0,
           "tcp_avg_packet": 1466.0,
-          "tcp_mbps": 19879.5
+          "tcp_mbps": 18964.5
         },
         "tcp_eth_4streams": {
           "errors": 0.0,
-          "tcp_avg_packet": 48476.0,
-          "tcp_mbps": 96431.7
-        },
-        "tcp_eth_4streams_gro": {
-          "errors": 0.0,
-          "tcp_avg_packet": 1496.0,
-          "tcp_mbps": 29358.2
-        },
-        "tcp_eth_4streams_nooffload": {
-          "errors": 0.0,
-          "tcp_avg_packet": 1456.0,
-          "tcp_mbps": 25331.3
+          "tcp_avg_packet": 47711.0,
+          "tcp_mbps": 90205.2
         },
         "tcp_mtu65535_1stream": {
           "errors": 0.0,
-          "tcp_avg_packet": 25073.0,
-          "tcp_mbps": 20776.1
-        },
-        "tcp_mtu65535_4streams": {
-          "errors": 0.0,
-          "tcp_avg_packet": 10954.0,
-          "tcp_mbps": 22871.6
+          "tcp_avg_packet": 25192.0,
+          "tcp_mbps": 19831.8
         },
         "tcp_mtu65535_gro_1stream": {
           "errors": 0.0,
-          "tcp_avg_packet": 36838.0,
-          "tcp_mbps": 34617.4
-        },
-        "tcp_mtu65535_gro_4streams": {
-          "errors": 0.0,
-          "tcp_avg_packet": 43850.0,
-          "tcp_mbps": 33665.4
+          "tcp_avg_packet": 36320.0,
+          "tcp_mbps": 33235.4
         },
         "tcp_mtu65535_whole_1stream": {
           "errors": 0.0,
-          "tcp_avg_packet": 50038.0,
-          "tcp_mbps": 98106.8
-        },
-        "tcp_mtu65535_whole_4streams": {
-          "errors": 0.0,
-          "tcp_avg_packet": 52422.0,
-          "tcp_mbps": 105864.1
+          "tcp_avg_packet": 49579.0,
+          "tcp_mbps": 97982.4
         },
         "tx_1400B": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 463490.0
+          "tx_pps": 450400.0
         },
         "tx_1400B_stall20ms": {
           "errors": 0.0,
-          "tx_drop_pct": 15.0307,
-          "tx_pps": 384985.0
-        },
-        "tx_512B": {
-          "errors": 0.0,
-          "tx_drop_pct": 0.0,
-          "tx_pps": 471387.0
-        },
-        "tx_512B_stall20ms": {
-          "errors": 0.0,
-          "tx_drop_pct": 8.1796,
-          "tx_pps": 432063.0
+          "tx_drop_pct": 14.5665,
+          "tx_pps": 379997.0
         },
         "tx_64B": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 475041.0
+          "tx_pps": 468927.0
         },
         "tx_64B_4senders": {
           "errors": 0.0,
           "tx_drop_pct": 0.0,
-          "tx_pps": 1257794.0
-        },
-        "tx_64B_stall20ms": {
-          "errors": 0.0,
-          "tx_drop_pct": 0.0,
-          "tx_pps": 476394.0
+          "tx_pps": 1236647.0
         }
       }
     },

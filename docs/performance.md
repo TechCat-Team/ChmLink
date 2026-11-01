@@ -48,7 +48,7 @@ packet per read or write request and stays an order of magnitude behind.
 |---|---|
 | UDP from Windows, one sender, 64 / 1400 B | 475k / 463k pps |
 | UDP from Windows, four senders, 64 B | 1.26M pps |
-| UDP to Windows, one thread, one flow, batches of 1 / 32 / 128 | 664k / 616k / 659k pps |
+| UDP to Windows, one thread, one flow, batches of 1 / 32 | 664k / 616k pps |
 | UDP to Windows, one thread, 64 flows | 1.78M pps |
 | UDP to Windows, two threads | 1.20M pps |
 | both directions at once, 64 B | 624k to / 458k from Windows |
@@ -56,9 +56,9 @@ packet per read or write request and stays an order of magnitude behind.
 | TCP, IP mode, one / four streams | 23.6 / 26.0 Gbps |
 | TCP, IP mode at MTU 65535, cut to 1500 before injecting | 20.8 Gbps |
 | … and merged again by `chmlink_coalescer` | 34.6 Gbps |
-| … injected whole | 98–106 Gbps |
-| TCP, Ethernet mode, no offloads, one / four streams | 19.9 / 25.3 Gbps |
-| TCP, Ethernet mode, 1500-byte frames merged into RSC by `chmlink_coalescer` | 33.6 / 29.4 Gbps |
+| … injected whole | 98 Gbps |
+| TCP, Ethernet mode, no offloads | 19.9 Gbps |
+| TCP, Ethernet mode, 1500-byte frames merged into RSC by `chmlink_coalescer` | 33.6 Gbps |
 | TCP, Ethernet mode, LSO and RSC, one / four streams | 116 / 96 Gbps |
 
 A consumer that stalls for 20 ms every 100 ms still receives 85% to 100% of the

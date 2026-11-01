@@ -624,7 +624,8 @@ int main(int argc, char **argv)
             fflush(stdout);
             Sleep(1500);   /* let the stack apply the new offload indication */
             run(a, &info, 1, seconds, suffix);
-            if (streams_max > 1) run(a, &info, streams_max, seconds, suffix);
+            /* Several streams only with every offload, where they scale differently. */
+            if (streams_max > 1 && (!offered || m == 2)) run(a, &info, streams_max, seconds, suffix);
         }
     }
     InterlockedExchange(&stop_reflector, 1);

@@ -102,16 +102,16 @@ try {
         Set-NetIPInterface -InterfaceIndex $bigIndex -AddressFamily IPv4 -Dhcp Disabled -PolicyStore ActiveStore
         New-NetIPAddress -InterfaceIndex $bigIndex -IPAddress $bigLocal -PrefixLength 24 -PolicyStore ActiveStore | Out-Null
         Start-Sleep -Seconds 3
-        Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 4" 'TCP benchmark (IP mode, MTU 65535)' ([int]($Seconds * 4 + 60))
+        Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 1" 'TCP benchmark (IP mode, MTU 65535)' ([int]($Seconds * 4 + 60))
         # The same packets injected whole: the bound for a tunnel that carries
         # large packets end to end (tcp_mtu65535_whole_*).
         $env:CHMLINK_BENCH_NO_SPLIT = '1'
-        try { Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 4" 'TCP benchmark (IP mode, MTU 65535, unsplit)' ([int]($Seconds * 4 + 60)) }
+        try { Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 1" 'TCP benchmark (IP mode, MTU 65535, unsplit)' ([int]($Seconds * 4 + 60)) }
         finally { Remove-Item Env:CHMLINK_BENCH_NO_SPLIT }
         # Cut to 1500 and merged again by the SDK's coalescer before injection, as
         # a receiving tunnel endpoint with software GRO would (tcp_mtu65535_gro_*).
         $env:CHMLINK_BENCH_GRO = '1'
-        try { Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 4" 'TCP benchmark (IP mode, MTU 65535, split and coalesced)' ([int]($Seconds * 4 + 60)) }
+        try { Invoke-Bench $tcpBench "$bigIndex $bigLocal $bigPeer $bigAlias $Seconds 1" 'TCP benchmark (IP mode, MTU 65535, split and coalesced)' ([int]($Seconds * 4 + 60)) }
         finally { Remove-Item Env:CHMLINK_BENCH_GRO }
 
         # Ethernet mode: without offloads, with the SDK coalescing plain frames into

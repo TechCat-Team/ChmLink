@@ -607,6 +607,8 @@ function New-SuiteRunner([string]$InfPath, [string]$BuildDir) {
             (Join-Path $script:srcDir "tools\$script"), $script:suiteInf, $script:suiteBuild, $Directory
         if ($Kind -eq 'bench') { $arguments += ' -Seconds 3'; if ($Filter) { $arguments += " -Filter $Filter" } }
         if ($Kind -eq 'lowres') { $arguments += " -Minutes $Filter" }
+        # Smoke and full fuzz the IOCTLs briefly; the nightly lane keeps the default under Verifier.
+        if ($Kind -eq 'lifecycle' -and ($Lane -eq 'smoke' -or $Lane -eq 'full')) { $arguments += ' -FuzzSeconds 5' }
         # Sleep and resume need platform support and put the VM to sleep; opt in with PowerTests.
         if ($Kind -eq 'lifecycle' -and $script:powerTests) { $arguments += ' -PowerCycle' }
         Invoke-Process "$Kind suite" 'powershell.exe' $arguments $Timeout

@@ -86,7 +86,7 @@ disposable VM with the signed package:
 `tools/ci/vm-run.sh` drives all of them from a Linux or macOS machine: it
 builds a commit on the VM, signs it with the VM's test certificate, installs it
 over a baseline driver, runs the suites, and restores the baseline. Lanes:
-`smoke` (about 2 minutes), `full` (plus three benchmark rounds gated against a
+`smoke` (about 1.5 minutes), `full` (plus three benchmark rounds gated against a
 recorded baseline), `nightly` (plus Driver Verifier, randomized and systematic
 low-resources simulation, leak checks and reboots). See
 [tools/ci/README.md](../tools/ci/README.md).
