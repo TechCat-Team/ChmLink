@@ -22,6 +22,16 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
+  # ARM64 Windows: cross-built only, tested on an emulated machine (tools/test-arm64.ps1).
+  windows-arm64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A ARM64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBUILD_TESTING=OFF
+      - name: Build
+        run: cmake --build build --config Release
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

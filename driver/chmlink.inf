@@ -3,18 +3,27 @@ Signature = "$WINDOWS NT$"
 Class = Net
 ClassGuid = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider = %Provider%
-DriverVer = 11/02/2026,0.5.1.4
+DriverVer = 11/02/2026,0.5.1.5
 CatalogFile = chmlink.cat
 PnpLockdown = 1
 
 [Manufacturer]
-%Provider% = Models,NTamd64.10.0...14393,NTamd64.10.0...25319
+%Provider% = Models,NTamd64.10.0...14393,NTamd64.10.0...25319,NTarm64.10.0...16299,NTarm64.10.0...25319
 
 [Models.NTamd64.10.0...14393]
 %DeviceDescription% = InstallLegacy, Root\ChmLink
 %IpDeviceDescription% = InstallIpLegacy, Root\ChmLinkIP
 
 [Models.NTamd64.10.0...25319]
+%DeviceDescription% = InstallStore, Root\ChmLink
+%IpDeviceDescription% = InstallIpStore, Root\ChmLinkIP
+
+; ARM64 Windows starts at 1709 (16299).
+[Models.NTarm64.10.0...16299]
+%DeviceDescription% = InstallLegacy, Root\ChmLink
+%IpDeviceDescription% = InstallIpLegacy, Root\ChmLinkIP
+
+[Models.NTarm64.10.0...25319]
 %DeviceDescription% = InstallStore, Root\ChmLink
 %IpDeviceDescription% = InstallIpStore, Root\ChmLinkIP
 

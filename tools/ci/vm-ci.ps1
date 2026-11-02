@@ -56,6 +56,13 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# IMAGE_FILE_HEADER.Machine of a PE file (0x8664 x64, 0xAA64 ARM64).
+function Get-PeMachine([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+    [BitConverter]::ToUInt16($bytes, $pe + 4)
+}
+
 function Get-Sha256([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
 
 function Get-InstalledImageHash {
@@ -1054,6 +1061,58 @@ function Invoke-Run {
             # chmlink.dll with the signed candidate inside, as applications ship it.
             Invoke-Process 'cmake configure (embedded)' 'cmake.exe' ('-S . -B build/embedded -G "Visual Studio 17 2022" -A x64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBUILD_TESTING=OFF "-DCHMLINK_DRIVER_DIR={0}"' -f $signed) 300 $script:srcDir
             Invoke-Process 'cmake build (embedded)' 'cmake.exe' '--build build/embedded --config Release --target chmlink-quickstart chmlink-package-test -- /m /v:minimal /nologo' 600 $script:srcDir
+        }
+        if ($Lane -eq 'full') {
+            Invoke-Stage 'build-arm64' {
+                # ARM64 is cross-built and signed here, then run on an emulated ARM64 Windows
+                # (tools/test-arm64.ps1); this x64 VM only checks that it builds. The kit holds
+                # everything that machine needs.
+                Invoke-Process 'build driver (arm64)' 'powershell.exe' ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`" -Arch arm64 -KitRoot `"{1}`" -Output `"{2}`"" -f `
+                    (Join-Path $script:srcDir 'tools\build-driver.ps1'), $config.WdkRoot, (Join-Path $script:srcDir 'build\driver-arm64')) 900 $script:srcDir
+                $kit = Join-Path $script:srcDir 'build\arm64-kit'
+                if (Test-Path -LiteralPath $kit) { Remove-Item -LiteralPath $kit -Recurse -Force }
+                $kitSigned = Join-Path $kit 'signed'; $kitOld = Join-Path $kit 'signed-old'
+                New-Item -ItemType Directory -Force $kitSigned, $kitOld, (Join-Path $kit 'bin'), (Join-Path $kit 'embedded'), (Join-Path $kit 'tools') | Out-Null
+                $signtool = Join-Path $config.WdkRoot "microsoft.windows.sdk.cpp\c\bin\$($config.KitVersion)\x64\signtool.exe"
+                $inf2cat = Join-Path $config.WdkRoot "microsoft.windows.wdk.x64\c\bin\$($config.KitVersion)\x86\Inf2Cat.exe"
+                $sign = '/fd sha256 /sm /s My /sha1 {0}' -f $config.CertThumbprint
+                Copy-Item (Join-Path $script:srcDir 'build\driver-arm64\chmlink.sys'), (Join-Path $script:srcDir 'driver\chmlink.inf') $kitSigned -Force
+                Invoke-Process 'sign sys (arm64)' $signtool ("sign /q $sign `"$kitSigned\chmlink.sys`"") 120
+                Invoke-Process 'inf2cat (arm64)' $inf2cat ("/driver:`"$kitSigned`" /os:10_RS3_ARM64 /uselocaltime") 300
+                Invoke-Process 'sign cat (arm64)' $signtool ("sign /q $sign `"$kitSigned\chmlink.cat`"") 120
+                Copy-Item (Join-Path $kitSigned 'chmlink.sys') $kitOld -Force
+                $inf = [IO.File]::ReadAllText((Join-Path $kitSigned 'chmlink.inf'))
+                $driverVer = [regex]::Match($inf, '(?m)^(\s*DriverVer\s*=\s*[^,]+,\s*)([0-9.]+)')
+                [IO.File]::WriteAllText((Join-Path $kitOld 'chmlink.inf'), $inf.Replace($driverVer.Value, $driverVer.Groups[1].Value + '0.4.3.99'), (New-Object Text.UTF8Encoding($false)))
+                Invoke-Process 'inf2cat (arm64, older)' $inf2cat ("/driver:`"$kitOld`" /os:10_RS3_ARM64 /uselocaltime") 300
+                Invoke-Process 'sign cat (arm64, older)' $signtool ("sign /q $sign `"$kitOld\chmlink.cat`"") 120
+                $filter = Join-Path $script:srcDir 'build\driver-test-arm64\chmlink-surprise.sys'
+                Invoke-Process 'sign test filter (arm64)' $signtool ("sign /q $sign `"$filter`"") 120
+                Copy-Item $filter $kit -Force
+                Invoke-Process 'cmake configure (arm64)' 'cmake.exe' '-S . -B build/arm64 -G "Visual Studio 17 2022" -A ARM64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBUILD_TESTING=OFF' 300 $script:srcDir
+                Invoke-Process 'cmake build (arm64)' 'cmake.exe' '--build build/arm64 --config Release --target chmlink-device chmlink-lifecycle-test chmlink-ip-test -- /m /v:minimal /nologo' 900 $script:srcDir
+                Invoke-Process 'cmake configure (arm64 embedded)' 'cmake.exe' ('-S . -B build/arm64-embedded -G "Visual Studio 17 2022" -A ARM64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON -DBUILD_TESTING=OFF "-DCHMLINK_DRIVER_DIR={0}"' -f $kitSigned) 300 $script:srcDir
+                Invoke-Process 'cmake build (arm64 embedded)' 'cmake.exe' '--build build/arm64-embedded --config Release --target chmlink-quickstart chmlink-package-test -- /m /v:minimal /nologo' 900 $script:srcDir
+                foreach ($name in 'chmlink-device.exe', 'chmlink-lifecycle-test.exe', 'chmlink-ip-test.exe', 'chmlink.dll') {
+                    Copy-Item (Join-Path $script:srcDir "build\arm64\Release\$name") (Join-Path $kit 'bin') -Force
+                }
+                foreach ($name in 'chmlink-quickstart.exe', 'chmlink-package-test.exe', 'chmlink.dll') {
+                    Copy-Item (Join-Path $script:srcDir "build\arm64-embedded\Release\$name") (Join-Path $kit 'embedded') -Force
+                }
+                foreach ($name in 'test-arm64.ps1', 'test-lifecycle.ps1', 'test-ip.ps1', 'test-package.ps1', 'manage-adapter.ps1') {
+                    Copy-Item (Join-Path $script:srcDir "tools\$name") (Join-Path $kit 'tools') -Force
+                }
+                foreach ($binary in @(Get-ChildItem $kit -Recurse -Include *.exe, *.dll, *.sys)) {
+                    $machine = Get-PeMachine $binary.FullName
+                    if ($machine -ne 0xAA64) { throw "$($binary.Name) is not ARM64 (machine 0x$('{0:X4}' -f $machine))." }
+                }
+                Export-Certificate -Cert "Cert:\LocalMachine\My\$($config.CertThumbprint)" -FilePath (Join-Path $kit 'test.cer') | Out-Null
+                $zip = Join-Path $out 'chmlink-arm64-kit.zip'
+                if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [IO.Compression.ZipFile]::CreateFromDirectory($kit, $zip)
+                Write-Log "  arm64 kit: $zip"
+            }
         }
         $candidateInf = Join-Path $signed 'chmlink.inf'
         $candidateSys = Get-Sha256 (Join-Path $signed 'chmlink.sys')
