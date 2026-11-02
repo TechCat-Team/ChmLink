@@ -48,7 +48,8 @@ typedef enum chmlink_ring_status {
     CHMLINK_RING_OK = 0,
     CHMLINK_RING_EMPTY,      /* consumer: nothing to read */
     CHMLINK_RING_FULL,       /* producer: no room for the record now */
-    CHMLINK_RING_CORRUPT     /* the other side broke the rules */
+    CHMLINK_RING_CORRUPT,    /* the other side broke the rules */
+    CHMLINK_RING_INVALID     /* producer: a record of this size never fits; do not retry */
 } chmlink_ring_status;
 
 /* One side's view of a ring. `base` points at the header. */

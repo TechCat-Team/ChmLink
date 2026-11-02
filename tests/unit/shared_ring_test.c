@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200112L   /* posix_memalign, pthreads under -std=c99 */
+#endif
 #include "chmlink/ring.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +22,10 @@ static void join_thread(thread_t t) { WaitForSingleObject(t, INFINITE); CloseHan
 typedef pthread_t thread_t;
 static int start_thread(thread_t *t, void *(*body)(void *), void *arg) { return pthread_create(t, NULL, body, arg) == 0; }
 static void join_thread(thread_t t) { pthread_join(t, NULL); }
-#define ALIGNED_ALLOC(size) aligned_alloc(64, (size))
+/* posix_memalign, not aligned_alloc: the latter is C11 and undeclared under
+ * -std=c99, where an implicit int return truncates the pointer. */
+static void *aligned_alloc_64(size_t size) { void *p = NULL; return posix_memalign(&p, 64, size) == 0 ? p : NULL; }
+#define ALIGNED_ALLOC(size) aligned_alloc_64(size)
 #define ALIGNED_FREE(p) free(p)
 #endif
 
@@ -121,6 +127,7 @@ static void hostile(void)
             memcpy(m + CHMLINK_RING_HEAD_OFFSET, &head, 4);
             st = chmlink_ring_reserve(&ring, &w, want, NULL, &packet);
             if (st == CHMLINK_RING_OK) CHECK(packet >= ring.data && packet + want <= ring.data + capacity && w < capacity);
+            else if (want > CHMLINK_PACKET_MAX_SIZE) CHECK(st == CHMLINK_RING_INVALID || st == CHMLINK_RING_CORRUPT);
             else CHECK(st == CHMLINK_RING_FULL || st == CHMLINK_RING_CORRUPT);
         }
     }

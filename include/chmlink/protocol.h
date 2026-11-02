@@ -51,6 +51,9 @@ typedef enum chmlink_result {
 #define CHMLINK_OFFLOAD_SIZE 12u
 #define CHMLINK_OFFLOAD_NEEDS_CSUM 0x01u
 #define CHMLINK_OFFLOAD_DATA_VALID 0x02u
+/* Never a real flag: the SDK marks abandoned records with it
+ * (chmlink_abandon_packet), and drivers drop records with unknown flags. */
+#define CHMLINK_OFFLOAD_DISCARD 0x80u
 #define CHMLINK_GSO_NONE 0u
 #define CHMLINK_GSO_TCPV4 1u
 #define CHMLINK_GSO_TCPV6 4u

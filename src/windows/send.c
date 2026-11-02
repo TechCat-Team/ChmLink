@@ -80,7 +80,8 @@ static int add_txq(chmlink_adapter *a)
 }
 
 /* The calling thread's queue. A new thread gets txq[0] if nobody uses it
- * yet, else a new queue while there is room, else shares round-robin. */
+ * yet, else a new queue while there is room, else shares round-robin. The
+ * first CHMLINK_TXQ_THREADS threads are remembered; later ones share by ID. */
 static chmlink_txq *pick_txq(chmlink_adapter *a)
 {
     DWORD self = GetCurrentThreadId();
@@ -92,6 +93,13 @@ static chmlink_txq *pick_txq(chmlink_adapter *a)
             ReleaseSRWLockShared(&a->txq_gate);
             return &a->txq[index];
         }
+    }
+    /* Past CHMLINK_TXQ_THREADS threads (a thread pool, say) every queue
+     * exists already: share them by thread ID, without the exclusive lock. */
+    if (a->txq_mapped >= CHMLINK_TXQ_THREADS) {
+        index = (self / 4) % (uint32_t)a->txq_count;
+        ReleaseSRWLockShared(&a->txq_gate);
+        return &a->txq[index];
     }
     ReleaseSRWLockShared(&a->txq_gate);
     AcquireSRWLockExclusive(&a->txq_gate);
@@ -134,7 +142,10 @@ uint8_t *chmlink_allocate_packet(chmlink_adapter *adapter, uint32_t size,
     chmlink_txq *q;
     uint8_t *packet = NULL;
     uint32_t saved;
-    if (adapter == NULL) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
+    if (adapter == NULL || size == 0 ||
+        size > (offload != NULL && offload->gso_type != CHMLINK_GSO_NONE ? CHMLINK_PACKET_MAX_SIZE : adapter->packet_limit)) {
+        SetLastError(ERROR_INVALID_PARAMETER); return NULL;
+    }
     if (!sdk_enter(adapter, NULL)) return NULL;
     q = pick_txq(adapter);
     AcquireSRWLockExclusive(&q->lock);
@@ -149,7 +160,8 @@ uint8_t *chmlink_allocate_packet(chmlink_adapter *adapter, uint32_t size,
     }
     ReleaseSRWLockExclusive(&q->lock);
     if (packet == NULL) {
-        SetLastError(status == CHMLINK_RING_FULL ? ERROR_BUFFER_OVERFLOW : ERROR_INVALID_DATA);
+        SetLastError(status == CHMLINK_RING_FULL ? ERROR_BUFFER_OVERFLOW :
+                     status == CHMLINK_RING_INVALID ? ERROR_INVALID_PARAMETER : ERROR_INVALID_DATA);
         sdk_leave(adapter, NULL, 0);
         return NULL;
     }
@@ -178,6 +190,19 @@ void chmlink_send_packet(chmlink_adapter *adapter, uint8_t *packet)
     ReleaseSRWLockExclusive(&q->lock);
     if (wake) SetEvent(q->event);
     sdk_leave(adapter, NULL, 1);
+}
+
+/* The record goes out marked with CHMLINK_OFFLOAD_DISCARD, a flag no driver
+ * accepts, so the driver drops it (rx_discards) and the packets allocated
+ * after it are not held back. */
+void chmlink_abandon_packet(chmlink_adapter *adapter, uint8_t *packet)
+{
+    static const chmlink_offload discard = {CHMLINK_OFFLOAD_DISCARD, 0, 0, 0, 0, 0};
+    if (adapter == NULL || packet == NULL || txq_of_packet(adapter, packet) == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER); return;
+    }
+    chmlink_ring_describe(packet, &discard);
+    chmlink_send_packet(adapter, packet);
 }
 
 int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length)
@@ -237,7 +262,8 @@ int chmlink_inject(chmlink_adapter *adapter, const void *batch, uint32_t length)
         if (!result) q->cursor = saved;
         ReleaseSRWLockExclusive(&q->lock);
         if (wake) SetEvent(q->event);
-        if (!result) SetLastError(status == CHMLINK_RING_CORRUPT ? ERROR_INVALID_DATA : ERROR_BUFFER_OVERFLOW);
+        if (!result) SetLastError(status == CHMLINK_RING_CORRUPT ? ERROR_INVALID_DATA :
+                                  status == CHMLINK_RING_INVALID ? ERROR_INVALID_PARAMETER : ERROR_BUFFER_OVERFLOW);
     }
     return sdk_leave(adapter, NULL, result);
 }

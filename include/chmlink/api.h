@@ -135,8 +135,9 @@ const uint8_t *chmlink_receive_packet(chmlink_adapter *adapter, uint32_t *size,
 void chmlink_release_packet(chmlink_adapter *adapter, const uint8_t *packet);
 
 /* Zero-copy send. chmlink_allocate_packet reserves exactly `size` bytes and
- * returns where to write them, or NULL with ERROR_BUFFER_OVERFLOW (ring full)
- * or ERROR_INVALID_PARAMETER. offload describes checksums the caller left
+ * returns where to write them, or NULL with ERROR_BUFFER_OVERFLOW (ring full;
+ * retry later) or ERROR_INVALID_PARAMETER (size 0, or more than packet_limit
+ * without a GSO descriptor: retrying cannot help). offload describes checksums the caller left
  * unfinished and GSO coalescing; NULL is a plain packet.
  * chmlink_send_packet publishes the reservation. Threads may allocate and
  * send concurrently; the SDK publishes in allocation order, so a caller that
@@ -144,6 +145,11 @@ void chmlink_release_packet(chmlink_adapter *adapter, const uint8_t *packet);
 uint8_t *chmlink_allocate_packet(chmlink_adapter *adapter, uint32_t size,
                                  const chmlink_offload *offload);
 void chmlink_send_packet(chmlink_adapter *adapter, uint8_t *packet);
+/* Give up an allocated packet, on an error path for example. Every allocation
+ * must end in chmlink_send_packet or this call: the ring publishes in
+ * allocation order, so a reservation left open holds back every later packet
+ * of the thread's ring. The driver drops it and counts it in rx_discards. */
+void chmlink_abandon_packet(chmlink_adapter *adapter, uint8_t *packet);
 
 /* Receive one protocol.h batch copied out of the ring (plain, or an offload
  * batch when descriptors are present). ERROR_NO_MORE_ITEMS means the ring is

@@ -15,6 +15,7 @@ EXPORTS
     chmlink_release_packet
     chmlink_allocate_packet
     chmlink_send_packet
+    chmlink_abandon_packet
     chmlink_receive
     chmlink_inject
     chmlink_set_offload

@@ -370,12 +370,15 @@ static VOID ClSessionThread(PVOID context)
             UCHAR *packet;
             PNET_BUFFER_LIST nbl;
             chmlink_ring_status status;
+            UCHAR version = 0;
             status = chmlink_ring_next(&q->Ring.View, &cursor, tail, ClPacketLimit(a),
                                        &offset, &size, &descriptor);
             if (status == CHMLINK_RING_EMPTY) break;
             if (status == CHMLINK_RING_CORRUPT) { s->Broken = TRUE; break; }
             packet = q->Ring.View.data + offset;
             if (a->Mode == CHMLINK_MODE_IP) {
+                /* Read once: the application can still write the ring. */
+                version = (UCHAR)(packet[0] >> 4);
                 if (!chmlink_ip_packet_valid(packet, size,
                         descriptor.gso_type != CHMLINK_GSO_NONE ? CHMLINK_PACKET_MAX_SIZE : ClPacketLimit(a))) {
                     discards++;
@@ -393,7 +396,7 @@ static VOID ClSessionThread(PVOID context)
             }
             nbl->SourceHandle = a->Handle;
             if (a->Mode == CHMLINK_MODE_IP) {
-                BOOLEAN ipv4 = (packet[0] >> 4) == 4;
+                BOOLEAN ipv4 = version == 4;
                 NdisClearNblFlag(nbl, NDIS_NBL_FLAGS_IS_IPV4 | NDIS_NBL_FLAGS_IS_IPV6);
                 NdisSetNblFlag(nbl, ipv4 ? NDIS_NBL_FLAGS_IS_IPV4 : NDIS_NBL_FLAGS_IS_IPV6);
                 NET_BUFFER_LIST_INFO(nbl, NetBufferListFrameType) =

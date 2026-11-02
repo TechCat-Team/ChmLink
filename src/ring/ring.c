@@ -89,9 +89,9 @@ chmlink_ring_status chmlink_ring_reserve(chmlink_ring *ring, uint32_t *cursor,
 {
     uint32_t head = chmlink_ring_load(ring, CHMLINK_RING_HEAD_OFFSET), at = *cursor, need, place;
     if (!position_valid(ring, head)) return CHMLINK_RING_CORRUPT;
-    if (packet_size == 0 || packet_size > CHMLINK_PACKET_MAX_SIZE) return CHMLINK_RING_FULL;
+    if (packet_size == 0 || packet_size > CHMLINK_PACKET_MAX_SIZE) return CHMLINK_RING_INVALID;
     need = chmlink_ring_record_size(packet_size);
-    if (need > ring->capacity - CHMLINK_RING_ALIGN) return CHMLINK_RING_FULL;
+    if (need > ring->capacity - CHMLINK_RING_ALIGN) return CHMLINK_RING_INVALID;
     if (at >= head) {
         uint32_t room = ring->capacity - at;
         if (need < room || (need == room && head != 0)) {

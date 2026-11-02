@@ -305,7 +305,8 @@ void ClSend(NDIS_HANDLE context, PNET_BUFFER_LIST lists, NDIS_PORT_NUMBER port, 
             }
             reserved = chmlink_ring_reserve(&session->From.View, &cursor, length, NULL, &slot);
             if (reserved != CHMLINK_RING_OK) {
-                status = reserved == CHMLINK_RING_FULL ? NDIS_STATUS_RESOURCES : NDIS_STATUS_INVALID_DATA;
+                status = reserved == CHMLINK_RING_FULL ? NDIS_STATUS_RESOURCES :
+                         reserved == CHMLINK_RING_INVALID ? NDIS_STATUS_INVALID_LENGTH : NDIS_STATUS_INVALID_DATA;
                 full = reserved == CHMLINK_RING_FULL;
                 if (reserved == CHMLINK_RING_CORRUPT) broken = TRUE;
                 break;

@@ -123,6 +123,14 @@ int main(void)
     CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE) == CHMLINK_OK);
     CHECK(same_info(&in, &out));
 
+    /* A later driver that appends fields: LENGTH says how much it wrote, and
+     * this build reads its fields and ignores the rest. */
+    memset(bytes + CHMLINK_INFO_SIZE, 0xab, 8);
+    put32(bytes + CHMLINK_INFO_LENGTH, CHMLINK_INFO_SIZE + 8);
+    CHECK(chmlink_query_decode(&out, bytes, CHMLINK_INFO_SIZE + 8) == CHMLINK_OK);
+    CHECK(same_info(&in, &out));
+    chmlink_query_encode(bytes, &in);
+
     /* Offloads in effect need the capability, and only known bits. */
     in.capabilities |= CHMLINK_CAP_OFFLOAD; in.offload = CHMLINK_OFFLOAD_TX_LSO | CHMLINK_OFFLOAD_RX_RSC;
     chmlink_query_encode(bytes, &in);
