@@ -227,7 +227,10 @@ packages it removes the driver service and, on Windows versions that copy the
 driver to `System32\drivers` (before build 25319), that copy.
 
 Adapter changes are serialized across processes: a call waits up to ten
-seconds for another to finish, then fails with `ERROR_BUSY`.
+seconds for another to finish, then fails with `ERROR_BUSY`. The lock is a
+mutex in a private namespace bounded by BUILTIN\Administrators, so a process
+without administrator rights cannot hold it to block configuration.
+`tools/manage-adapter.ps1` and `tools/manage-driver.ps1` take the same lock.
 
 ## Sessions
 

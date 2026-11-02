@@ -11,6 +11,8 @@ installed the candidate on its anchor adapter.
   concurrent  several processes create adapters at once: unique names win, a shared
               name is created once, nothing is left half-made
   surprise    the adapter is surprise-removed under an open session (test filter driver)
+  squat       LocalService holds the old Global\ lock name and cannot create the private
+              namespace; creation still works, and manage-adapter.ps1's lock excludes the SDK
 
 -OldInfPath is the candidate re-signed with a lower DriverVer, at least the SDK's minimum.
 -FilterPath is the signed chmlink-surprise.sys; without it the surprise part is skipped.
@@ -22,12 +24,13 @@ param(
     [Parameter(Mandatory)][string]$BuildDirectory,      # chmlink-device.exe
     [Parameter(Mandatory)][string]$OutputDirectory,
     [string]$FilterPath,
-    [string[]]$Parts = @('package', 'driver', 'concurrent', 'surprise')
+    [string[]]$Parts = @('package', 'driver', 'concurrent', 'squat', 'surprise')
 )
 $ErrorActionPreference = 'Stop'
 $ERROR_BUSY = 170; $ERROR_DUP_NAME = 52; $ERROR_INF_IN_USE = 3758096957   # 0xE000023D
 $owner = '{5F1C2A7E-3B4D-4E8F-9A10-6C2D7E41883B}'
 $filterService = 'chmlinksurprise'
+$squatTask = 'ChmLink package test squatter'
 $created = [Collections.Generic.List[string]]::new()
 $holders = [Collections.Generic.List[object]]::new()
 $exitCode = 1
@@ -207,6 +210,67 @@ function Test-Concurrent {
     Log '  7 adapters created with the right names, the duplicate refused, all deleted'
 }
 
+# The configuration lock of manage-adapter.ps1, taken from the script itself.
+function Import-ConfigurationMutex {
+    $script = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'manage-adapter.ps1'), [ref]$null, [ref]$null)
+    $function = $script.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ConfigurationMutex' }, $true)
+    Check ($null -ne $function) 'manage-adapter.ps1 defines Get-ConfigurationMutex'
+    . ([scriptblock]::Create($function.Extent.Text))
+    Set-Item function:script:Get-ConfigurationMutex (Get-Item function:Get-ConfigurationMutex).ScriptBlock
+}
+
+function Test-Squat {
+    Log 'squat: LocalService holds Global\ChmLink.AdapterConfiguration and tries the private namespace'
+    Import-ConfigurationMutex
+    $dir = New-Item -ItemType Directory -Force -Path (Join-Path $output.FullName 'squat')
+    & icacls.exe $dir.FullName /grant '*S-1-5-19:(OI)(CI)M' | Out-Null
+    $status = Join-Path $dir.FullName 'status.txt'; $stop = Join-Path $dir.FullName 'stop'
+    $body = (Get-Item function:Get-ConfigurationMutex).ScriptBlock.ToString()
+    Set-Content -LiteralPath (Join-Path $dir.FullName 'squat.ps1') -Encoding UTF8 -Value @"
+`$ErrorActionPreference = 'Stop'
+function Get-ConfigurationMutex {
+$body
+}
+`$old = [Threading.Mutex]::new(`$true, 'Global\ChmLink.AdapterConfiguration')
+try { [void](Get-ConfigurationMutex); `$result = 'namespace opened' } catch { `$result = "namespace refused: `$(`$_.Exception.Message)" }
+Set-Content -LiteralPath '$status' -Value "held`n`$result"
+while (!(Test-Path -LiteralPath '$stop')) { Start-Sleep -Milliseconds 200 }
+"@
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $dir.FullName 'squat.ps1')`""
+    $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount
+    Register-ScheduledTask -TaskName $squatTask -Action $action -Principal $principal -Force | Out-Null
+    try {
+        Start-ScheduledTask -TaskName $squatTask
+        $deadline = (Get-Date).AddSeconds(60)
+        while (!(Test-Path -LiteralPath $status) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+        Check (Test-Path -LiteralPath $status) 'the LocalService squatter started'
+        $lines = @(Get-Content -LiteralPath $status)
+        Log "  squatter: $($lines -join '; ')"
+        Check ($lines[0] -eq 'held') 'LocalService holds the old lock name'
+        Check ($lines[1] -like 'namespace refused*') 'LocalService cannot create or open the private namespace'
+        $a = New-Adapter 'ChmLink Squat'
+        Log "  created $($a.Json.instance) while the old name was squatted"
+
+        # manage-adapter.ps1 and the SDK share one lock.
+        $mutex = Get-ConfigurationMutex
+        Check ($mutex.WaitOne(0)) 'the script lock was free'
+        try {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-Test @('create', 'ChmLink Squat Busy')
+            if ($r.Json.ok -eq 1) { $created.Add($r.Json.instance) }
+            Check ($r.Json.ok -eq 0 -and $r.Json.error -eq $ERROR_BUSY) "creation under the script lock fails with ERROR_BUSY (ok $($r.Json.ok), error $($r.Json.error))"
+            Log "  creation under the script lock: ERROR_BUSY after $([int]$watch.Elapsed.TotalSeconds) s"
+        } finally { $mutex.ReleaseMutex(); $mutex.Dispose() }
+        Remove-Adapter $a.Json.instance
+    } finally {
+        Set-Content -LiteralPath $stop -Value ''
+        Start-Sleep -Seconds 1
+        Stop-ScheduledTask -TaskName $squatTask -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $squatTask -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    Log '  old-name squat ignored, namespace refused to LocalService, script and SDK exclude each other'
+}
+
 function Test-Surprise {
     if (!$FilterPath) { Log 'surprise: skipped (no -FilterPath)'; return }
     Log 'surprise: surprise removal under an open session'
@@ -262,6 +326,7 @@ try {
     if ($Parts -contains 'driver') { Test-Driver }     # first: clears leftover packages of the older version
     if ($Parts -contains 'package') { Test-Package }
     if ($Parts -contains 'concurrent') { Test-Concurrent }
+    if ($Parts -contains 'squat') { Test-Squat }
     if ($Parts -contains 'surprise') { Test-Surprise }
     if ($Parts -contains 'driver') { Test-Driver }     # again: the older package is unused now and goes
     Log 'PASS package tests'

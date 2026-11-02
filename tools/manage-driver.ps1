@@ -14,6 +14,50 @@ param(
 if (-not $DeviceTool) { $DeviceTool = Join-Path $PSScriptRoot '../build/Release/chmlink-device.exe' }
 $ErrorActionPreference = 'Stop'
 
+# The SDK's configuration lock lives in a private namespace bounded by
+# BUILTIN\Administrators, so unprivileged processes cannot squat it. Once this
+# process holds the namespace open, the 'ChmLink\' prefix resolves to it.
+function Get-ConfigurationMutex {
+    if (!('ChmLink.ConfigLock' -as [type])) {
+        Add-Type -Namespace ChmLink -Name ConfigLock -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr CreateBoundaryDescriptorW(string name, uint flags);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool AddSIDToBoundaryDescriptor(ref IntPtr boundary, byte[] sid);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr CreatePrivateNamespaceW(ref SECURITY_ATTRIBUTES attributes, IntPtr boundary, string alias);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr OpenPrivateNamespaceW(IntPtr boundary, string alias);
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string sddl, uint revision, out IntPtr descriptor, IntPtr size);
+[StructLayout(LayoutKind.Sequential)] public struct SECURITY_ATTRIBUTES { public int Length; public IntPtr Descriptor; public bool Inherit; }
+public static IntPtr Namespace;
+'@
+    }
+    if ([ChmLink.ConfigLock]::Namespace -eq [IntPtr]::Zero) {
+        $sid = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+        $bytes = [byte[]]::new($sid.BinaryLength); $sid.GetBinaryForm($bytes, 0)
+        $boundary = [ChmLink.ConfigLock]::CreateBoundaryDescriptorW('ChmLink', 0)
+        if ($boundary -eq [IntPtr]::Zero -or ![ChmLink.ConfigLock]::AddSIDToBoundaryDescriptor([ref]$boundary, $bytes)) {
+            throw "Cannot build the configuration lock boundary ($([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
+        }
+        $attributes = [ChmLink.ConfigLock+SECURITY_ATTRIBUTES]::new()
+        $attributes.Length = [Runtime.InteropServices.Marshal]::SizeOf($attributes)
+        $descriptor = [IntPtr]::Zero
+        if (![ChmLink.ConfigLock]::ConvertStringSecurityDescriptorToSecurityDescriptorW('D:(A;;GA;;;SY)(A;;GA;;;BA)', 1, [ref]$descriptor, [IntPtr]::Zero)) {
+            throw "Cannot build the configuration lock descriptor ($([Runtime.InteropServices.Marshal]::GetLastWin32Error()))."
+        }
+        $attributes.Descriptor = $descriptor
+        for ($attempt = 0; $attempt -lt 8 -and [ChmLink.ConfigLock]::Namespace -eq [IntPtr]::Zero; $attempt++) {
+            $handle = [ChmLink.ConfigLock]::CreatePrivateNamespaceW([ref]$attributes, $boundary, 'ChmLink')
+            if ($handle -eq [IntPtr]::Zero) {
+                $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                if ($errorCode -ne 183) { break }
+                $handle = [ChmLink.ConfigLock]::OpenPrivateNamespaceW($boundary, 'ChmLink')
+                if ($handle -eq [IntPtr]::Zero) { $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+            }
+            [ChmLink.ConfigLock]::Namespace = $handle
+        }
+        if ([ChmLink.ConfigLock]::Namespace -eq [IntPtr]::Zero) { throw "Cannot open the configuration lock namespace ($errorCode)." }
+    }
+    [Threading.Mutex]::new($false, 'ChmLink\AdapterConfiguration')
+}
+
 # Exit codes: 0 completed, 1 failed before device changes, 2 upgrade failed but
 # recovery was applied (inspect RestartRequired), 3 recovery incomplete or
 # deferred, 3010 requested operation applied with restart required.
@@ -315,7 +359,7 @@ try {
         $locked = $true; throw 'Previous maintenance was interrupted; inspect its recovery journal first.'
     }
     if (!$locked) { throw 'Another package maintenance operation is running.' }
-    $configMutex = [Threading.Mutex]::new($false, 'Global\ChmLink.AdapterConfiguration')
+    $configMutex = Get-ConfigurationMutex
     try { $configLocked = $configMutex.WaitOne(0) } catch [Threading.AbandonedMutexException] {
         $configLocked = $true; throw 'Adapter configuration was interrupted; inspect the device inventory.'
     }

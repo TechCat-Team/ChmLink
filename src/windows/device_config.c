@@ -16,6 +16,7 @@
 #include <newdev.h>
 #include <initguid.h>   /* defines the DEVPKEY below rather than declaring it */
 #include <devpkey.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
@@ -171,10 +172,65 @@ BOOL ClIsStaleInterface(const GUID *guid)
 
 /* An abandoned lock means a change was interrupted halfway: refuse once so
  * that the caller inspects the devices, as the lock is then released. */
+/* The lock lives in a private namespace bounded by BUILTIN\Administrators.
+ * Only a token with that group can create the namespace, so an unprivileged
+ * process cannot squat the name the way it can a Global\ object. The process
+ * keeps its namespace handle open for its lifetime: the namespace disappears
+ * with its last handle, and two namespaces of the same name would mean two
+ * locks. */
+static SRWLOCK namespace_lock = SRWLOCK_INIT;
+static HANDLE config_namespace;
+
+static HANDLE open_namespace(void)
+{
+    BYTE sid[SECURITY_MAX_SID_SIZE];
+    DWORD size = sizeof(sid), error = ERROR_SUCCESS;
+    HANDLE boundary, space = NULL;
+    SECURITY_ATTRIBUTES attributes = { sizeof(attributes), NULL, FALSE };
+    int attempt;
+
+    AcquireSRWLockExclusive(&namespace_lock);
+    if (config_namespace != NULL) {
+        space = config_namespace;
+        ReleaseSRWLockExclusive(&namespace_lock);
+        return space;
+    }
+    boundary = CreateBoundaryDescriptorW(L"ChmLink", 0);
+    if (boundary == NULL) { error = GetLastError(); goto out; }
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, sid, &size) ||
+        !AddSIDToBoundaryDescriptor(&boundary, sid)) { error = GetLastError(); goto boundary; }
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;SY)(A;;GA;;;BA)",
+            SDDL_REVISION_1, &attributes.lpSecurityDescriptor, NULL)) { error = GetLastError(); goto boundary; }
+    /* Another process may create it, or close the last handle, between the
+     * two calls; a few rounds settle either race. */
+    for (attempt = 0; attempt < 8 && space == NULL; attempt++) {
+        space = CreatePrivateNamespaceW(&attributes, boundary, L"ChmLink");
+        if (space != NULL) break;
+        error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS) break;
+        space = OpenPrivateNamespaceW(boundary, L"ChmLink");
+        if (space == NULL) error = GetLastError();
+    }
+    LocalFree(attributes.lpSecurityDescriptor);
+    if (space != NULL) config_namespace = space;
+boundary:
+    DeleteBoundaryDescriptor(boundary);
+out:
+    ReleaseSRWLockExclusive(&namespace_lock);
+    if (space == NULL) {
+        SetLastError(error);
+        sdk_log_error(L"Opening the configuration lock namespace failed");
+        SetLastError(error);
+    }
+    return space;
+}
+
 BOOL ClLock(HANDLE *mutex)
 {
     DWORD locked;
-    *mutex = CreateMutexW(NULL, FALSE, L"Global\\ChmLink.AdapterConfiguration");
+    *mutex = NULL;
+    if (open_namespace() == NULL) return FALSE;
+    *mutex = CreateMutexW(NULL, FALSE, L"ChmLink\\AdapterConfiguration");
     if (*mutex == NULL) return FALSE;
     locked = WaitForSingleObject(*mutex, 10000);
     if (locked == WAIT_OBJECT_0) return TRUE;
