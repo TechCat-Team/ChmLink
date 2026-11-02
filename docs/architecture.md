@@ -26,14 +26,17 @@ which locks and maps them:
   the SDK adds one per sending thread (`CHMLINK_IOCTL_ADD_INJECT_RING`).
 
 A ring (`include/chmlink/ring.h`) has a power-of-two capacity from 128 KiB to
-64 MiB (4 MiB by default) and a header with the consumer's `head`, the
-producer's `tail` and an `alertable` flag, each on its own cache line. Records
-are `[u32 size][12-byte offload descriptor][packet]`, 4-byte aligned, and never
-wrap: the space at the end always holds a maximum record.
+64 MiB (4 MiB by default) and a 256-byte header with four fields, each on its
+own cache line: the consumer's `head`, the producer's `tail`, the consumer's
+`wait` flag and the driver's `state` bits (`CHMLINK_RING_STATE_RUNNING`,
+`CHMLINK_RING_STATE_CLOSED`). Records are `[u32 size][12-byte offload
+descriptor][packet]`, padded to 16 bytes, and never wrap: a record that does
+not fit before the end is placed at the start, and the rest of the end is
+marked skipped.
 
 Signalling follows Wintun: a consumer that finds its ring empty polls briefly,
-sets `alertable`, checks again and waits on an event; a producer sets the event
-only when `alertable` is set. Both sides can poll before sleeping: the SDK's
+sets `wait`, checks again and waits on an event; a producer sets the event
+only when `wait` is set. Both sides can poll before sleeping: the SDK's
 wait (up to 64 µs) and the driver's to-Windows threads (up to 100 µs,
 yielding). At high packet rates and in request-response traffic the next
 packet usually arrives within that time, which spares a wake-up per packet and
@@ -48,10 +51,12 @@ under the threshold even without polling, so it turns polling back on. With
 10,000 evenly spaced packets per second each way a session then costs 0.21
 cores instead of a core or more ([performance.md](performance.md#resource-use)).
 
-**From Windows.** `MiniportSend` reserves space under a spin lock, copies the
-packet outside it and publishes in reservation order, so senders on many CPUs
-do not serialize on the copy. A packet that finds the ring full is dropped and
-counted (`tx_queue_drops`).
+**From Windows.** `MiniportSend` reserves space, copies the packet and
+publishes it while holding the session's send lock, so senders on several
+CPUs take turns on that lock; one copy of a packet is short next to the stack
+work around it (four senders reach about 1.27M packets per second, as many as
+Wintun). A packet that finds the ring full is dropped and counted
+(`tx_queue_drops`).
 
 **To Windows.** A ring's thread reads a batch of records, builds NBLs that
 point into the locked ring (no copy, no `NDIS_RECEIVE_FLAGS_RESOURCES`) and
@@ -152,6 +157,13 @@ waits for indicated packets to return and drains I/O; the session survives and
 reports `CHMLINK_STATE_PAUSED`. System sleep is reported as
 `CHMLINK_STATE_LOW_POWER`, shutdown as `CHMLINK_STATE_SHUTDOWN`, removal as
 `CHMLINK_STATE_REMOVING`; removal ends the session.
+
+Pausing and closing a session wait without a time limit until the stack has
+returned every packet indicated from the rings: those packets point into the
+application's memory, which NDIS does not allow to be released while the stack
+still holds them. The stack returns packets promptly; a component that kept
+them would hold up the close (and the exit of the process that owns the
+session) until it let go.
 
 ## Installation model
 

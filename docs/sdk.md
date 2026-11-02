@@ -339,7 +339,16 @@ chmlink_send_packet(adapter, slot);
   still uses several cores, and each connection stays in order. Run the
   sending thread at normal priority or above.
 - Packets are published in allocation order within a ring: do not allocate
-  and then stall.
+  and then stall. Every allocation ends in `chmlink_send_packet` or, on an
+  error path, `chmlink_abandon_packet`, which hands the slot to the driver to
+  drop (counted in `rx_discards`); a reservation left open holds back every
+  later packet of that thread's ring.
+- `chmlink_allocate_packet` fails with `ERROR_BUFFER_OVERFLOW` when the ring is
+  full (retry shortly) and with `ERROR_INVALID_PARAMETER` for a size of 0 or
+  above `packet_limit` without a GSO descriptor (retrying cannot help).
+- The driver hands packets to the stack in place, without a copy: do not
+  change a packet after sending it. Its space is reused once the stack has
+  returned it.
 
 `chmlink_inject(adapter, batch, length)` copies a whole [batch](#batches)
 instead: all of it or nothing (`ERROR_BUFFER_OVERFLOW` when it does not fit,

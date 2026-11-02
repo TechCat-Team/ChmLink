@@ -296,7 +296,12 @@ chmlink_send_packet(adapter, slot);
   驱动在各自的核心上把每个环形队列交给协议栈。同一线程的包按顺序到达。
 - 驱动还会按流（地址、协议、端口）把数据包分到最多四个核心，和网卡的 RSS 一样：
   一个线程承载多条连接时也能用上多个核心，每条连接内部保持顺序。发送线程请使用普通或更高的优先级。
-- 同一环形队列内按分配顺序发布：不要分配之后迟迟不发送。
+- 同一环形队列内按分配顺序发布：不要分配之后迟迟不发送。每次分配都要以 `chmlink_send_packet` 结束；
+  在出错路径上则调用 `chmlink_abandon_packet`，把这个位置交给驱动丢弃（计入 `rx_discards`）。
+  一直不结束的预留会挡住该线程环形队列中之后的所有包。
+- 环形队列已满时，`chmlink_allocate_packet` 以 `ERROR_BUFFER_OVERFLOW` 失败（稍后重试）；长度为 0，或在没有 GSO 描述符时超过
+  `packet_limit`，则以 `ERROR_INVALID_PARAMETER` 失败（重试也没用）。
+- 驱动直接在原地把包交给协议栈，不做复制：包发出后不要再修改它。协议栈归还之后，这块空间才会被重新使用。
 
 `chmlink_inject(adapter, batch, length)` 则复制一整个[批量格式](#批量格式)的缓冲区：要么全部写入，
 要么一个都不写（放不下时返回 `ERROR_BUFFER_OVERFLOW`，可以用同一批数据重试）。
