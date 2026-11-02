@@ -45,7 +45,7 @@ Each side keeps a smoothed estimate of how long its ring stays empty before
 the next packet (wake-ups without data do not count) and polls only while that
 is under 64 µs; otherwise it sleeps at once. A request-response exchange stays
 under the threshold even without polling, so it turns polling back on. With
-10,000 evenly spaced packets per second each way a session then costs 0.27
+10,000 evenly spaced packets per second each way a session then costs 0.21
 cores instead of a core or more ([performance.md](performance.md#resource-use)).
 
 **From Windows.** `MiniportSend` reserves space under a spin lock, copies the

@@ -18,7 +18,7 @@ network or packet tool create them and move packets through them.
 
 - **Fast towards Windows.** Packets go through shared-memory rings without a
   copy or a system call each, and the driver hands them to the stack on up to
-  four cores, by flow, as RSS does on a physical NIC: 1.75M packets per second
+  four cores, by flow, as RSS does on a physical NIC: 1.8M packets per second
   from one thread, 5× Wintun's TCP throughput.
 - **TUN and TAP in one package.** IP adapters for layer-3 tunnels, Ethernet
   adapters with a MAC for layer-2 ones, side by side.
@@ -43,12 +43,12 @@ Same VM, same benchmark programs, MTU 1500 (details and method in
 
 | | ChmLink | Wintun 0.14.1 | tap-windows6 9.27.0 |
 |---|---|---|---|
-| UDP to Windows, one thread, 64 flows | **1.75M pps** | 348k pps | 74k pps |
-| UDP to Windows, one thread, one flow | **550k pps** | 350k pps | 72k pps |
-| UDP from Windows, one sender | 479k pps | 473k pps | 45k pps |
-| TCP, one stream | **21.0 Gbps** | 4.2 Gbps | 0.89 Gbps |
-| TCP at MTU 65535 | **97 Gbps** | 52 Gbps | — |
-| 64 B round trip (median) | 14.6 µs | 14.7 µs | 41 µs |
+| UDP to Windows, one thread, 64 flows | **1.81M pps** | 348k pps | 74k pps |
+| UDP to Windows, one thread, one flow | **578k pps** | 350k pps | 72k pps |
+| UDP from Windows, one sender | 480k pps | 473k pps | 45k pps |
+| TCP, one stream | **23.1 Gbps** | 4.2 Gbps | 0.89 Gbps |
+| TCP at MTU 65535 | **100 Gbps** | 52 Gbps | — |
+| 64 B round trip (median) | 14.4 µs | 14.7 µs | 41 µs |
 
 ## Quick start
 
