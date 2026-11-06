@@ -138,6 +138,16 @@ int chmlink_create_adapter(const chmlink_create_options *o, chmlink_device *crea
     if (o->driver_inf == NULL && !ClSelectPackage(embedded, path, &reboot)) goto fail;
     step = L"checking that existing adapters run the same driver package";
     if (!ClCheckPackage(path)) goto fail;
+    if (mode == CHMLINK_MODE_ETHERNET && chmlink_config_mtu(config.Bytes) != CHMLINK_MTU_DEFAULT) {
+        step = L"checking that the driver package supports the Ethernet MTU";
+        if (!ClPackageVersion(path, &package)) goto fail;
+        if (package < CL_PACKAGE_ETHERNET_MTU) {
+            sdk_log(CHMLINK_LOG_ERROR, L"Driver package %u.%u.%u.%u runs Ethernet adapters at MTU 1500 only; "
+                    L"%u.%u.%u.%u or later is needed for MTU %u.", CL_PACKAGE_PARTS(package),
+                    CL_PACKAGE_PARTS(CL_PACKAGE_ETHERNET_MTU), chmlink_config_mtu(config.Bytes));
+            SetLastError(ERROR_REVISION_MISMATCH); goto fail;
+        }
+    }
     step = L"checking that the name, MAC and identity are unused";
     if (!ClCheckUnique(&config)) goto fail;
     step = L"registering the device";
@@ -278,6 +288,9 @@ int chmlink_set_adapter_mtu(const wchar_t *instance, const GUID *owner, uint32_t
     if (!chmlink_config_mtu_allowed(chmlink_config_mode(config.Bytes), mtu)) { error = ERROR_INVALID_PARAMETER; goto done; }
     /* A driver that predates configuration version 3 would not read it. */
     if (ClBoundPackage(set, &device) < CL_PACKAGE_CONFIG_3) { error = ERROR_REVISION_MISMATCH; goto done; }
+    /* Nor would one before CL_PACKAGE_ETHERNET_MTU start an Ethernet device at another MTU. */
+    if (chmlink_config_mode(config.Bytes) == CHMLINK_CONFIG_MODE_ETHERNET && mtu != CHMLINK_MTU_DEFAULT &&
+        ClBoundPackage(set, &device) < CL_PACKAGE_ETHERNET_MTU) { error = ERROR_REVISION_MISMATCH; goto done; }
     if (!ClUpdateMtu(set, &device, &config, mtu)) { error = GetLastError(); goto done; }
     ZeroMemory(&change, sizeof(change));
     change.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);

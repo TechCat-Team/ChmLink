@@ -73,8 +73,9 @@ static int failed(const char *what, DWORD error)
 {
     switch (error) {
     case ERROR_REVISION_MISMATCH:
-        fprintf(stderr, "%s failed: the driver package is unsupported (0.4.2.0 or later is needed), or the "
-                        "existing adapters run a different package (use a managed upgrade first).\n", what);
+        fprintf(stderr, "%s failed: the driver package is unsupported (0.4.3.0 or later is needed, 0.5.1.6 for an "
+                        "Ethernet MTU other than 1500), or the existing adapters run a different package (use a "
+                        "managed upgrade first).\n", what);
         break;
     case ERROR_DUP_NAME:
         fprintf(stderr, "%s failed: the name, MAC or identity is already in use.\n", what); break;
@@ -225,11 +226,11 @@ int wmain(int argc, wchar_t **argv)
         if (!chmlink_set_adapter_mtu(argv[2], owner, (uint32_t)mtu_value, &flags)) {
             DWORD error = GetLastError();
             if (error == ERROR_INVALID_PARAMETER) {
-                fprintf(stderr, "MTU %lu is not allowed: Ethernet adapters use 1500, IP adapters 1280 to 65535.\n", mtu_value);
+                fprintf(stderr, "MTU %lu is not allowed: Ethernet adapters take 1280 to 9000, IP adapters 1280 to 65535.\n", mtu_value);
                 return 1;
             }
             if (error == ERROR_REVISION_MISMATCH) {
-                fprintf(stderr, "The installed driver predates configuration version 3; upgrade it first.\n");
+                fprintf(stderr, "The installed driver is too old for this MTU (0.4.2.0 for IP, 0.5.1.6 for Ethernet); upgrade it first.\n");
                 return 1;
             }
             return failed("Set MTU", error);
@@ -241,7 +242,7 @@ int wmain(int argc, wchar_t **argv)
     wprintf(L"Removed %ls\n", argv[2]);
     return 0;
 usage:
-    fwprintf(stderr, L"Usage: chmlink-device create <signed-inf-path> [--owner <GUID>] [--name <name>] [--mac <MAC>] [--mode ethernet|ip] [--mtu <1280-65535, IP only>]\n"
+    fwprintf(stderr, L"Usage: chmlink-device create <signed-inf-path> [--owner <GUID>] [--name <name>] [--mac <MAC>] [--mode ethernet|ip] [--mtu <IP 1280-65535, Ethernet 1280-9000>]\n"
                      L"       chmlink-device set-mtu <exact-device-instance-id> <mtu> [--owner <GUID>]   (restarts the device)\n"
                      L"       chmlink-device show <exact-device-instance-id>\n"
                      L"       chmlink-device remove <exact-device-instance-id> [--owner <GUID>]\n"

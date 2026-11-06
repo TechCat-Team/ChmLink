@@ -9,8 +9,8 @@ param(
     [string]$Name,
     [string]$Mac,
     [ValidateSet('ethernet', 'ip')][string]$Mode = 'ethernet',
-    # IP adapters only: 1280 to 65535, 1500 by default. SetMtu restarts the
-    # adapter, which ends an open data session.
+    # 1500 by default; IP adapters 1280 to 65535, Ethernet adapters 1280 to 9000.
+    # SetMtu restarts the adapter, which ends an open data session.
     [ValidateRange(1280, 65535)][int]$Mtu,
     [guid]$OwnerId = '7C71F369-78C2-44F4-94CD-A2C14A29469B',
     [string]$DeviceTool
@@ -89,7 +89,7 @@ try {
     if ($Action -eq 'Create') {
         if (!$InfPath -or $InstanceId) { throw 'Create requires InfPath and does not accept InstanceId.' }
         if ($Mode -eq 'ip' -and $Mac) { throw 'IP adapters do not have a MAC address.' }
-        if ($Mtu -and $Mode -ne 'ip') { throw 'Only IP adapters have a configurable MTU.' }
+        if ($Mtu -and $Mode -ne 'ip' -and $Mtu -gt 9000) { throw 'Ethernet adapters take an MTU from 1280 to 9000.' }
         $arguments = @('create', (Resolve-Path -LiteralPath $InfPath).Path, '--owner', $OwnerId.ToString('B'))
         if ($Name) { $arguments += @('--name', $Name) }
         if ($Mac) { $arguments += @('--mac', $Mac) }

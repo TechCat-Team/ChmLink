@@ -111,7 +111,7 @@ if (!chmlink_create_adapter(&options, &device))
 | `name` | Windows 中的连接名称，最多 128 个字符 | `ChmLink-<网卡 ID>` |
 | `owner` | 所有者 GUID | `CHMLINK_DEFAULT_OWNER_ID`（供工具使用；应用请用自己的） |
 | `mac` | 6 字节，仅以太网；必须是单播且本地管理的地址 | 随机的本地管理地址 |
-| `mtu` | 仅 IP 模式，1280 到 65535 | 1500 |
+| `mtu` | IP 模式 1280 到 65535；以太网模式 1280 到 9000 | 1500 |
 | `driver_inf` | 从哪个已签名的 `chmlink.inf` 安装 | `chmlink.dll` 内置的驱动包 |
 
 `chmlink_create_adapter` 在需要时安装驱动，创建设备，等待 Windows 为它建立网络接口，
@@ -182,7 +182,7 @@ uint32_t flags;
 chmlink_set_adapter_mtu(device.instance_id, &my_owner, 9000, &flags);
 ```
 
-仅限 IP 网卡，范围 1280 到 65535；以太网网卡固定为 1500。网卡会重启，会话随之结束。
+IP 网卡的范围是 1280 到 65535，以太网网卡是 1280 到 9000。数据包要经过隧道传输时，把它调到 1500 以下，使一个完整的帧加上隧道头仍能放进外层链路；需要巨帧时则调大。以太网 MTU 不是 1500 时需要 0.5.1.6 或更新的驱动，驱动包更旧时调用以 `ERROR_REVISION_MISMATCH` 失败。网卡会重启，会话随之结束。
 如果新值已保存但重启失败，调用以 `ERROR_INSTALL_FAILURE` 失败，MTU 在下次重启时生效。
 见[大 MTU 与软件 GRO](#大-mtu-与软件-gro)。
 
@@ -232,7 +232,7 @@ chmlink_close(adapter);
 
 | 字段 | 含义 |
 |---|---|
-| `mode`、`mtu`、`packet_limit` | 数据包格式和最大包长（IP：等于 MTU；以太网：1522 字节，含 VLAN 标签） |
+| `mode`、`mtu`、`packet_limit` | 数据包格式和最大包长（IP：等于 MTU；以太网：MTU + 22 字节，含帧头和最多两个 VLAN 标签） |
 | `mac`、`interface_index`、`interface_id` | 身份信息 |
 | `state` | `CHMLINK_STATE_*` 标志位，见下表 |
 | `capabilities` | `CHMLINK_CAP_*` 标志位；`CHMLINK_CAP_OFFLOAD` 表示可以请求卸载功能 |

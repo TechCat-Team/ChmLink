@@ -30,7 +30,7 @@ typedef struct chmlink_create_options {
     const wchar_t *name;       /* connection name; NULL generates "ChmLink-<adapter id>" */
     const GUID *owner;         /* NULL: CHMLINK_DEFAULT_OWNER_ID */
     const uint8_t *mac;        /* Ethernet only, 6 bytes; NULL: random, locally administered */
-    uint32_t mtu;              /* IP only, 1280 to 65535; 0: 1500. Ethernet is always 1500 */
+    uint32_t mtu;              /* 0: 1500. IP 1280 to 65535; Ethernet 1280 to 9000 (driver 0.5.1.6 or later) */
     const wchar_t *driver_inf; /* NULL: the package embedded in chmlink.dll (see below) */
 } chmlink_create_options;
 
@@ -73,8 +73,9 @@ int chmlink_create_adapter(const chmlink_create_options *options, chmlink_device
 /* Remove an adapter. An open data session ends. */
 int chmlink_delete_adapter(const wchar_t *instance_id, const GUID *owner);
 
-/* Store a new MTU for an IP adapter and restart the device so that it takes
- * effect; an open data session ends. When the MTU was stored but the restart
+/* Store a new MTU for an adapter (IP 1280 to 65535, Ethernet 1280 to 9000) and
+ * restart the device so that it takes effect; an open data session ends. A
+ * driver package too old for the value fails with ERROR_REVISION_MISMATCH. When the MTU was stored but the restart
  * failed, the error is ERROR_INSTALL_FAILURE and the change applies at the
  * next restart. flags may be NULL. */
 int chmlink_set_adapter_mtu(const wchar_t *instance_id, const GUID *owner, uint32_t mtu,

@@ -28,6 +28,9 @@
 #define CHMLINK_MTU_DEFAULT 1500u
 #define CHMLINK_IP_MTU_MIN 1280u
 #define CHMLINK_IP_MTU_MAX 65535u
+/* Ethernet: the IP payload of a frame; the frame adds CHMLINK_ETHERNET_OVERHEAD. */
+#define CHMLINK_ETHERNET_MTU_MIN 1280u
+#define CHMLINK_ETHERNET_MTU_MAX 9000u
 #define CHMLINK_CONFIG_MODE_ETHERNET 1u
 #define CHMLINK_CONFIG_MODE_IP 2u
 #define CHMLINK_DEFAULT_OWNER L"{7C71F369-78C2-44F4-94CD-A2C14A29469B}"
@@ -49,7 +52,7 @@ static __inline void chmlink_config_set_mtu(unsigned char *p, unsigned int mtu)
 /* Whether `mtu` is allowed for a device of `mode` (CHMLINK_CONFIG_MODE_*). */
 static __inline int chmlink_config_mtu_allowed(unsigned int mode, unsigned int mtu)
 {
-    if (mode == CHMLINK_CONFIG_MODE_ETHERNET) return mtu == CHMLINK_MTU_DEFAULT;
+    if (mode == CHMLINK_CONFIG_MODE_ETHERNET) return mtu >= CHMLINK_ETHERNET_MTU_MIN && mtu <= CHMLINK_ETHERNET_MTU_MAX;
     return mtu >= CHMLINK_IP_MTU_MIN && mtu <= CHMLINK_IP_MTU_MAX;
 }
 

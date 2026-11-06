@@ -109,8 +109,8 @@ the contract.
 | | Ethernet (`Root\ChmLink`) | IP (`Root\ChmLinkIP`) |
 |---|---|---|
 | medium | 802.3 | `NdisMediumIP` |
-| packets | Ethernet frames up to 1522 bytes, VLAN tags allowed, no FCS | one complete IPv4 or IPv6 packet each (no jumbograms) |
-| MTU | 1500 | 1500 by default, 1280–65535 per adapter |
+| packets | Ethernet frames up to MTU + 22 bytes, VLAN tags allowed, no FCS | one complete IPv4 or IPv6 packet each (no jumbograms) |
+| MTU | 1500 by default, 1280–9000 per adapter | 1500 by default, 1280–65535 per adapter |
 | offloads | LSOv2, TCP/UDP checksum, RSC, per session | none (Windows does not use task offloads on `NdisMediumIP`) |
 | identity | MAC (locally administered unicast) | none |
 

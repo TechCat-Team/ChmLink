@@ -60,13 +60,20 @@ int main(void)
     bytes[12] = CHMLINK_CONFIG_MODE_IP; bytes[4] = 4; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
     bytes[4] = 1; bytes[12] = 0; CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
 
-    /* MTU: Ethernet exactly 1500; IP from 1280 to 65535. */
+    /* MTU: Ethernet from 1280 to 9000; IP from 1280 to 65535. */
     baseline(bytes);
     CHECK(chmlink_config_mtu(bytes) == 1500);
-    for (value = 0; value < 70000; value += (value < 1600 ? 1 : 97)) {
+    for (value = 0; value < 70000; value += (value < 1600 || (value > 8900 && value < 9100) ? 1 : 97)) {
         chmlink_config_set_mtu(bytes, value);
-        CHECK(chmlink_config_valid(bytes, sizeof(bytes)) == (value == 1500));
+        CHECK(chmlink_config_valid(bytes, sizeof(bytes)) == (value >= 1280 && value <= 9000));
+        if (value >= 1280 && value <= 9000) CHECK(chmlink_config_mtu(bytes) == value);
     }
+    chmlink_config_set_mtu(bytes, 9000); CHECK(chmlink_config_valid(bytes, sizeof(bytes)));
+    chmlink_config_set_mtu(bytes, 9001); CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+    chmlink_config_set_mtu(bytes, 1279); CHECK(!chmlink_config_valid(bytes, sizeof(bytes)));
+    /* The version 2 layout has no MTU field: such a device always runs at 1500. */
+    baseline(bytes); bytes[4] = CHMLINK_CONFIG_VERSION_NO_MTU; memset(bytes + CHMLINK_CONFIG_MTU, 0, 4);
+    CHECK(chmlink_config_valid(bytes, sizeof(bytes)) && chmlink_config_mtu(bytes) == 1500);
     baseline(bytes); bytes[12] = CHMLINK_CONFIG_MODE_IP; memset(bytes + 48, 0, 6);
     for (value = 0; value < 70000; value += (value < 1600 ? 1 : 97)) {
         chmlink_config_set_mtu(bytes, value);

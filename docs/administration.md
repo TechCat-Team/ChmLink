@@ -13,7 +13,7 @@ linked statically, so it runs on its own. Unlike the SDK it always takes an
 explicit INF, and it never changes the driver of other adapters.
 
 ```text
-chmlink-device create <signed-inf> [--owner <GUID>] [--name <name>] [--mac <MAC>] [--mode ethernet|ip] [--mtu <1280-65535>]
+chmlink-device create <signed-inf> [--owner <GUID>] [--name <name>] [--mac <MAC>] [--mode ethernet|ip] [--mtu <IP 1280-65535, Ethernet 1280-9000>]
 chmlink-device set-mtu <instance-id> <mtu> [--owner <GUID>]      restarts the adapter
 chmlink-device show <instance-id>
 chmlink-device remove <instance-id> [--owner <GUID>]

@@ -22,6 +22,8 @@ typedef struct CL_DEVICE_CONFIG {
                             (unsigned int)((p) >> 16 & 0xffff), (unsigned int)((p) & 0xffff)
 #define CL_PACKAGE_CONFIG_2 CL_PACKAGE(0, 3, 0, 0)
 #define CL_PACKAGE_CONFIG_3 CL_PACKAGE(0, 4, 2, 0)
+/* The first package that starts an Ethernet device with an MTU other than 1500. */
+#define CL_PACKAGE_ETHERNET_MTU CL_PACKAGE(0, 5, 1, 6)
 /* The oldest package whose contract range includes this SDK's contract
  * (CHMLINK_DEVICE_VERSION): adapters this SDK creates need at least this one.
  * Raise it together with CHMLINK_DEVICE_VERSION. */

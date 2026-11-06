@@ -76,8 +76,8 @@
 | | 以太网（`Root\ChmLink`） | IP（`Root\ChmLinkIP`） |
 |---|---|---|
 | 介质 | 802.3 | `NdisMediumIP` |
-| 数据包 | 最长 1522 字节的以太网帧，允许 VLAN 标签，不含 FCS | 每个都是完整的 IPv4 或 IPv6 包（不支持 jumbogram） |
-| MTU | 1500 | 默认 1500，可为每块网卡设为 1280–65535 |
+| 数据包 | 最长 MTU + 22 字节的以太网帧，允许 VLAN 标签，不含 FCS | 每个都是完整的 IPv4 或 IPv6 包（不支持 jumbogram） |
+| MTU | 默认 1500，可为每块网卡设为 1280–9000 | 默认 1500，可为每块网卡设为 1280–65535 |
 | 卸载 | LSOv2、TCP/UDP 校验和、RSC，按会话启用 | 无（Windows 不在 `NdisMediumIP` 上使用任务卸载） |
 | 身份 | MAC（本地管理的单播地址） | 无 |
 

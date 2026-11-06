@@ -123,7 +123,7 @@ if (!chmlink_create_adapter(&options, &device))
 | `name` | Windows connection name, up to 128 characters | `ChmLink-<adapter id>` |
 | `owner` | owner GUID | `CHMLINK_DEFAULT_OWNER_ID` (meant for tools; use your own) |
 | `mac` | 6 bytes, Ethernet only; must be unicast and locally administered | random, locally administered |
-| `mtu` | IP only, 1280 to 65535 | 1500 |
+| `mtu` | IP 1280 to 65535; Ethernet 1280 to 9000 | 1500 |
 | `driver_inf` | path of a signed `chmlink.inf` to install from | the package embedded in `chmlink.dll` |
 
 `chmlink_create_adapter` installs the driver when needed, creates the device,
@@ -207,8 +207,12 @@ uint32_t flags;
 chmlink_set_adapter_mtu(device.instance_id, &my_owner, 9000, &flags);
 ```
 
-IP adapters only, 1280 to 65535; Ethernet adapters stay at 1500. The adapter
-restarts, which ends its session. If the value was stored but the restart
+IP adapters take 1280 to 65535, Ethernet adapters 1280 to 9000. Lower it below
+1500 when packets are carried in a tunnel, so that a full frame plus the
+tunnel's headers still fits the outer path; raise it for jumbo frames. An
+Ethernet MTU other than 1500 needs driver 0.5.1.6 or later: with an older
+package the call fails with `ERROR_REVISION_MISMATCH`. The adapter restarts,
+which ends its session. If the value was stored but the restart
 failed, the call fails with `ERROR_INSTALL_FAILURE` and the MTU applies at the
 next restart. See [Large MTU and software GRO](#large-mtu-and-software-gro).
 
@@ -267,7 +271,7 @@ Opening fails with `ERROR_SHARING_VIOLATION` when another session is open,
 
 | field | meaning |
 |---|---|
-| `mode`, `mtu`, `packet_limit` | packet format and the largest packet (IP: the MTU; Ethernet: 1522 bytes, VLAN tag included) |
+| `mode`, `mtu`, `packet_limit` | packet format and the largest packet (IP: the MTU; Ethernet: MTU + 22 bytes, header and up to two VLAN tags) |
 | `mac`, `interface_index`, `interface_id` | identity |
 | `state` | `CHMLINK_STATE_*` bits, below |
 | `capabilities` | `CHMLINK_CAP_*` bits; `CHMLINK_CAP_OFFLOAD` means offloads can be requested |

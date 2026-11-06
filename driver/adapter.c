@@ -70,7 +70,7 @@ NDIS_STATUS ClInitialize(NDIS_HANDLE handle, NDIS_HANDLE driverContext,
     status = ClReadConfiguration(handle, a->Configuration);
     if (status != NDIS_STATUS_SUCCESS) goto fail;
     a->Mode = (chmlink_mode)chmlink_config_mode(a->Configuration);
-    /* chmlink_config_valid allows only 1500 for Ethernet and 1280..65535 for IP. */
+    /* chmlink_config_valid allows 1280..9000 for Ethernet and 1280..65535 for IP. */
     a->Mtu = chmlink_config_mtu(a->Configuration);
     a->Lookahead = a->Mtu;
     NdisMoveMemory(a->Mac, a->Configuration + CHMLINK_CONFIG_MAC, sizeof(a->Mac));

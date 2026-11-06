@@ -11,7 +11,7 @@
 与 SDK 不同，它总是需要显式指定 INF，并且从不改动其他网卡的驱动。
 
 ```text
-chmlink-device create <signed-inf> [--owner <GUID>] [--name <name>] [--mac <MAC>] [--mode ethernet|ip] [--mtu <1280-65535>]
+chmlink-device create <signed-inf> [--owner <GUID>] [--name <name>] [--mac <MAC>] [--mode ethernet|ip] [--mtu <IP 1280-65535，以太网 1280-9000>]
 chmlink-device set-mtu <instance-id> <mtu> [--owner <GUID>]      restarts the adapter
 chmlink-device show <instance-id>
 chmlink-device remove <instance-id> [--owner <GUID>]

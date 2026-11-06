@@ -4,10 +4,13 @@
 /* Experimental Windows device contract. Include windows.h or ntddk.h first. */
 #include "version.h"
 #include "query.h"
-#define CHMLINK_ETHERNET_MTU 1500u
-#define CHMLINK_ETHERNET_LIMIT 1522u   /* frame with a VLAN tag, without FCS */
-/* An IP adapter's MTU is configured per device (chmlink/config.h: 1500 by
- * default, 1280 to 65535); QUERY reports it as mtu and packet_limit. */
+#define CHMLINK_ETHERNET_MTU 1500u      /* the default; configurable per device */
+/* An Ethernet frame is its MTU plus a header with up to two VLAN tags, without FCS. */
+#define CHMLINK_ETHERNET_OVERHEAD 22u
+#define CHMLINK_ETHERNET_LIMIT (CHMLINK_ETHERNET_MTU + CHMLINK_ETHERNET_OVERHEAD)
+/* The MTU is configured per device (chmlink/config.h: 1500 by default; IP 1280
+ * to 65535, Ethernet 1280 to 9000). QUERY reports it as mtu, and as
+ * packet_limit the largest packet: the MTU for IP, MTU + 22 for Ethernet. */
 /* Packets move through two shared-memory rings per session (chmlink/ring.h):
  * one the driver produces for Windows traffic, one the application produces
  * for injection. The driver registers both with CHMLINK_IOCTL_REGISTER_RINGS

@@ -8,6 +8,7 @@
 #include <errno.h>
 #include "chmlink/api.h"
 #include "chmlink/protocol.h"
+#include "chmlink/device.h"
 
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s (win=%lu wsa=%d)\n", \
     __FILE__, __LINE__, #x, GetLastError(), WSAGetLastError()); ExitProcess(1); } } while (0)
@@ -105,13 +106,45 @@ static void wait_for_address(ULONG index, int family, const void *address)
     fprintf(stderr, "Test address is not preferred on the selected adapter.\n"); ExitProcess(1);
 }
 
+static uint32_t ethernet_limit = CHMLINK_ETHERNET_LIMIT;
+
+/* The Ethernet adapter's MTU (tools/test-ip.ps1 passes the one it configured)
+ * sets its frame limit: a frame of exactly packet_limit bytes is accepted by
+ * the SDK and the driver, one byte more is refused before it reaches the ring. */
+static void check_ethernet_mtu(chmlink_adapter *ethernet, const chmlink_adapter_info *info)
+{
+    char expected[16];
+    chmlink_adapter_info after;
+    uint8_t *frame;
+    ULONGLONG deadline;
+    REQUIRE(info->packet_limit == info->mtu + CHMLINK_ETHERNET_OVERHEAD);
+    if (GetEnvironmentVariableA("CHMLINK_TEST_ETHERNET_MTU", expected, sizeof(expected)) != 0)
+        REQUIRE(info->mtu == (uint32_t)strtoul(expected, NULL, 10));
+    ethernet_limit = info->packet_limit;
+    REQUIRE(chmlink_allocate_packet(ethernet, info->packet_limit + 1, NULL) == NULL &&
+            GetLastError() == ERROR_INVALID_PARAMETER);
+    frame = chmlink_allocate_packet(ethernet, info->packet_limit, NULL); REQUIRE(frame != NULL);
+    memset(frame, 0xff, 6);                       /* broadcast, so the receive filter passes it */
+    memcpy(frame + 6, info->mac, 6);
+    frame[12] = 0x88; frame[13] = 0xb5;           /* IEEE local experimental EtherType */
+    memset(frame + 14, 0x5a, info->packet_limit - 14);
+    chmlink_send_packet(ethernet, frame);
+    deadline = GetTickCount64() + 5000;
+    do {
+        Sleep(10);
+        REQUIRE(chmlink_query(ethernet, &after));
+    } while (after.rx_packets == info->rx_packets && GetTickCount64() < deadline);
+    REQUIRE(after.rx_packets == info->rx_packets + 1 && after.rx_discards == info->rx_discards);
+    printf("ethernet mtu %u: a %u-byte frame was accepted, one byte more refused\n", info->mtu, info->packet_limit);
+}
+
 static void check_ethernet_isolation(chmlink_adapter *ethernet, uint8_t *buffer)
 {
     uint32_t bytes, count, i, offset = CHMLINK_BATCH_HEADER_SIZE;
     if (!chmlink_receive(ethernet, buffer, CHMLINK_BATCH_MAX_SIZE, &bytes)) {
         REQUIRE(GetLastError() == ERROR_NO_MORE_ITEMS); return;
     }
-    REQUIRE(chmlink_batch_validate(buffer, bytes, CHMLINK_MODE_ETHERNET, 1522, &count) == CHMLINK_OK);
+    REQUIRE(chmlink_batch_validate(buffer, bytes, CHMLINK_MODE_ETHERNET, ethernet_limit, &count) == CHMLINK_OK);
     for (i = 0; i < count; ++i) {
         size_t j, length = get32(buffer + offset);
         offset += 4;
@@ -239,6 +272,7 @@ int main(int argc, char **argv)
         REQUIRE(!errno && *argv[6] != '-' && !*end && ethernetIndex && ethernetIndex != index);
         ethernet = chmlink_open((uint32_t)ethernetIndex); REQUIRE(ethernet != NULL);
         REQUIRE(chmlink_query(ethernet, &info) && info.mode == CHMLINK_MODE_ETHERNET);
+        check_ethernet_mtu(ethernet, &info);
         ethernetBatch = malloc(CHMLINK_BATCH_MAX_SIZE); REQUIRE(ethernetBatch != NULL);
         REQUIRE(chmlink_query(adapter, &info) && info.mode == CHMLINK_MODE_IP);
     }
