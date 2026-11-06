@@ -113,10 +113,11 @@ offloads, configurable MTU, software GRO, adapter management and driver
 installation in the SDK (upgrades with open sessions, concurrent creation,
 clean uninstall), version negotiation, surprise removal, and validation under
 Driver Verifier and fault injection. Tested on Windows 11 and on Windows 10
-1607, the minimum target, without the Visual C++ Redistributable.
+1607, the minimum target, without the Visual C++ Redistributable. Standby (S3)
+and hibernation (S4) with an open session pass on a desktop with Windows 11
+26300. ARM64 is built, signed and packaged.
 
-Before 1.0: production signing, sleep and resume on hardware with sleep states
-(the test VMs have none), ARM64 and x86 builds.
+Before 1.0: production signing, a run on ARM64 Windows. No x86 build is planned.
 
 ## Contributing
 

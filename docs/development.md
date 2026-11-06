@@ -56,6 +56,14 @@ Inf2Cat /driver:build\driver /os:10_X64,Server10_X64
 signtool sign /fd sha256 /sha1 <test-cert-thumbprint> build\driver\chmlink.cat
 ```
 
+Security and anti-cheat software can refuse test-signed drivers before
+Windows maps them. The device then reports `CM_PROB_OUT_OF_MEMORY` and the
+System log has Kernel-PnP event 219 with status `0xC000009A`, which looks like
+a driver bug but is not: no image load is ever traced and `DriverEntry` never
+runs. Huorong and FACEIT Anti-Cheat did this on a test desktop; exiting their
+applications was not enough, their kernel drivers had to be gone (uninstalled,
+then a restart).
+
 Point `CHMLINK_DRIVER_DIR` at that directory to embed the package in
 `chmlink.dll` ([sdk.md](sdk.md#getting-the-sdk)).
 

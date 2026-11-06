@@ -52,6 +52,11 @@ Inf2Cat /driver:build\driver /os:10_X64,Server10_X64
 signtool sign /fd sha256 /sha1 <test-cert-thumbprint> build\driver\chmlink.cat
 ```
 
+安全软件和反作弊软件可能在 Windows 映射驱动镜像之前就拒绝测试签名的驱动。此时设备报告
+`CM_PROB_OUT_OF_MEMORY`，系统日志里有 Kernel-PnP 事件 219、状态 `0xC000009A`。这看起来像驱动的问题，
+其实不是：跟踪里根本没有镜像加载记录，`DriverEntry` 也从未运行。在一台测试用台式机上，火绒和 FACEIT
+反作弊都会这样。只退出它们的程序不够，必须让它们的内核驱动不再加载（卸载后重启）。
+
 把 `CHMLINK_DRIVER_DIR` 指向这个目录，即可把驱动包内置进 `chmlink.dll`（[sdk.md](sdk.md#获取-sdk)）。
 
 ## 测试

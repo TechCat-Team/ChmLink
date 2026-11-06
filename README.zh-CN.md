@@ -103,9 +103,10 @@ cmake --install build --config Release --prefix C:\sdk\chmlink   # bin\chmlink.d
 已完成：两种网卡、按流分发的共享环形队列数据通路、卸载、可配置 MTU、软件 GRO、
 SDK 中的网卡管理与驱动安装（会话打开时的升级、并发创建、干净卸载）、版本协商、意外移除，
 以及在 Driver Verifier 和故障注入下的验证。已在 Windows 11 和最低支持版本 Windows 10 1607 上测试，
-后者未安装 Visual C++ 运行库。
+后者未安装 Visual C++ 运行库。在一台 Windows 11 26300 台式机上，带着打开的会话待机（S3）和休眠（S4）均已通过。
+ARM64 已能构建、签名和打包。
 
-1.0 之前：正式签名、在支持睡眠的真机上测试睡眠与唤醒（测试虚拟机不支持睡眠）、ARM64 和 x86 构建。
+1.0 之前：正式签名、在 ARM64 Windows 上实际运行。不计划提供 x86 构建。
 
 ## 参与贡献
 
